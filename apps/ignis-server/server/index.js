@@ -96,6 +96,7 @@ const treeReconcile = require("./cache/reconcile");
 const { createMetadataChannel } = require("./cache/metadata-channel");
 const { registerCacheListeners } = require("./cache/listeners");
 const vaultLifecycle = require("./vault/lifecycle");
+const collaboration = require("./collab");
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
@@ -209,6 +210,12 @@ const wss = setupWebSocket(server, {
   getVaultPath: config.getVaultPath,
   originAllowlist: settings.get("wsOrigins"),
 });
+collaboration.register({
+  wss,
+  getVaultPath: config.getVaultPath,
+  dataRoot: config.dataRoot,
+  writeCoalescer,
+});
 vaultLifecycle.setWss(wss);
 
 const metadataChannel = createMetadataChannel(wss);
@@ -252,6 +259,7 @@ writeCoalescer.onFlushGiveUp((absPath) => {
 async function gracefulShutdown(signal) {
   console.log(`\n[ignis] Received ${signal}, shutting down gracefully...`);
 
+  await collaboration.flushAll();
   await flushAll();
   await shutdownPlugins();
 

@@ -152,6 +152,8 @@ function setupWebSocket(server, opts = {}) {
     }
 
     const vaultPath = getVaultPath(vaultId);
+    // Trusted vault association for channel handlers; never trust a message-supplied vault.
+    ws.ignisVaultId = vaultId;
     console.log(`[ws] Client connected to vault: ${vaultId}`);
 
     // isAlive is reset by each pong; the heartbeat sweep terminates sockets that miss one.

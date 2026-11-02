@@ -23,6 +23,7 @@ const {
   supersedePendingSubtree,
 } = writeCoalescer;
 const bootstrapCache = require("../cache");
+const collaboration = require("../collab");
 
 const router = express.Router();
 
@@ -188,6 +189,16 @@ router.get("/readFile", async (req, res) => {
     return;
   }
 
+  const collaborative = collaboration.getActive(
+    req._vaultId,
+    toRelative(req._vaultRoot, resolved),
+  );
+
+  if (collaborative) {
+    const content = collaborative.text.toString();
+    return res.type("text/plain").send(content);
+  }
+
   try {
     const stat = await fs.promises.stat(resolved);
 
@@ -235,6 +246,23 @@ router.post("/writeFile", async (req, res) => {
 
   if (!resolved) {
     return;
+  }
+
+  // Obsidian's ordinary autosave may contain a stale whole-file snapshot.
+  // During a live Yjs session, only CRDT updates are authoritative.
+  const collaborative = collaboration.getActive(
+    req._vaultId,
+    toRelative(req._vaultRoot, resolved),
+  );
+
+  if (collaborative) {
+    const current = collaborative.text.toString();
+    return res.json({
+      ok: true,
+      collaborative: true,
+      mtime: Date.now(),
+      size: Buffer.byteLength(current, "utf-8"),
+    });
   }
 
   try {

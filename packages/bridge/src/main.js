@@ -21,6 +21,7 @@ import { initProxyBlockNotice } from "./notices/proxy-block-notice.js";
 import { initWriteGiveupNotice } from "./notices/write-giveup-notice.js";
 import { initImageRetry } from "./image-retry.js";
 import { installReadingLock } from "./reading-lock.js";
+import { initCollaboration } from "./collaboration.js";
 
 class IgnisBridgePlugin extends Plugin {
   async onload() {
@@ -41,6 +42,7 @@ class IgnisBridgePlugin extends Plugin {
     this._insecureApiUnsub = initInsecureApiNotice();
     this._proxyBlockUnsub = initProxyBlockNotice(this.app);
     this._imageRetryUnsub = initImageRetry();
+    this._collaborationUnsub = initCollaboration(this);
 
     const flags = window.__ignis.flags || {};
 
@@ -96,6 +98,10 @@ class IgnisBridgePlugin extends Plugin {
 
     if (this._imageRetryUnsub) {
       this._imageRetryUnsub();
+    }
+
+    if (this._collaborationUnsub) {
+      this._collaborationUnsub();
     }
 
     if (this._pluginTogglesUnsub) {
