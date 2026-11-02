@@ -12,7 +12,7 @@ const base = process.env.BASE_URL || "http://127.0.0.1:3191";
 const chromePath = process.env.CHROME_PATH ||
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const vaultId = process.env.COLLAB_TEST_VAULT || "Collab Lab";
-const notePath = "Browser CRDT Test.md";
+const notePath = process.env.COLLAB_TEST_NOTE || "Browser CRDT Test.md";
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), "ignis-browser-e2e-"));
 const chromeProfile = path.join(temp, "chrome");
 
@@ -41,6 +41,7 @@ class CDP {
     this.ws = ws;
     this.id = 0;
     this.pending = new Map();
+    this.targets = new Map();
     ws.on("message", (buffer) => {
       const msg = JSON.parse(buffer.toString());
       const pending = this.pending.get(msg.id);
@@ -92,7 +93,12 @@ class CDP {
     await this.command("Page.enable", {}, sessionId);
     await this.command("Runtime.enable", {}, sessionId);
     await this.command("Page.navigate", { url }, sessionId);
+    this.targets.set(sessionId, targetId);
     return sessionId;
+  }
+
+  async activate(tab) {
+    await this.command("Target.activateTarget", { targetId: this.targets.get(tab) });
   }
 }
 
@@ -132,6 +138,10 @@ try {
       "Boolean(window.app?.workspace?.getLeaf && window.app?.vault?.getAbstractFileByPath)"),
     50000);
 
+    await poll(() => cdp.evaluate(tab,
+      `Boolean(window.app.vault.getAbstractFileByPath(${JSON.stringify(notePath)}))`),
+    40000);
+
     const opened = await cdp.evaluate(tab, `(async () => {
       const file = window.app.vault.getAbstractFileByPath(${JSON.stringify(notePath)});
       if (!file) throw new Error("Browser test note is missing");
@@ -153,6 +163,69 @@ try {
     (await status(b)).includes("online"), 15000);
   console.log("Both Markdown editors joined:", await status(a), await status(b));
 
+  async function setName(tab, name) {
+    return cdp.evaluate(tab, `(() => {
+      const status = document.querySelector('.ignis-collaboration-status');
+      status?.click();
+      const input = document.querySelector('.modal-container .ignis-collab-person')?.closest('.modal')?.querySelector('form input') || document.querySelector('.modal-container form input');
+      if (!input) return false;
+      input.value = ${JSON.stringify(name)};
+      input.closest('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+      return true;
+    })()`);
+  }
+
+  if (!await setName(a, "Alice") || !await setName(b, "Bob")) {
+    throw new Error("Unable to set participant display names");
+  }
+
+  await cdp.evaluate(a, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.setSelection({line: 0, ch: 1}, {line: 0, ch: 5});
+    editor.cm.dom.dispatchEvent(new KeyboardEvent('keyup', {key:'Shift', bubbles:true}));
+    return true;
+  })()`);
+
+  const awareness = await poll(async () => cdp.evaluate(b, `(() => {
+    const caret = document.querySelector('.ignis-collab-remote-caret');
+    const label = caret?.querySelector('.ignis-collab-remote-label')?.textContent;
+    const selected = document.querySelectorAll('.ignis-collab-remote-selection').length;
+    const color = caret ? getComputedStyle(caret).borderLeftColor : null;
+    return label === 'Alice' && selected > 0 && color ? {label, selected, color} : null;
+  })()`), 18000);
+
+  console.log("PASS: distinct remote identity, caret, and text selection:", JSON.stringify(awareness));
+
+  await cdp.evaluate(b, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.setSelection({line: 0, ch: 2}, {line: 0, ch: 7});
+    editor.cm.dom.dispatchEvent(new KeyboardEvent('keyup', {key:'Shift', bubbles:true}));
+    return true;
+  })()`);
+  await cdp.activate(a);
+
+  await poll(async () => cdp.evaluate(a, `(() => {
+    return document.querySelector('.ignis-collab-remote-label')?.textContent === 'Bob';
+  })()`), 15000);
+  console.log("PASS: both participants have visible remote cursors");
+
+  // A displayed nickname is not a unique identity. Even when both participants
+  // choose the same nickname, the overlay must disambiguate them.
+  if (!await setName(b, "Alice")) {
+    throw new Error("Unable to set duplicate display name");
+  }
+
+
+  await poll(async () => cdp.evaluate(a, `(() => {
+    const label = document.querySelector('.ignis-collab-remote-label')?.textContent || '';
+    return label.startsWith('Alice ·') && label.length > 'Alice ·'.length;
+  })()`), 10000);
+  console.log("PASS: duplicate display names receive unique ID suffixes");
+
+  if (!await setName(b, "Bob")) {
+    throw new Error("Unable to restore participant name");
+  }
+
   await Promise.all([
     cdp.evaluate(a, "window.app.workspace.activeLeaf.view.editor.replaceRange('Alice ', {line:0,ch:0}); true"),
     cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.replaceRange('Bob ', {line:0,ch:0}); true"),
@@ -164,6 +237,14 @@ try {
     return first === second && first.includes("Alice ") && first.includes("Bob ") && first;
   }, 20000);
   console.log("PASS: two real Obsidian editors converged:", JSON.stringify(merged));
+
+  await cdp.command("Target.closeTarget", { targetId: cdp.targets.get(a) });
+  await cdp.activate(b);
+  await poll(async () => cdp.evaluate(b, `(() => {
+    const status = document.querySelector('.ignis-collaboration-status')?.textContent || '';
+    return status.includes('1 online') && document.querySelectorAll('.ignis-collab-remote-caret').length === 0;
+  })()`), 15000);
+  console.log("PASS: departed user's remote caret removed");
   socket.close();
 } finally {
   if (cdp?.ws.readyState === WebSocket.OPEN) {

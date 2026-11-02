@@ -151,4 +151,50 @@ describe("collaboration room", () => {
     applyTextChange(text, "abc", "abXYZc", "external");
     expect(text.toString()).toBe("abXYZc");
   });
+
+  it("tracks distinct named cursors, selections, and removes departed peers", async () => {
+    const alice = await connect();
+    const bob = await connect();
+    const aReady = waitFor(alice, "init");
+    alice.send(JSON.stringify({ channel: "collab", type: "join", path: "test.md", name: "Alice" }));
+    const aInfo = await aReady;
+    const aPresence = waitFor(alice, "presence");
+    const bReady = waitFor(bob, "init");
+    bob.send(JSON.stringify({ channel: "collab", type: "join", path: "test.md", name: "Bob" }));
+    const bInfo = await bReady;
+    const nowPresent = await aPresence;
+
+    expect(aInfo.self.name).toBe("Alice");
+    expect(bInfo.self.name).toBe("Bob");
+    expect(aInfo.self.id).not.toBe(bInfo.self.id);
+    expect(aInfo.self.color).not.toBe(bInfo.self.color);
+    expect(nowPresent.people).toHaveLength(2);
+
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Buffer.from(aInfo.state, "base64"));
+    const text = doc.getText("content");
+    const relative = (offset) => Buffer.from(Y.encodeRelativePosition(
+      Y.createRelativePositionFromTypeIndex(text, offset),
+    )).toString("base64");
+    const cursor = waitFor(bob, "cursor");
+    alice.send(JSON.stringify({
+      channel: "collab", type: "cursor", path: "test.md",
+      anchor: relative(1), head: relative(4),
+    }));
+    const received = await cursor;
+    expect(received.id).toBe(aInfo.self.id);
+    expect(received.anchor).toBe(relative(1));
+    expect(received.head).toBe(relative(4));
+
+    const updated = waitFor(bob, "presence");
+    alice.send(JSON.stringify({ channel: "collab", type: "identity", path: "test.md", name: "Alice New" }));
+    const list = await updated;
+    expect(list.people.find((person) => person.id === aInfo.self.id).name).toBe("Alice New");
+
+    const left = waitFor(bob, "presence");
+    alice.send(JSON.stringify({ channel: "collab", type: "leave", path: "test.md" }));
+    const reduced = await left;
+    expect(reduced.people).toHaveLength(1);
+    expect(reduced.people[0].id).toBe(bInfo.self.id);
+  });
 });

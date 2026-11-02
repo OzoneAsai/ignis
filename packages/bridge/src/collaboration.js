@@ -1,10 +1,70 @@
 // Browser Markdown collaboration: bind the existing Obsidian Editor to Y.Text.
 // The shared Ignis WebSocket transports Yjs updates, not whole-file snapshots.
-import { MarkdownView } from "obsidian";
+import { MarkdownView, Modal } from "obsidian";
 import * as Y from "yjs";
+import {
+  createCursorOverlay,
+  encodeCursorSelection,
+} from "./collaboration-cursors.js";
 
 const REMOTE = "remote";
 const LOCAL = "local";
+const NAME_KEY = "ignis-collab-display-name";
+const TAB_KEY = "ignis-collab-tab-id";
+
+function ownDisplayName() {
+  let tabId = sessionStorage.getItem(TAB_KEY);
+
+  if (!tabId) {
+    tabId = crypto.randomUUID();
+    sessionStorage.setItem(TAB_KEY, tabId);
+  }
+
+  return sessionStorage.getItem(NAME_KEY) || `Guest ${tabId.slice(0, 4)}`;
+}
+
+class PeopleModal extends Modal {
+  constructor(app, getPeople, getName, setName) {
+    super(app);
+    this.getPeople = getPeople;
+    this.getName = getName;
+    this.setName = setName;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  render() {
+    const root = this.contentEl;
+    root.replaceChildren();
+    root.createEl("h3", { text: "Live collaborators" });
+    const form = root.createEl("form");
+    const label = form.createEl("label", { text: "Your display name" });
+    const input = label.createEl("input", { type: "text" });
+    input.maxLength = 40;
+    input.value = this.getName();
+    input.style.display = "block";
+    input.style.width = "100%";
+    const save = form.createEl("button", { text: "Save name", type: "submit" });
+    save.style.marginTop = "8px";
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.setName(input.value);
+      this.close();
+    });
+    root.createEl("h4", { text: "People in this note" });
+    const participants = this.getPeople();
+
+    for (const person of participants) {
+      const entry = root.createDiv({ cls: "ignis-collab-person" });
+      const color = entry.createSpan({ cls: "ignis-collab-person-color" });
+      color.style.setProperty("--ignis-peer-color", person.color);
+      entry.createSpan({ text: person.name + (person.isSelf ? " (you)" : "") });
+      entry.createEl("small", { text: `· ${person.id.slice(0, 6)}` });
+    }
+  }
+}
 
 function encodeUpdate(bytes) {
   let result = "";
@@ -105,6 +165,74 @@ export function initCollaboration(plugin) {
 
   let session = null;
   let activeTimer = null;
+  let peopleModal = null;
+
+  function people() {
+    if (!session) {
+      return [];
+    }
+
+    return [...session.people.values()].map((person) => ({
+      ...person,
+      isSelf: person.id === session.self?.id,
+    }));
+  }
+
+  function showPeople() {
+    peopleModal?.close();
+    peopleModal = new PeopleModal(plugin.app, people, ownDisplayName, (value) => {
+      // eslint-disable-next-line no-control-regex
+      const clean = value.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
+        .trim().slice(0, 40);
+
+      if (!clean) {
+        return;
+      }
+
+      sessionStorage.setItem(NAME_KEY, clean);
+
+      if (session?.self) {
+        session.self.name = clean;
+        session.people.set(session.self.id, { ...session.self });
+
+        if (session.joined && ws.isOpen()) {
+          channel.send("identity", { path: session.path, name: clean });
+        }
+
+        render();
+      }
+    });
+    peopleModal.open();
+  }
+
+  status.setAttribute("role", "button");
+  status.setAttribute("tabindex", "0");
+  status.setAttribute("aria-label", "Live collaborators: view people or edit your name");
+  status.addEventListener("click", showPeople);
+  status.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      showPeople();
+    }
+  });
+
+  function renderPeers(current) {
+    const members = [...current.people.values()];
+    const counts = new Map();
+
+    for (const member of members) {
+      counts.set(member.name, (counts.get(member.name) || 0) + 1);
+    }
+
+    current.overlay?.render(members
+      .filter((member) => member.id !== current.self?.id)
+      .map((member) => ({
+        ...member,
+        label: (counts.get(member.name) || 0) > 1
+          ? `${member.name} ·${member.id.slice(0, 4)}`
+          : member.name,
+      })));
+  }
 
   function render() {
     if (!session) {
@@ -119,12 +247,48 @@ export function initCollaboration(plugin) {
     } else {
       status.setText(`Collab: ${session.participants} online`);
     }
+
+    renderPeers(session);
+    if (peopleModal?.isOpen) {
+      peopleModal.render();
+    }
   }
 
   function sendJoin() {
     if (session && ws.isOpen()) {
-      channel.send("join", { path: session.path });
+      channel.send("join", { path: session.path, name: ownDisplayName() });
     }
+  }
+
+  function sendSelection(current) {
+    if (!current || !current.initialized || !current.joined || !ws.isOpen() || current.suppress) {
+      return;
+    }
+
+    const selected = current.editor.cm?.state?.selection?.main;
+
+    if (!selected) {
+      return;
+    }
+
+    const encoded = encodeCursorSelection(current.text, selected.anchor, selected.head);
+    const signature = encoded.anchor + ":" + encoded.head;
+
+    if (current.lastSelection === signature) {
+      return;
+    }
+
+    current.lastSelection = signature;
+    channel.send("cursor", { path: current.path, ...encoded });
+  }
+
+  function scheduleSelection(current) {
+    if (!current || current !== session) {
+      return;
+    }
+
+    clearTimeout(current.selectionTimer);
+    current.selectionTimer = setTimeout(() => sendSelection(current), 65);
   }
 
   function dispose() {
@@ -139,6 +303,9 @@ export function initCollaboration(plugin) {
       channel.send("leave", { path: current.path });
     }
 
+    clearTimeout(current.selectionTimer);
+    current.removeEditorListeners?.();
+    current.overlay?.destroy();
     current.doc.destroy();
     render();
   }
@@ -171,6 +338,35 @@ export function initCollaboration(plugin) {
       joined: false,
       suppress: false,
       participants: 1,
+      people: new Map(),
+      self: null,
+      lastSelection: null,
+      selectionTimer: null,
+    };
+
+    next.overlay = createCursorOverlay(next);
+
+    const onCursorMotion = () => scheduleSelection(next);
+    const cmDom = editor.cm?.dom;
+    const events = ["keyup", "mouseup", "pointerup", "focusin"];
+
+    for (const event of events) {
+      cmDom?.addEventListener(event, onCursorMotion);
+    }
+
+    const onSelectionChange = () => {
+      if (editor.cm?.hasFocus) {
+        onCursorMotion();
+      }
+    };
+
+    document.addEventListener("selectionchange", onSelectionChange);
+    next.removeEditorListeners = () => {
+      for (const event of events) {
+        cmDom?.removeEventListener(event, onCursorMotion);
+      }
+
+      document.removeEventListener("selectionchange", onSelectionChange);
     };
 
     doc.on("update", (update, origin) => {
@@ -182,6 +378,7 @@ export function initCollaboration(plugin) {
     text.observe(() => {
       if (session === next && next.initialized) {
         reconcileEditor(next);
+        renderPeers(next);
       }
     });
 
@@ -210,6 +407,9 @@ export function initCollaboration(plugin) {
         current.initialized = true;
         current.joined = true;
         current.participants = msg.participants || 1;
+        current.self = msg.self || null;
+        current.people = new Map((msg.people || []).map((person) => [person.id, person]));
+        current.lastSelection = null;
 
         if (changedWhileJoining) {
           // Preserve edits made during the initial WebSocket handshake.
@@ -223,6 +423,7 @@ export function initCollaboration(plugin) {
           update: encodeUpdate(Y.encodeStateAsUpdate(current.doc)),
         });
         render();
+        scheduleSelection(current);
       } catch (error) {
         console.error("[collab] Failed to initialize note:", error);
         status.setText("Collab: initialization failed");
@@ -242,7 +443,25 @@ export function initCollaboration(plugin) {
     channel.subscribe("presence", (msg) => {
       if (session?.path === msg.path) {
         session.participants = msg.participants;
+        if (Array.isArray(msg.people)) {
+          session.people = new Map(msg.people.map((person) => [person.id, person]));
+          session.self = session.people.get(session.self?.id) || session.self;
+        }
+
         render();
+      }
+    }),
+    channel.subscribe("cursor", (msg) => {
+      if (!session || msg.path !== session.path || msg.id === session.self?.id) {
+        return;
+      }
+
+      const person = session.people.get(msg.id);
+
+      if (person) {
+        person.anchor = msg.anchor;
+        person.head = msg.head;
+        renderPeers(session);
       }
     }),
     channel.subscribe("error", (msg) => {
@@ -253,10 +472,13 @@ export function initCollaboration(plugin) {
     }),
     ws.onStateChange((state) => {
       if (session) {
-        session.joined = state === "open" ? false : session.joined;
+        session.joined = false;
 
         if (state === "open") {
           sendJoin();
+        } else {
+          session.people.clear();
+          session.participants = 1;
         }
 
         render();
@@ -269,6 +491,7 @@ export function initCollaboration(plugin) {
   plugin.registerEvent(plugin.app.workspace.on("editor-change", (editor) => {
     if (session?.editor === editor && session.initialized && !session.suppress) {
       applyLocalChange(session.text, editor.getValue());
+      scheduleSelection(session);
     }
   }));
 
@@ -277,6 +500,7 @@ export function initCollaboration(plugin) {
 
   return () => {
     clearTimeout(activeTimer);
+    peopleModal?.close();
     dispose();
 
     for (const off of unsubscribe) {

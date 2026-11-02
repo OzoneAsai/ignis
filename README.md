@@ -77,7 +77,7 @@ Ignis currently ships as a self-hosted server, with a desktop plugin variant pla
 - File upload (ribbon, right-click, drag-and-drop) and download (files, or folders as ZIP).
 - Multi-vault support with create, open, switch, rename, and delete, and a different vault per browser tab.
 - Live sync between tabs over WebSocket, so edits propagate within a second.
-- **This fork's experimental realtime Markdown collaboration:** active editors merge concurrent changes through Yjs, with per-note participant counts and persisted CRDT state. See [Collaboration](docs/COLLABORATION.md) for scope, testing, and limitations.
+- **This fork's experimental realtime Markdown collaboration:** active editors merge concurrent changes through Yjs, showing colored, named participant cursors and selection highlights, with persisted CRDT state. See [Collaboration](docs/COLLABORATION.md) for scope, testing, and limitations.
 - Saved workspaces opened in separate tabs via a `?workspace=` URL parameter.
 - Notes can be opened directly by URL via a `?file=` parameter, with an "as Ignis URL" option in the note menu 'Copy path' section.
 - Obsidian Sync in a logged-in tab, or server-side Headless Sync that runs without a tab open.

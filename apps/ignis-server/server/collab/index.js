@@ -10,8 +10,26 @@ const CHANNEL = "collab";
 const MAX_UPDATE_BYTES = 1024 * 1024;
 const MAX_NOTE_BYTES = 4 * 1024 * 1024;
 const SAVE_DELAY_MS = 120;
+const MAX_CURSOR_BYTES = 512;
+const CURSOR_COLORS = [
+  "#ee6b72", "#59baf2", "#e3ad54", "#ac8cf2",
+  "#5ecc9b", "#f288c9", "#6dcacc", "#ef9862",
+  "#b8cc61", "#9c9cf4", "#e56a9a", "#65b5e3",
+];
 
 let manager = null;
+
+function cleanDisplayName(value, fallback = "Guest") {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  // Display names are untrusted labels, not authenticated identities.
+  // eslint-disable-next-line no-control-regex
+  const name = value.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
+    .trim().slice(0, 40);
+  return name || fallback;
+}
 
 function normalizeNotePath(notePath) {
   if (typeof notePath !== "string" || !notePath || notePath.length > 2048) {
@@ -182,6 +200,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
         doc,
         text,
         members: new Set(),
+        people: new Map(),
         pending: Promise.resolve(),
         timer: null,
       };
@@ -209,7 +228,8 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     const room = rooms.get(key);
 
     if (room && room.members.delete(ws)) {
-      broadcast(room, "presence", { participants: room.members.size });
+      room.people.delete(ws);
+      announcePresence(room);
 
       if (room.members.size === 0) {
         flush(room)
@@ -224,6 +244,33 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     }
   }
 
+  function peopleIn(room) {
+    return [...room.people.values()].map((person) => ({ ...person }));
+  }
+
+  function announcePresence(room) {
+    broadcast(room, "presence", {
+      participants: room.members.size,
+      people: peopleIn(room),
+    });
+  }
+
+  function cursorPosition(encoded, room) {
+    if (typeof encoded !== "string" || encoded.length > MAX_CURSOR_BYTES) {
+      return null;
+    }
+
+    const bytes = Buffer.from(encoded, "base64");
+
+    if (!bytes.length || bytes.length > MAX_CURSOR_BYTES) {
+      return null;
+    }
+
+    const relative = Y.decodeRelativePosition(bytes);
+    const absolute = Y.createAbsolutePositionFromRelativePosition(relative, room.doc);
+    return absolute && absolute.type === room.text ? encoded : null;
+  }
+
   channel.on("join", async (msg, ws) => {
     try {
       const room = await openRoom(ws.ignisVaultId, msg.path);
@@ -232,13 +279,28 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
         return;
       }
 
-      room.members.add(ws);
+      if (!room.members.has(ws)) {
+        room.members.add(ws);
+        const used = new Set([...room.people.values()].map((person) => person.color));
+        const color = CURSOR_COLORS.find((candidate) => !used.has(candidate)) ||
+          CURSOR_COLORS[room.members.size % CURSOR_COLORS.length];
+        room.people.set(ws, {
+          id: crypto.randomUUID(),
+          name: cleanDisplayName(msg.name),
+          color,
+          anchor: null,
+          head: null,
+        });
+      }
+
       send(ws, "init", {
         path: room.path,
         state: Buffer.from(Y.encodeStateAsUpdate(room.doc)).toString("base64"),
         participants: room.members.size,
+        self: { ...room.people.get(ws) },
+        people: peopleIn(room),
       });
-      broadcast(room, "presence", { participants: room.members.size });
+      announcePresence(room);
     } catch (error) {
       // No filesystem or state-root details are exposed to browser clients.
       send(ws, "error", {
@@ -281,6 +343,44 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     }
   });
 
+  channel.on("identity", (msg, ws) => {
+    const relPath = normalizeNotePath(msg.path);
+    const room = relPath && rooms.get(idFor(ws.ignisVaultId, relPath));
+    const person = room?.people.get(ws);
+
+    if (!person) {
+      return;
+    }
+
+    person.name = cleanDisplayName(msg.name, person.name);
+    announcePresence(room);
+  });
+
+  channel.on("cursor", (msg, ws) => {
+    const relPath = normalizeNotePath(msg.path);
+    const room = relPath && rooms.get(idFor(ws.ignisVaultId, relPath));
+    const person = room?.people.get(ws);
+
+    if (!person) {
+      return;
+    }
+
+    try {
+      const anchor = cursorPosition(msg.anchor, room);
+      const head = cursorPosition(msg.head, room);
+
+      if (!anchor || !head) {
+        return;
+      }
+
+      person.anchor = anchor;
+      person.head = head;
+      broadcast(room, "cursor", { id: person.id, anchor, head }, ws);
+    } catch {
+      // Malformed or outdated Yjs positions are ignored, never broadcast.
+    }
+  });
+
   wss.on("connection", (ws) => {
     ws.on("close", () => {
       for (const room of rooms.values()) {
@@ -320,6 +420,7 @@ async function flushAll() {
 
 module.exports = {
   CHANNEL,
+  cleanDisplayName,
   normalizeNotePath,
   applyTextChange,
   createCollaborationManager,

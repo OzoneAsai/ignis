@@ -6,6 +6,12 @@ This fork adds realtime text collaboration for Markdown notes using Yjs. It does
 
 The bundled Ignis Bridge binds the active Obsidian `MarkdownView.editor` to a `Y.Text` document. Local editor changes become Yjs operations; incoming changes update only the modified range, preserving the cursor where possible. Both directions use Ignis's existing single WebSocket connection and the `collab` channel.
 
+### Identifiable collaborator cursors
+
+The server allocates a unique participant ID and a distinguishable color for each active WebSocket participant. The name is an editable, browser-tab-local display name (default: a short random Guest identifier), **not an authenticated identity**. Click the `Collab: N online` status-bar indicator to see the people in the current note and edit your own display name. Duplicate names are disambiguated with a short participant ID.
+
+Caret and selection endpoints are serialized as **Yjs relative positions**, so ordinary concurrent insertions can rebase remote positions without assuming stale absolute character offsets. Cursor awareness is ephemeral and is not saved in the Markdown or CRDT files. The renderer draws colored remote carets, name tags, and selection highlights over the active CodeMirror 6 editor. A departing participant is removed from the room roster and from all remote cursor overlays. The client clears the remote roster on connection loss and rejoins automatically when the WebSocket reconnects.
+
 The server creates rooms keyed by `[vaultId, relativeMarkdownPath]`. Each room maintains a Yjs document, relays Yjs updates to the other participants, and periodically saves two representations:
 
 - `VAULT_ROOT/<vault>/note.md`: ordinary Markdown for Obsidian and external tools.
@@ -46,7 +52,8 @@ The final script uses a separate headless Chrome profile and the `Collab Lab` de
 ## Current scope and limitations
 
 - Collaboration is automatic for the *active* Markdown editor. Multiple open panes in one browser are not yet independently bound.
-- Shared remote cursors, selection highlighting, identities, and document-level access controls are not implemented. Participant counts are available.
+- Remote cursors, selection highlighting, and editable display names are implemented for the active editor; **authenticated identities** and document-level access controls are not. Names are self-declared.
+- For performance, multi-line selections are drawn per logical document line (up to 250 highlighted lines); especially long soft-wrapped lines do not yet have pixel-perfect highlighted segments.
 - Editing through external file tools, non-CRDT plugins, rename/delete operations, and third-party sync engines while a room is active need additional coordination. Test with a dedicated vault before mounting production notes.
 - The service retains the parent Ignis project's authentication model: it has **no built-in user authentication**. Protect any network-facing deployment with HTTPS and authentication at a reverse proxy. Local testing does not need OAuth.
 - Collaboration state is currently held in one server process. Sticky WebSocket routing or a shared-room backend is required before scaling to multiple Ignis workers.
