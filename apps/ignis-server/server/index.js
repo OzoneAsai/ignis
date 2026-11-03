@@ -100,6 +100,13 @@ const collaboration = require("./collab");
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
+app.get("/ignis-offline-sw.js", (_req, res) => {
+  res.set("Cache-Control", "no-cache");
+  res.set("Service-Worker-Allowed", "/");
+  res.type("application/javascript");
+  res.sendFile(path.join(__dirname, "assets", "ignis-offline-sw.js"));
+});
+
 app.use("/api/fs", fsRoutes);
 app.use("/api/vault", vaultRoutes);
 app.use("/api/proxy", proxyRoutes);
@@ -209,6 +216,11 @@ const server = app.listen(config.port, async () => {
 const wss = setupWebSocket(server, {
   getVaultPath: config.getVaultPath,
   originAllowlist: settings.get("wsOrigins"),
+  // A live CRDT room, not the conventional file watcher, owns the note body.
+  // Metadata listeners are still notified independently.
+  filterFileEvent: (vaultId, event) => !(
+    event.type === "modified" && collaboration.getActive(vaultId, event.path)
+  ),
 });
 collaboration.register({
   wss,

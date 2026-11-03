@@ -181,6 +181,16 @@ try {
 
   await stopServer();
   await startServer(port);
+  const inactiveWrite = await fetch(`http://127.0.0.1:${port}/api/fs/writeFile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vault: "Lab", path: "Shared.md", content: "LOST EDIT", encoding: "utf-8" }),
+  });
+  assert(inactiveWrite.status === 409, "Inactive CRDT note silently accepted a conventional write");
+  assert((await inactiveWrite.json()).code === "COLLABORATIVE_WRITE_CONFLICT",
+    "Server failed to explain the conflicting write");
+  assert(await fs.readFile(note, "utf-8") === expected, "Inactive file write corrupted Markdown");
+  console.log("PASS: inactive collaborative note rejects silent whole-file overwrite");
   const restored = await join(port);
   assert(restored.doc.getText("content").toString() === expected, "Saved CRDT state did not survive restart");
   console.log("PASS: full CRDT state survives process restart");

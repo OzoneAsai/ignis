@@ -16,6 +16,7 @@ import { initNativeMenuGuard } from "./guards/native-menu-guard.js";
 import { initSettingsWindowGuard } from "./guards/settings-window-guard.js";
 import { initSpellcheckGuard } from "./guards/spellcheck-guard.js";
 import { initPopoutGuard } from "./guards/popout-guard.js";
+import { saveOfflineBootstrap, loadOfflineBootstrap } from "./offline-boot.js";
 
 let bootstrapVirtualPlugins = [];
 
@@ -133,6 +134,16 @@ function applyTree(tree) {
     fsShim._metadataCache.size,
     "entries",
   );
+}
+
+function applyBootstrapData(bootstrap) {
+  applyVaultInfo(bootstrap.vault);
+  window.__vaultList = bootstrap.vaultList;
+  applyTree(bootstrap.tree);
+  fsShim._watcherClient.setTreeEtag(bootstrap.etag);
+  applyCoreSyncGuard(bootstrap.plugins);
+  bootstrapVirtualPlugins = bootstrap.virtualPlugins || [];
+  applyServerSettings(bootstrap.settings);
 }
 
 function initVaultConfigFallback() {
@@ -267,18 +278,17 @@ function resolveWorkspaceAndAppearance() {
 }
 
 export function initialize() {
+  if ("serviceWorker" in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register("/ignis-offline-sw.js", { scope: "/" })
+      .catch((error) => console.warn("[ignis] Offline shell unavailable:", error));
+  }
+
   resolveVaultId();
 
   const bootstrap = fetchBootstrap();
 
   if (bootstrap) {
-    applyVaultInfo(bootstrap.vault);
-    window.__vaultList = bootstrap.vaultList;
-    applyTree(bootstrap.tree);
-    fsShim._watcherClient.setTreeEtag(bootstrap.etag);
-    applyCoreSyncGuard(bootstrap.plugins);
-    bootstrapVirtualPlugins = bootstrap.virtualPlugins || [];
-    applyServerSettings(bootstrap.settings);
+    applyBootstrapData(bootstrap);
 
     // Warm the caches before Obsidian boots.
     // The priority slice (configs and plugin entry files) resolves window.__ignisBootReady, which the index.html injector waits on before appending Obsidian's scripts, so Obsidian's early reads hit the cache.
@@ -292,18 +302,58 @@ export function initialize() {
 
     window.__ignisBooting = true;
 
+    // Persist exactly the boot metadata/config files that Obsidian may read
+    // synchronously. The online copy is always preferred on later launches.
+    priority.then(() => saveOfflineBootstrap(
+      window.__currentVaultId, bootstrap, fsShim._contentCache,
+    )).catch((error) => console.warn("[ignis] Offline bootstrap cache:", error));
+
     // Chain workspace/appearance resolution onto readiness so its config reads hit the warm priority slice instead of the network.
     window.__ignisBootReady = priority
       .catch(() => {})
       .then(resolveWorkspaceAndAppearance);
   } else {
-    initVaultConfigFallback();
-    initVaultListFallback();
-    initMetadataCacheFallback();
-    initCoreSyncGuardFallback();
-    // No prefetch on the fallback path, so resolve directly; the reads fall through to the network.
-    resolveWorkspaceAndAppearance();
-    window.__ignisBootReady = Promise.resolve();
+    window.__ignisBooting = true;
+    const label = document.getElementById("ignis-status-label");
+
+    if (label) {
+      label.textContent = "Opening locally saved vault…";
+    }
+
+    // CacheStorage is asynchronous and synchronous XHR cannot reliably read
+    // through a Service Worker. Hold Obsidian script injection until IndexedDB
+    // has restored its metadata and sync-file cache.
+    window.__ignisBootReady = loadOfflineBootstrap(window.__currentVaultId)
+      .then((offline) => {
+        if (offline) {
+          applyBootstrapData(offline.bootstrap);
+
+          for (const [path, content] of Object.entries({
+            ...offline.files,
+            ...offline.notes,
+          })) {
+            fsShim._contentCache.set(path, content);
+          }
+
+          window.__ignisOfflineBoot = true;
+          console.log("[ignis] Restored offline vault bootstrap from IndexedDB");
+        } else {
+          initVaultConfigFallback();
+          initVaultListFallback();
+          initMetadataCacheFallback();
+          initCoreSyncGuardFallback();
+        }
+
+        resolveWorkspaceAndAppearance();
+      })
+      .catch((error) => {
+        console.warn("[ignis] Offline vault initialization failed:", error);
+        initVaultConfigFallback();
+        initVaultListFallback();
+        initMetadataCacheFallback();
+        initCoreSyncGuardFallback();
+        resolveWorkspaceAndAppearance();
+      });
   }
 
   installRequestUrlShim();

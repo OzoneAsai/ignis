@@ -76,6 +76,32 @@ function applyTextChange(text, before, after, origin) {
   }, origin);
 }
 
+async function atomicReplace(target, content) {
+  const directory = path.dirname(target);
+  const temporary = path.join(directory, `.ignis-collab-tmp-${crypto.randomUUID()}`);
+  let handle;
+
+  try {
+    handle = await fs.promises.open(temporary, "wx");
+    await handle.writeFile(content);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.promises.rename(temporary, target);
+    // The rename itself must be durably recorded before an update is ACKed.
+    const dir = await fs.promises.open(directory, "r");
+
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } finally {
+    await handle?.close().catch(() => {});
+    await fs.promises.unlink(temporary).catch(() => {});
+  }
+}
+
 function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalescer }) {
   const rooms = new Map();
   const loading = new Map();
@@ -84,6 +110,11 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
 
   function idFor(vaultId, relPath) {
     return JSON.stringify([vaultId, relPath]);
+  }
+
+  function statePathFor(vaultId, relPath) {
+    const digest = crypto.createHash("sha256").update(idFor(vaultId, relPath)).digest("hex");
+    return path.join(stateDir, `${digest}.yjs`);
   }
 
   function send(ws, type, data) {
@@ -101,21 +132,37 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
   }
 
   async function persist(room) {
+    // Only acknowledge updates included in this exact on-disk snapshot.
+    const acknowledgements = room.acks.splice(0);
     const bytes = Buffer.from(Y.encodeStateAsUpdate(room.doc));
     const content = room.text.toString();
-    const temp = `${room.statePath}.${process.pid}.tmp`;
+    const digest = crypto.createHash("sha256").update(content).digest("hex");
 
-    await fs.promises.mkdir(stateDir, { recursive: true });
-    await fs.promises.writeFile(temp, bytes);
-    await fs.promises.rename(temp, room.statePath);
-    const writeCanonical = () => fs.promises.writeFile(room.filePath, content, "utf-8");
+    try {
+      await fs.promises.mkdir(stateDir, { recursive: true });
+      await atomicReplace(room.statePath, bytes);
+      const writeCanonical = () => atomicReplace(room.filePath, content);
 
-    if (writeCoalescer?.supersedePending) {
-      // Serialize behind in-flight conventional writes and atomically supersede
-      // queued stale snapshots before writing the CRDT's canonical content.
-      await writeCoalescer.supersedePending(room.filePath, writeCanonical);
-    } else {
-      await writeCanonical();
+      if (writeCoalescer?.supersedePending) {
+        await writeCoalescer.supersedePending(room.filePath, writeCanonical);
+      } else {
+        await writeCanonical();
+      }
+
+      // Commit record is written LAST. On restart it distinguishes a newer
+      // Yjs state that survived a crash from a deliberate external file edit.
+      const marker = `${room.statePath}.baseline.json`;
+      await atomicReplace(marker, JSON.stringify({ digest }));
+
+      for (const { ws, seq } of acknowledgements) {
+        send(ws, "saved", { path: room.path, seq });
+      }
+    } catch (error) {
+      for (const { ws, seq } of acknowledgements) {
+        send(ws, "save-error", { path: room.path, seq });
+      }
+
+      throw error;
     }
   }
 
@@ -164,6 +211,8 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     }
 
     const operation = (async () => {
+      // Establish the CRDT baseline after all conventional pending writes.
+      await writeCoalescer?.flushPending?.(filePath);
       const stat = await fs.promises.stat(filePath);
 
       if (!stat.isFile() || stat.size > MAX_NOTE_BYTES) {
@@ -171,8 +220,8 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
       }
 
       const diskText = await fs.promises.readFile(filePath, "utf-8");
-      const digest = crypto.createHash("sha256").update(roomId).digest("hex");
-      const statePath = path.join(stateDir, `${digest}.yjs`);
+      const diskDigest = crypto.createHash("sha256").update(diskText).digest("hex");
+      const statePath = statePathFor(vaultId, relPath);
       const doc = new Y.Doc();
       const text = doc.getText("content");
       const saved = await fs.promises.readFile(statePath).catch((error) => {
@@ -185,8 +234,29 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
 
       if (saved) {
         Y.applyUpdate(doc, saved);
-        // Preserve Yjs identity while acknowledging offline/external file edits.
-        applyTextChange(text, text.toString(), diskText, "external");
+        if (text.toString() !== diskText) {
+          const marker = await fs.promises.readFile(`${statePath}.baseline.json`, "utf-8")
+            .then((value) => JSON.parse(value)).catch(() => null);
+          const stateStat = await fs.promises.stat(statePath);
+          const diskIsExternal = marker?.digest
+            ? marker.digest !== diskDigest
+            : stat.mtimeMs >= stateStat.mtimeMs;
+
+          if (diskIsExternal) {
+            // A changed on-disk file is an independent edit, not an exception.
+            applyTextChange(text, text.toString(), diskText, "external");
+          } else {
+            // CRDT snapshot committed before crash, but Markdown did not.
+            // Restore the text projection without destroying CRDT identity.
+            const restore = () => fs.promises.writeFile(filePath, text.toString(), "utf-8");
+
+            if (writeCoalescer?.supersedePending) {
+              await writeCoalescer.supersedePending(filePath, restore);
+            } else {
+              await restore();
+            }
+          }
+        }
       } else if (diskText) {
         text.insert(0, diskText);
       }
@@ -201,6 +271,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
         text,
         members: new Set(),
         people: new Map(),
+        acks: [],
         pending: Promise.resolve(),
         timer: null,
       };
@@ -338,6 +409,11 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
       }
 
       Y.applyUpdate(room.doc, bytes, ws);
+      if (Number.isSafeInteger(msg.seq) && msg.seq >= 0) {
+        room.acks.push({ ws, seq: msg.seq });
+        // An unchanged full-state exchange must still receive a durability ACK.
+        schedulePersist(room);
+      }
     } catch {
       send(ws, "error", { path: relPath, error: "Invalid collaboration update" });
     }
@@ -392,6 +468,14 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
   });
 
   return {
+    isCollaborative(vaultId, notePath) {
+      const normalized = normalizeNotePath(notePath);
+
+      return normalized && (
+        rooms.has(idFor(vaultId, normalized)) ||
+        fs.existsSync(statePathFor(vaultId, normalized))
+      );
+    },
     getActive(vaultId, notePath) {
       const normalized = normalizeNotePath(notePath);
       const room = normalized && rooms.get(idFor(vaultId, normalized));
@@ -414,6 +498,10 @@ function getActive(vaultId, notePath) {
   return manager?.getActive(vaultId, notePath) || null;
 }
 
+function isCollaborative(vaultId, notePath) {
+  return manager?.isCollaborative(vaultId, notePath) || false;
+}
+
 async function flushAll() {
   await manager?.flushAll();
 }
@@ -426,5 +514,6 @@ module.exports = {
   createCollaborationManager,
   register,
   getActive,
+  isCollaborative,
   flushAll,
 };

@@ -255,6 +255,8 @@ router.post("/writeFile", async (req, res) => {
     toRelative(req._vaultRoot, resolved),
   );
 
+  const relPath = toRelative(req._vaultRoot, resolved);
+
   if (collaborative) {
     const current = collaborative.text.toString();
     return res.json({
@@ -262,6 +264,16 @@ router.post("/writeFile", async (req, res) => {
       collaborative: true,
       mtime: Date.now(),
       size: Buffer.byteLength(current, "utf-8"),
+    });
+  }
+
+  if (collaboration.isCollaborative(req._vaultId, relPath)) {
+    // Once a note has a CRDT history, a disconnected whole-file writer must
+    // not overwrite that history. Acknowledging its write would falsely claim
+    // success and lose the author's changes on the next room reopen.
+    return res.status(409).json({
+      error: "This note uses collaborative editing. Open it in the Ignis Markdown editor to merge changes.",
+      code: "COLLABORATIVE_WRITE_CONFLICT",
     });
   }
 

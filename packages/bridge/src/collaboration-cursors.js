@@ -49,34 +49,33 @@ export function resolveCursorSelection(text, peer) {
   }
 }
 
-function addSelectionRects(container, cm, root, color, start, end) {
-  if (start === end) {
-    return;
-  }
-
+function selectionRects(cm, root, start, end) {
+  const rects = [];
   const doc = cm.state.doc;
+  const visibleFrom = Math.max(start, cm.viewport?.from ?? 0);
+  const visibleTo = Math.min(end, cm.viewport?.to ?? doc.length);
   let count = 0;
 
-  for (let position = start; position < end && count < 250;) {
+  for (let position = visibleFrom; position < visibleTo && count < 250;) {
     const line = doc.lineAt(position);
-    const lineEnd = Math.min(line.to, end);
+    const lineEnd = Math.min(line.to, visibleTo);
     const first = cm.coordsAtPos(position);
     const last = cm.coordsAtPos(lineEnd);
 
     if (first && last) {
-      const mark = document.createElement("span");
-      mark.className = "ignis-collab-remote-selection";
-      mark.style.setProperty("--ignis-peer-color", color);
-      mark.style.left = `${first.left - root.left}px`;
-      mark.style.top = `${first.top - root.top}px`;
-      mark.style.height = `${Math.max(1, last.bottom - first.top)}px`;
-      mark.style.width = `${Math.max(2, last.left - first.left)}px`;
-      container.appendChild(mark);
+      rects.push({
+        left: first.left - root.left,
+        top: first.top - root.top,
+        height: Math.max(1, last.bottom - first.top),
+        width: Math.max(2, last.left - first.left),
+      });
     }
 
     position = Math.max(position + 1, lineEnd + 1);
     count++;
   }
+
+  return rects;
 }
 
 export function createCursorOverlay(session) {
@@ -92,11 +91,45 @@ export function createCursorOverlay(session) {
   cm.dom.appendChild(root);
   let raf = 0;
   let peers = [];
+  const nodes = new Map();
+
+  function discard(id) {
+    const record = nodes.get(id);
+
+    if (!record) {
+      return;
+    }
+
+    record.caret.remove();
+
+    for (const mark of record.marks) {
+      mark.remove();
+    }
+
+    nodes.delete(id);
+  }
+
+  function ensure(peer) {
+    if (nodes.has(peer.id)) {
+      return nodes.get(peer.id);
+    }
+
+    const caret = document.createElement("div");
+    caret.className = "ignis-collab-remote-caret";
+    caret.dataset.collabPeer = peer.id;
+    const label = document.createElement("span");
+    label.className = "ignis-collab-remote-label";
+    caret.appendChild(label);
+    root.appendChild(caret);
+    const record = { caret, label, marks: [] };
+    nodes.set(peer.id, record);
+    return record;
+  }
 
   function paint() {
     raf = 0;
-    root.replaceChildren();
     const bounds = cm.dom.getBoundingClientRect();
+    const displayed = new Set();
 
     for (const peer of peers) {
       const selection = resolveCursorSelection(session.text, peer);
@@ -105,31 +138,58 @@ export function createCursorOverlay(session) {
         continue;
       }
 
+      displayed.add(peer.id);
       const offset = Math.max(0, Math.min(cm.state.doc.length, selection.head));
       const caretCoords = cm.coordsAtPos(offset);
+      const visible = caretCoords && caretCoords.bottom >= bounds.top &&
+        caretCoords.top <= bounds.bottom;
+      const color = /^#[0-9a-fA-F]{6}$/.test(peer.color) ? peer.color : "#59baf2";
+      const record = ensure(peer);
+      record.caret.style.display = visible ? "" : "none";
+      record.caret.style.setProperty("--ignis-peer-color", color);
+      const name = peer.label || peer.name;
 
-      if (!caretCoords || caretCoords.bottom < bounds.top || caretCoords.top > bounds.bottom) {
-        continue;
+      if (record.label.textContent !== name) {
+        record.label.textContent = name;
       }
 
-      const color = /^#[0-9a-fA-F]{6}$/.test(peer.color) ? peer.color : "#59baf2";
-      const wrapper = document.createElement("div");
-      wrapper.className = "ignis-collab-remote-caret";
-      wrapper.dataset.collabPeer = peer.id;
-      wrapper.style.setProperty("--ignis-peer-color", color);
-      wrapper.style.left = `${caretCoords.left - bounds.left}px`;
-      wrapper.style.top = `${caretCoords.top - bounds.top}px`;
-      wrapper.style.height = `${Math.max(1, caretCoords.bottom - caretCoords.top)}px`;
-
-      const label = document.createElement("span");
-      label.className = "ignis-collab-remote-label";
-      label.textContent = peer.label || peer.name;
-      wrapper.appendChild(label);
-      root.appendChild(wrapper);
+      if (visible) {
+        record.caret.style.left = `${caretCoords.left - bounds.left}px`;
+        record.caret.style.top = `${caretCoords.top - bounds.top}px`;
+        record.caret.style.height = `${Math.max(1, caretCoords.bottom - caretCoords.top)}px`;
+      }
 
       const from = Math.min(selection.anchor, selection.head);
       const to = Math.max(selection.anchor, selection.head);
-      addSelectionRects(root, cm, bounds, color, from, to);
+      const rects = selectionRects(cm, bounds, from, to);
+
+      for (let i = 0; i < rects.length; i++) {
+        let mark = record.marks[i];
+
+        if (!mark) {
+          mark = document.createElement("span");
+          mark.className = "ignis-collab-remote-selection";
+          root.appendChild(mark);
+          record.marks.push(mark);
+        }
+
+        mark.style.setProperty("--ignis-peer-color", color);
+        const rect = rects[i];
+        mark.style.left = `${rect.left}px`;
+        mark.style.top = `${rect.top}px`;
+        mark.style.width = `${rect.width}px`;
+        mark.style.height = `${rect.height}px`;
+      }
+
+      while (record.marks.length > rects.length) {
+        record.marks.pop().remove();
+      }
+    }
+
+    for (const id of nodes.keys()) {
+      if (!displayed.has(id)) {
+        discard(id);
+      }
     }
   }
 
@@ -146,7 +206,9 @@ export function createCursorOverlay(session) {
         raf = 0;
       }
 
-      root.replaceChildren();
+      for (const id of nodes.keys()) {
+        discard(id);
+      }
       return;
     }
 

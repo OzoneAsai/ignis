@@ -96,6 +96,19 @@ export function createWatcherClient(
       return false;
     }
 
+    // The CRDT editor owns content while its room is active. A parallel file
+    // watcher invalidation could cause Obsidian to reload the whole note and
+    // interrupt native selection, undo or Japanese IME composition.
+    if (globalThis.window?.__ignis?.collaboration?.isActivePath(path)) {
+      if (stat) {
+        metadataCache.set(path, {
+          type: "file", size: stat.size, mtime: stat.mtime, ctime: stat.ctime,
+        });
+      }
+
+      return false;
+    }
+
     if (stat) {
       metadataCache.set(path, {
         type: "file",

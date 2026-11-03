@@ -209,6 +209,33 @@ try {
   })()`), 15000);
   console.log("PASS: both participants have visible remote cursors");
 
+  const editorState = await cdp.evaluate(b, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    const cm = editor.cm;
+    cm.contentDOM.__ignisStableEditor = 'same-element';
+    cm.scrollDOM.scrollTop = 450;
+    return {
+      anchor: cm.state.selection.main.anchor,
+      head: cm.state.selection.main.head,
+      selected: editor.getSelection(),
+      scrollTop: cm.scrollDOM.scrollTop,
+    };
+  })()`);
+
+  await cdp.evaluate(a, "window.app.workspace.activeLeaf.view.editor.replaceRange('~', {line:0,ch:0}); true");
+  await poll(async () => cdp.evaluate(b, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    const cm = editor.cm;
+    return cm.contentDOM.__ignisStableEditor === 'same-element' &&
+      editor.getValue().startsWith('~') &&
+      cm.state.selection.main.anchor === ${editorState.anchor + 1} &&
+      cm.state.selection.main.head === ${editorState.head + 1} &&
+      editor.getSelection() === ${JSON.stringify(editorState.selected)} &&
+      ((${editorState.scrollTop} < 100) ||
+        Math.abs(cm.scrollDOM.scrollTop - ${editorState.scrollTop}) < 70);
+  })()`), 15000);
+  console.log("PASS: remote edits preserve CodeMirror DOM, mapped selection and scroll state");
+
   // A displayed nickname is not a unique identity. Even when both participants
   // choose the same nickname, the overlay must disambiguate them.
   if (!await setName(b, "Alice")) {
@@ -236,7 +263,68 @@ try {
     const second = await read(b);
     return first === second && first.includes("Alice ") && first.includes("Bob ") && first;
   }, 20000);
-  console.log("PASS: two real Obsidian editors converged:", JSON.stringify(merged));
+  console.log("PASS: two real Obsidian editors converged:",
+    JSON.stringify(merged.slice(0, 110)), `(${merged.length} characters)`);
+
+  const markerId = `${process.pid}-${Date.now()}`;
+  const localMarker = `[LOCAL-UNDO-${markerId}]`;
+  const remoteMarker = `[REMOTE-KEEP-${markerId}]`;
+  const beforeOwnEdit = await read(b);
+  await cdp.evaluate(b, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.replaceRange(${JSON.stringify(localMarker)}, editor.offsetToPos(editor.getValue().length));
+    return true;
+  })()`);
+  await poll(async () => (await read(a)).includes(localMarker), 15000);
+  await cdp.evaluate(a, `window.app.workspace.activeLeaf.view.editor.replaceRange(${JSON.stringify(remoteMarker)}, {line:0,ch:0}); true`);
+  await poll(async () => (await read(b)).includes(remoteMarker), 15000);
+  const afterRemote = await read(b);
+  await cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.undo(); true");
+  const afterUndo = await read(b);
+  if (afterUndo.includes(localMarker) || !afterUndo.includes(remoteMarker)) {
+    throw new Error("Undo affected another participant's change: " + JSON.stringify({
+      before: beforeOwnEdit.slice(0, 60), afterRemote: afterRemote.slice(0, 90),
+      afterUndo: afterUndo.slice(0, 90),
+    }));
+  }
+
+  await cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.redo(); true");
+  await poll(async () => {
+    const value = await read(b);
+    return value.includes(localMarker) && value.includes(remoteMarker);
+  }, 10000);
+  console.log("PASS: local Undo/Redo preserve the remote participant's edits");
+
+  // A Japanese IME composition is a single author-intent boundary. Incoming
+  // updates must not rewrite the composing editor or destroy either change.
+  const composingText = `[IME-${markerId}]`;
+  const concurrentText = `[DURING-IME-${markerId}]`;
+  await cdp.evaluate(b, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.cm.dom.dispatchEvent(new CompositionEvent('compositionstart', {bubbles:true}));
+    editor.replaceRange(${JSON.stringify(composingText)},
+      editor.offsetToPos(editor.getValue().length));
+    return true;
+  })()`);
+  await cdp.evaluate(a, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.replaceRange(${JSON.stringify(concurrentText)}, {line:0,ch:0});
+    return true;
+  })()`);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const composingView = await read(b);
+
+
+  if (!composingView.includes(composingText) || composingView.includes(concurrentText)) {
+    throw new Error("Incoming remote edit interfered with the active composition");
+  }
+
+  await cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.cm.dom.dispatchEvent(new CompositionEvent('compositionend', {bubbles:true})); true");
+  await poll(async () => {
+    const [first, second] = await Promise.all([read(a), read(b)]);
+    return first === second && first.includes(composingText) && first.includes(concurrentText);
+  }, 15000);
+  console.log("PASS: IME composition and simultaneous remote edit merge without interrupting input");
 
   await cdp.command("Target.closeTarget", { targetId: cdp.targets.get(a) });
   await cdp.activate(b);

@@ -25,6 +25,9 @@ router.get("/", async (req, res) => {
 
     // don't cache the bootstrap response, since it contains the metadata tree which can change frequently.
     res.setHeader("Cache-Control", "no-store");
+    // The fork's Service Worker uses network-first + explicit fallback. This
+    // opt-in does NOT change the browser's ordinary HTTP caching semantics.
+    res.setHeader("X-Ignis-Offline-Cache", "1");
 
     const ae = req.headers["accept-encoding"] || "";
     const compressed = await getOrCompress(entry);

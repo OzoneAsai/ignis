@@ -24,7 +24,7 @@ function heartbeatSweep(clients) {
 }
 
 function setupWebSocket(server, opts = {}) {
-  const { getVaultPath, originAllowlist } = opts;
+  const { getVaultPath, originAllowlist, filterFileEvent } = opts;
 
   if (typeof getVaultPath !== "function") {
     throw new Error("setupWebSocket: opts.getVaultPath is required");
@@ -173,7 +173,7 @@ function setupWebSocket(server, opts = {}) {
 
     // Per-client listener that forwards file events over WebSocket
     const listener = (event) => {
-      if (ws.readyState === ws.OPEN) {
+      if (ws.readyState === ws.OPEN && filterFileEvent?.(vaultId, event) !== false) {
         ws.send(JSON.stringify(event));
       }
     };

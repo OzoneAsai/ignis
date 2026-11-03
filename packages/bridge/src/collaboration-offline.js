@@ -1,0 +1,215 @@
+import * as Y from "yjs";
+
+// The v1 name and object-store schema intentionally match y-indexeddb. Existing
+// offline drafts are migrated by reading its append-only Yjs update store.
+export function collaborationStorageKey(vault, note) {
+  return `ignis-collab-v1:${JSON.stringify([vault, note])}`;
+}
+
+const COMPACT_EVERY = 512;
+
+function openDatabase(name) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(name, 1);
+
+    request.onupgradeneeded = () => {
+      const database = request.result;
+
+      if (!database.objectStoreNames.contains("updates")) {
+        database.createObjectStore("updates", { autoIncrement: true });
+      }
+
+      if (!database.objectStoreNames.contains("custom")) {
+        database.createObjectStore("custom");
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => reject(new Error("Offline note database is blocked"));
+  });
+}
+
+function readSnapshot(database) {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(["updates", "custom"], "readonly");
+    const updates = transaction.objectStore("updates").getAll();
+    const initialized = transaction.objectStore("custom").get("initialized");
+    transaction.oncomplete = () => resolve({
+      updates: updates.result,
+      initialized: Boolean(initialized.result),
+    });
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+function transactionFor(database, stores) {
+  // Chrome supports strict durability; other browsers fall back to default
+  // IndexedDB durability rather than silently losing offline support.
+  try {
+    return database.transaction(stores, "readwrite", { durability: "strict" });
+  } catch {
+    return database.transaction(stores, "readwrite");
+  }
+}
+
+function appendUpdate(database, update) {
+  return new Promise((resolve, reject) => {
+    const transaction = transactionFor(database, ["updates"]);
+    transaction.objectStore("updates").add(update);
+    // Only this event means the Yjs update transaction actually committed.
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+function getMetadata(database, key) {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(["custom"], "readonly");
+    const request = transaction.objectStore("custom").get(key);
+    transaction.oncomplete = () => resolve(request.result);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+function setMetadata(database, key, value) {
+  return new Promise((resolve, reject) => {
+    const transaction = transactionFor(database, ["custom"]);
+    transaction.objectStore("custom").put(value, key);
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+function compact(database) {
+  return new Promise((resolve, reject) => {
+    // Read, merge and replace within the SAME transaction, including updates
+    // produced by another tab. Never compact from this tab's partial Y.Doc.
+    const transaction = transactionFor(database, ["updates"]);
+    const store = transaction.objectStore("updates");
+    const request = store.getAll();
+
+    request.onsuccess = () => {
+      if (request.result.length >= COMPACT_EVERY) {
+        const snapshot = Y.mergeUpdates(request.result);
+        store.clear();
+        store.add(snapshot);
+      }
+    };
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+export function createOfflineDocument(vaultId, notePath, onDurabilityChange = () => {}) {
+  const doc = new Y.Doc();
+  const text = doc.getText("content");
+  let localRevision = 0;
+  let savedRevision = 0;
+  let failure = null;
+  let closed = false;
+  let pending = Promise.resolve();
+  let database = null;
+  let writesSinceCompaction = 0;
+
+  const announce = () => {
+    if (!closed) {
+      onDurabilityChange({
+        isSaving: savedRevision < localRevision,
+        error: failure,
+        savedRevision,
+        localRevision,
+      });
+    }
+  };
+
+  const ready = openDatabase(collaborationStorageKey(vaultId, notePath))
+    .then(async (db) => {
+      database = db;
+      const snapshot = await readSnapshot(db);
+
+      doc.transact(() => {
+        for (const update of snapshot.updates) {
+          Y.applyUpdate(doc, update, "offline-hydration");
+        }
+      }, "offline-hydration");
+
+      // Bind only AFTER hydration, so replay cannot be counted as a new edit.
+      doc.on("update", (update) => {
+        if (closed) {
+          return;
+        }
+
+        const revision = ++localRevision;
+        announce();
+        pending = pending.catch(() => {}).then(async () => {
+          // A failed earlier write cannot be made good by a later dependent
+          // delta; recover by saving this document's COMPLETE current state.
+          const recovering = Boolean(failure);
+          const payload = recovering ? Y.encodeStateAsUpdate(doc) : update;
+          await appendUpdate(db, payload);
+          savedRevision = Math.max(savedRevision, revision);
+          failure = null;
+          writesSinceCompaction++;
+          announce();
+
+          if (writesSinceCompaction >= COMPACT_EVERY) {
+            writesSinceCompaction = 0;
+            await compact(db);
+          }
+        }).catch((error) => {
+          failure = error;
+          announce();
+          throw error;
+        });
+      });
+
+      return snapshot.initialized || snapshot.updates.length > 0;
+    }).catch((error) => {
+      failure = error;
+      announce();
+      throw error;
+    });
+
+  const persistence = {
+    async get(key) {
+      await ready;
+      return getMetadata(database, key);
+    },
+    async set(key, value) {
+      await ready;
+      return setMetadata(database, key, value);
+    },
+  };
+
+  return {
+    doc,
+    text,
+    persistence,
+    ready,
+    get status() {
+      return { isSaving: savedRevision < localRevision, error: failure };
+    },
+    async markInitialized() {
+      // The empty/nonempty initialization marker must never outrun the
+      // accompanying Yjs update. Otherwise an offline reload could see an
+      // initialized but incomplete note after an interrupted transaction.
+      await pending;
+      await persistence.set("initialized", 1);
+    },
+    async close() {
+      closed = true;
+      try {
+        await ready;
+        await pending;
+      } finally {
+        database?.close();
+        doc.destroy();
+      }
+    },
+  };
+}

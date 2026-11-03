@@ -126,7 +126,9 @@ describe("collaboration room", () => {
 
     await manager.flushAll();
     expect(await fs.promises.readFile(path.join(vaultPath, "test.md"), "utf-8")).toBe(merged);
-    expect((await fs.promises.readdir(path.join(root, "data", "collaboration"))).length).toBe(1);
+    const savedFiles = await fs.promises.readdir(path.join(root, "data", "collaboration"));
+    expect(savedFiles.filter((name) => name.endsWith(".yjs"))).toHaveLength(1);
+    expect(savedFiles.filter((name) => name.endsWith(".baseline.json"))).toHaveLength(1);
   });
 
   it("rejects a traversal and ignores updates from clients who have not joined", async () => {
@@ -150,6 +152,70 @@ describe("collaboration room", () => {
     text.insert(0, "abc");
     applyTextChange(text, "abc", "abXYZc", "external");
     expect(text.toString()).toBe("abXYZc");
+  });
+
+  it("does not claim remote sync until the canonical Markdown file is durable", async () => {
+    const ws = await connect();
+    const doc = await join(ws);
+    const before = Y.encodeStateVector(doc);
+    doc.getText("content").insert(0, "Saved ");
+    const saved = waitFor(ws, "saved");
+    ws.send(JSON.stringify({
+      channel: "collab", type: "update", path: "test.md", seq: 71,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc, before)).toString("base64"),
+    }));
+
+    const confirmation = await saved;
+    expect(confirmation.seq).toBe(71);
+    expect(await fs.promises.readFile(path.join(vaultPath, "test.md"), "utf-8"))
+      .toBe("Saved Start\n");
+
+    const unchanged = waitFor(ws, "saved");
+    ws.send(JSON.stringify({
+      channel: "collab", type: "update", path: "test.md", seq: 72,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64"),
+    }));
+    expect((await unchanged).seq).toBe(72);
+  });
+
+  it("recovers a Yjs update committed before a crash without reverting to stale Markdown", async () => {
+    const room = await manager.openRoom("test", "test.md");
+    room.text.insert(0, "Initial saved ");
+    await manager.flushAll();
+    const directory = path.join(root, "data", "collaboration");
+    const fileName = (await fs.promises.readdir(directory)).find((name) => name.endsWith(".yjs"));
+    const sidecar = path.join(directory, fileName);
+    const afterCrash = new Y.Doc();
+    Y.applyUpdate(afterCrash, await fs.promises.readFile(sidecar));
+    afterCrash.getText("content").insert(0, "CRASH RECOVERY ");
+    // Simulate the crash window: CRDT snapshot written; Markdown and the
+    // commit watermark still contain the preceding successfully saved text.
+    await fs.promises.writeFile(sidecar, Y.encodeStateAsUpdate(afterCrash));
+
+    const recreated = createCollaborationManager({
+      wss,
+      getVaultPath: (id) => (id === "test" ? vaultPath : null),
+      dataRoot: path.join(root, "data"),
+    });
+    const reopened = await recreated.openRoom("test", "test.md");
+    expect(reopened.text.toString()).toBe("CRASH RECOVERY Initial saved Start\n");
+    expect(await fs.promises.readFile(path.join(vaultPath, "test.md"), "utf-8"))
+      .toBe(reopened.text.toString());
+  });
+
+  it("treats a disk change after the last successful watermark as an independent edit", async () => {
+    const room = await manager.openRoom("test", "test.md");
+    room.text.insert(0, "Collaborative ");
+    await manager.flushAll();
+    const external = "External Collaborative Start\n";
+    await fs.promises.writeFile(path.join(vaultPath, "test.md"), external);
+    const recreated = createCollaborationManager({
+      wss,
+      getVaultPath: (id) => (id === "test" ? vaultPath : null),
+      dataRoot: path.join(root, "data"),
+    });
+    const reopened = await recreated.openRoom("test", "test.md");
+    expect(reopened.text.toString()).toBe(external);
   });
 
   it("tracks distinct named cursors, selections, and removes departed peers", async () => {

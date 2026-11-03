@@ -2,6 +2,14 @@
 // The shared Ignis WebSocket transports Yjs updates, not whole-file snapshots.
 import { MarkdownView, Modal } from "obsidian";
 import * as Y from "yjs";
+import { createOfflineDocument } from "./collaboration-offline.js";
+import { saveOfflineNote } from "../../shim/src/offline-boot.js";
+import { fsShim } from "../../shim/src/fs/index.js";
+import {
+  localChanges,
+  patchEditor,
+  reconcileEditor as reconcileEditorState,
+} from "./collaboration-editor.js";
 import {
   createCursorOverlay,
   encodeCursorSelection,
@@ -24,20 +32,18 @@ function ownDisplayName() {
 }
 
 class PeopleModal extends Modal {
-  constructor(app, getPeople, getName, setName) {
+  constructor(app, getPeople, getName, setName, getDetails, retrySync, dismissDraft) {
     super(app);
     this.getPeople = getPeople;
     this.getName = getName;
     this.setName = setName;
+    this.getDetails = getDetails;
+    this.retrySync = retrySync;
+    this.dismissDraft = dismissDraft;
   }
 
   onOpen() {
-    this.render();
-  }
-
-  render() {
     const root = this.contentEl;
-    root.replaceChildren();
     root.createEl("h3", { text: "Live collaborators" });
     const form = root.createEl("form");
     const label = form.createEl("label", { text: "Your display name" });
@@ -53,15 +59,96 @@ class PeopleModal extends Modal {
       this.setName(input.value);
       this.close();
     });
+    const details = this.getDetails();
+    root.createEl("p", { text: details.status });
+
+    if (details.storageError) {
+      root.createEl("p", {
+        text: "Local storage is unavailable. Keep this tab open and copy your note before closing it.",
+      });
+      root.createEl("small", { text: String(details.storageError.message || details.storageError) });
+    }
+
+    if (details.serverSaveError) {
+      root.createEl("p", {
+        text: "Your device retains the draft, but the server has not confirmed saving it.",
+      });
+      root.createEl("button", { text: "Retry server sync", type: "button" })
+        .addEventListener("click", () => {
+          this.retrySync();
+          this.close();
+        });
+    }
+
+    if (typeof details.pendingDraft === "string") {
+      root.createEl("h4", { text: "Recovered unsent draft" });
+      root.createEl("p", {
+        text: "An editor changed this note before the shared version finished loading. The unsent text is preserved separately. Review and copy it; it was NOT merged over other people's edits.",
+      });
+      const area = root.createEl("textarea");
+      area.readOnly = true;
+      area.value = details.pendingDraft;
+      area.style.width = "100%";
+      area.style.minHeight = "140px";
+      const copy = root.createEl("button", { text: "Copy recovered draft", type: "button" });
+      copy.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(details.pendingDraft);
+            copy.textContent = "Copied";
+          } catch {
+            area.select();
+          }
+        });
+      const dismiss = root.createEl("button", {
+        text: "Discard this recovery copy", type: "button",
+      });
+      dismiss.style.marginLeft = "10px";
+      dismiss.addEventListener("click", () => {
+        dismiss.textContent = "Confirm discard recovery copy";
+        dismiss.addEventListener("click", () => {
+          this.dismissDraft();
+          this.close();
+        }, { once: true });
+      }, { once: true });
+    }
+
     root.createEl("h4", { text: "People in this note" });
+    this.peopleList = root.createDiv({ cls: "ignis-collab-people" });
+    this.refreshPeople();
+  }
+
+  refreshPeople() {
+    if (!this.peopleList) {
+      return;
+    }
+
     const participants = this.getPeople();
+    const active = new Set(participants.map((person) => person.id));
+
+    for (const node of Array.from(this.peopleList.children)) {
+      if (!active.has(node.dataset.collabPeer)) {
+        node.remove();
+      }
+    }
 
     for (const person of participants) {
-      const entry = root.createDiv({ cls: "ignis-collab-person" });
-      const color = entry.createSpan({ cls: "ignis-collab-person-color" });
+      let entry = [...this.peopleList.children].find(
+        (node) => node.dataset.collabPeer === person.id,
+      );
+
+      if (!entry) {
+        entry = this.peopleList.createDiv({ cls: "ignis-collab-person" });
+        entry.dataset.collabPeer = person.id;
+        entry.createSpan({ cls: "ignis-collab-person-color" });
+        entry.createSpan({ cls: "ignis-collab-person-name" });
+        entry.createEl("small", { text: `· ${person.id.slice(0, 6)}` });
+      }
+
+      const color = entry.querySelector(".ignis-collab-person-color");
       color.style.setProperty("--ignis-peer-color", person.color);
-      entry.createSpan({ text: person.name + (person.isSelf ? " (you)" : "") });
-      entry.createEl("small", { text: `· ${person.id.slice(0, 6)}` });
+      entry.querySelector(".ignis-collab-person-name").textContent =
+        person.name + (person.isSelf ? " (you)" : "");
+      this.peopleList.appendChild(entry);
     }
   }
 }
@@ -87,29 +174,6 @@ function decodeUpdate(encoded) {
   return bytes;
 }
 
-function changeSpan(before, after) {
-  let prefix = 0;
-
-  while (prefix < Math.min(before.length, after.length) && before[prefix] === after[prefix]) {
-    prefix++;
-  }
-
-  let suffix = 0;
-
-  while (
-    suffix < Math.min(before.length, after.length) - prefix &&
-    before[before.length - suffix - 1] === after[after.length - suffix - 1]
-  ) {
-    suffix++;
-  }
-
-  return {
-    from: prefix,
-    to: before.length - suffix,
-    insert: after.slice(prefix, after.length - suffix),
-  };
-}
-
 function applyLocalChange(ytext, value) {
   const before = ytext.toString();
 
@@ -117,41 +181,16 @@ function applyLocalChange(ytext, value) {
     return;
   }
 
-  const { from, to, insert } = changeSpan(before, value);
-
   ytext.doc.transact(() => {
-    if (to > from) {
-      ytext.delete(from, to - from);
-    }
-
-    if (insert) {
-      ytext.insert(from, insert);
-    }
+    ytext.applyDelta(localChanges(before, value));
   }, LOCAL);
 }
 
 function reconcileEditor(session) {
-  const editor = session.editor;
-  const before = editor.getValue();
-  const after = session.text.toString();
-
-  if (before === after) {
-    return;
-  }
-
-  const { from, to, insert } = changeSpan(before, after);
-  const oldCursor = editor.posToOffset(editor.getCursor());
-  const nextCursor = oldCursor < from
-    ? oldCursor
-    : oldCursor > to
-      ? oldCursor + insert.length - (to - from)
-      : from + insert.length;
-
   session.suppress = true;
 
   try {
-    editor.replaceRange(insert, editor.offsetToPos(from), editor.offsetToPos(to));
-    editor.setCursor(editor.offsetToPos(Math.min(after.length, nextCursor)));
+    return reconcileEditorState(session.editor, session.text.toString());
   } finally {
     session.suppress = false;
   }
@@ -166,6 +205,10 @@ export function initCollaboration(plugin) {
   let session = null;
   let activeTimer = null;
   let peopleModal = null;
+
+  window.__ignis.collaboration = {
+    isActivePath: (path) => Boolean(session && session.path === path),
+  };
 
   function people() {
     if (!session) {
@@ -199,6 +242,24 @@ export function initCollaboration(plugin) {
           channel.send("identity", { path: session.path, name: clean });
         }
 
+        render();
+        renderPeers(session);
+        peopleModal?.refreshPeople();
+      }
+    }, () => ({
+      status: status.textContent,
+      storageError: session?.storageError,
+      serverSaveError: session?.serverSaveError,
+      pendingDraft: session?.pendingConflict,
+    }), () => {
+      if (session?.joined && ws.isOpen()) {
+        sendUpdate(session, Y.encodeStateAsUpdate(session.doc));
+      }
+    }, () => {
+      if (session?.pendingConflict) {
+        session.pendingConflict = null;
+        session.local.persistence.set("unsent-startup-draft", null)
+          .catch((error) => console.warn("[collab] Could not clear recovery copy:", error));
         render();
       }
     });
@@ -236,28 +297,120 @@ export function initCollaboration(plugin) {
 
   function render() {
     if (!session) {
-      status.setText("");
+      if (status.textContent) {
+        status.setText("");
+      }
       return;
     }
 
-    if (!ws.isOpen()) {
-      status.setText("Collab: offline");
+    let label;
+
+    if (session.storageError) {
+      label = "Collab: local storage failed · keep this tab open";
+    } else if (!session.hydrated) {
+      label = "Collab: loading local draft…";
+    } else if (!session.initialized) {
+      label = ws.isOpen() ? "Collab: loading note…" : "Collab: offline · note unavailable";
+    } else if (session.pendingConflict) {
+      label = "Collab: review unsent startup changes";
+    } else if (session.serverSaveError) {
+      label = "Collab: server save failed · local draft retained";
+    } else if (session.protocolError) {
+      label = "Collab: synchronization error · check this note";
+    } else if (session.localSaving || session.previewSaving) {
+      label = ws.isOpen() ? "Collab: saving to device…" : "Collab: offline · saving locally…";
+    } else if (!ws.isOpen()) {
+      label = "Collab: offline · saved on device";
     } else if (!session.joined) {
-      status.setText("Collab: joining…");
+      label = "Collab: reconnecting · local copy ready";
+    } else if (session.dirty || session.confirmedSeq < session.sentSeq) {
+      label = `Collab: syncing · ${session.participants} online`;
     } else {
-      status.setText(`Collab: ${session.participants} online`);
+      label = `Collab: ${session.participants} online · saved`;
     }
 
-    renderPeers(session);
-    if (peopleModal?.isOpen) {
-      peopleModal.render();
+    if (status.textContent !== label) {
+      status.setText(label);
     }
   }
 
   function sendJoin() {
-    if (session && ws.isOpen()) {
+    if (session?.hydrated && ws.isOpen() && !session.joined) {
       channel.send("join", { path: session.path, name: ownDisplayName() });
     }
+  }
+
+  function sendUpdate(current, bytes) {
+    if (!current.joined || !ws.isOpen()) {
+      return;
+    }
+
+    current.sentSeq++;
+    current.dirty = true;
+    current.serverSaveError = false;
+    channel.send("update", {
+      path: current.path,
+      seq: current.sentSeq,
+      update: encodeUpdate(bytes),
+    });
+    render();
+  }
+
+  function guardEditor(current) {
+    const contentDOM = current.editor.cm?.contentDOM;
+
+    if (!contentDOM) {
+      return;
+    }
+
+    const previous = contentDOM.getAttribute("contenteditable");
+    contentDOM.setAttribute("contenteditable", "false");
+    contentDOM.setAttribute("aria-busy", "true");
+    current.unlockEditor = () => {
+      if (previous === null) {
+        contentDOM.removeAttribute("contenteditable");
+      } else {
+        contentDOM.setAttribute("contenteditable", previous);
+      }
+
+      contentDOM.removeAttribute("aria-busy");
+      current.unlockEditor = null;
+    };
+  }
+
+  function writeOfflinePreview(current) {
+    clearTimeout(current.previewTimer);
+    current.previewTimer = null;
+    const content = current.text.toString();
+    const revision = current.previewRevision;
+    current.previewPromise = current.previewPromise.then(() =>
+      saveOfflineNote(window.__currentVaultId, current.path, content)
+    ).then((saved) => {
+      if (!saved) {
+        throw new Error("This note exceeds the offline startup cache limit");
+      }
+
+      if (revision === current.previewRevision && session === current) {
+        current.previewSaving = false;
+        render();
+      }
+    }).catch((error) => {
+      current.storageError = error;
+      console.error("[collab] Offline note cache failed:", error);
+      render();
+    });
+  }
+
+  function scheduleOfflinePreview(current) {
+    if (!current.hydrated || !current.initialized) {
+      return;
+    }
+
+    current.previewRevision++;
+    current.previewSaving = true;
+    clearTimeout(current.previewTimer);
+    current.previewTimer = setTimeout(() => writeOfflinePreview(current), 90);
+    render();
   }
 
   function sendSelection(current) {
@@ -291,6 +444,27 @@ export function initCollaboration(plugin) {
     current.selectionTimer = setTimeout(() => sendSelection(current), 65);
   }
 
+  function finishComposition(current) {
+    clearTimeout(current.compositionTimer);
+
+    if (!current.composing || !current.initialized) {
+      return;
+    }
+
+    // Keep the original Y.Doc fixed during native IME composition. A remote
+    // update received mid-composition must not rewrite the composing DOM.
+    // Apply the author's completed change first, then merge buffered remote
+    // CRDT operations. This preserves both inputs and CodeMirror's IME state.
+    applyLocalChange(current.text, current.editor.getValue());
+    current.composing = false;
+
+    for (const update of current.pendingRemote.splice(0)) {
+      Y.applyUpdate(current.doc, update, REMOTE);
+    }
+
+    scheduleSelection(current);
+  }
+
   function dispose() {
     if (!session) {
       return;
@@ -304,9 +478,18 @@ export function initCollaboration(plugin) {
     }
 
     clearTimeout(current.selectionTimer);
+    finishComposition(current);
+    if (current.previewTimer) {
+      writeOfflinePreview(current);
+    }
+    current.restoreUndo?.();
+    current.undoManager?.destroy();
     current.removeEditorListeners?.();
     current.overlay?.destroy();
-    current.doc.destroy();
+    current.unlockEditor?.();
+    current.local?.close().catch((error) => {
+      console.warn("[collab] Could not close offline document:", error);
+    });
     render();
   }
 
@@ -326,23 +509,96 @@ export function initCollaboration(plugin) {
 
     dispose();
 
-    const doc = new Y.Doc();
-    const text = doc.getText("content");
     const next = {
       path: file.path,
       editor,
-      doc,
-      text,
       initial: editor.getValue(),
       initialized: false,
+      hydrated: false,
       joined: false,
+      dirty: false,
+      sentSeq: 0,
+      confirmedSeq: 0,
+      localSaving: false,
+      storageError: null,
+      serverSaveError: false,
+      protocolError: null,
+      previewSaving: false,
+      previewRevision: 0,
+      previewTimer: null,
+      previewPromise: Promise.resolve(),
       suppress: false,
       participants: 1,
       people: new Map(),
       self: null,
       lastSelection: null,
       selectionTimer: null,
+      composing: false,
+      compositionTimer: null,
+      pendingRemote: [],
     };
+
+    const local = createOfflineDocument(window.__currentVaultId, file.path, (storage) => {
+      if (session === next) {
+        next.localSaving = storage.isSaving;
+        next.storageError = storage.error;
+        render();
+      }
+    });
+    const { doc, text } = local;
+    next.doc = doc;
+    next.text = text;
+    next.local = local;
+    next.undoManager = new Y.UndoManager(text, {
+      trackedOrigins: new Set([LOCAL]),
+      captureTimeout: 500,
+    });
+
+    // CodeMirror's stock history cannot distinguish a remote transaction from
+    // the local author's changes. Use Yjs UndoManager for collaborative notes:
+    // remote edits remain untouched, and Undo itself is synced as a CRDT edit.
+    const originalUndo = editor.undo;
+    const originalRedo = editor.redo;
+    const undo = () => next.undoManager.undo();
+    const redo = () => next.undoManager.redo();
+    editor.undo = function () {
+      return next.initialized && session === next
+        ? undo()
+        : originalUndo.call(editor);
+    };
+    editor.redo = function () {
+      return next.initialized && session === next
+        ? redo()
+        : originalRedo.call(editor);
+    };
+
+    const onUndoShortcut = (event) => {
+      if (!next.initialized || session !== next || event.isComposing ||
+          !editor.cm?.dom?.contains(event.target) ||
+          !(event.metaKey || event.ctrlKey) || event.altKey) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      const wantsUndo = key === "z" && !event.shiftKey;
+      const wantsRedo = (key === "z" && event.shiftKey) ||
+        (key === "y" && event.ctrlKey && !event.metaKey);
+
+      if (wantsUndo || wantsRedo) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        (wantsUndo ? undo : redo)();
+      }
+    };
+
+    document.addEventListener("keydown", onUndoShortcut, true);
+    next.restoreUndo = () => {
+      document.removeEventListener("keydown", onUndoShortcut, true);
+      editor.undo = originalUndo;
+      editor.redo = originalRedo;
+    };
+
+    guardEditor(next);
 
     next.overlay = createCursorOverlay(next);
 
@@ -353,6 +609,21 @@ export function initCollaboration(plugin) {
     for (const event of events) {
       cmDom?.addEventListener(event, onCursorMotion);
     }
+
+    const onCompositionStart = () => {
+      if (next.initialized) {
+        next.composing = true;
+      }
+    };
+    const onCompositionEnd = () => {
+      if (next.composing) {
+        clearTimeout(next.compositionTimer);
+        // Native compositionend can precede its final editor-change event.
+        next.compositionTimer = setTimeout(() => finishComposition(next), 0);
+      }
+    };
+    cmDom?.addEventListener("compositionstart", onCompositionStart);
+    cmDom?.addEventListener("compositionend", onCompositionEnd);
 
     const onSelectionChange = () => {
       if (editor.cm?.hasFocus) {
@@ -367,24 +638,76 @@ export function initCollaboration(plugin) {
       }
 
       document.removeEventListener("selectionchange", onSelectionChange);
+      cmDom?.removeEventListener("compositionstart", onCompositionStart);
+      cmDom?.removeEventListener("compositionend", onCompositionEnd);
     };
 
     doc.on("update", (update, origin) => {
-      if (origin !== REMOTE && session === next && next.joined && ws.isOpen()) {
-        channel.send("update", { path: next.path, update: encodeUpdate(update) });
+      if ((origin === LOCAL || origin === next.undoManager) && session === next) {
+        next.dirty = true;
+        sendUpdate(next, update);
+        render();
       }
     });
 
-    text.observe(() => {
+    text.observe((event, transaction) => {
+      if (session === next) {
+        fsShim._contentCache.set(next.path, next.text.toString());
+      }
+
       if (session === next && next.initialized) {
-        reconcileEditor(next);
+        if (transaction.origin !== LOCAL) {
+          next.suppress = true;
+
+          try {
+            if (!patchEditor(next.editor, next.text, event.delta)) {
+              // One fallback CM6 transaction, not a DOM replacement.
+              reconcileEditor(next);
+            }
+          } finally {
+            next.suppress = false;
+          }
+        }
+
         renderPeers(next);
+        scheduleOfflinePreview(next);
       }
     });
 
     session = next;
     render();
-    sendJoin();
+
+    local.ready.then((hasLocalCopy) => {
+      if (session !== next) {
+        return;
+      }
+
+      next.hydrated = true;
+
+      if (hasLocalCopy) {
+        next.initialized = true;
+        reconcileEditor(next);
+        fsShim._contentCache.set(next.path, next.text.toString());
+        next.unlockEditor?.();
+        scheduleOfflinePreview(next);
+      }
+
+      render();
+      sendJoin();
+      next.local.persistence.get("unsent-startup-draft").then((draft) => {
+        if (session === next && typeof draft === "string") {
+          next.pendingConflict = draft;
+          render();
+        }
+      }).catch((error) => console.warn("[collab] Could not read startup recovery copy:", error));
+    }).catch((error) => {
+      console.error("[collab] Local draft initialization failed:", error);
+
+      if (session === next) {
+        next.storageError = error;
+        render();
+      }
+    });
   }
 
   function scheduleActive() {
@@ -394,7 +717,7 @@ export function initCollaboration(plugin) {
 
   const unsubscribe = [
     channel.subscribe("init", (msg) => {
-      if (!session || msg.path !== session.path) {
+      if (!session || msg.path !== session.path || !session.hydrated) {
         return;
       }
 
@@ -412,17 +735,31 @@ export function initCollaboration(plugin) {
         current.lastSelection = null;
 
         if (changedWhileJoining) {
-          // Preserve edits made during the initial WebSocket handshake.
-          applyLocalChange(current.text, preJoinText);
+          if (current.text.toString() === current.initial) {
+            // Inputs that occurred before hydration had the same baseline.
+            applyLocalChange(current.text, preJoinText);
+          } else {
+            // A plugin changed the uninitialized editor against a divergent
+            // server state. Preserve the exact draft; never overwrite peers.
+            current.pendingConflict = preJoinText;
+            current.local.persistence.set("unsent-startup-draft", preJoinText).catch(
+              (error) => console.warn("[collab] Unable to store competing draft:", error),
+            );
+          }
         }
 
         reconcileEditor(current);
-        // Full state exchange also catches any edits made while disconnected.
-        channel.send("update", {
-          path: current.path,
-          update: encodeUpdate(Y.encodeStateAsUpdate(current.doc)),
+        fsShim._contentCache.set(current.path, current.text.toString());
+        current.unlockEditor?.();
+        current.local.markInitialized().catch((error) => {
+          current.storageError = error;
+          render();
         });
+        scheduleOfflinePreview(current);
+        // Full state exchange includes local edits retained while disconnected.
+        sendUpdate(current, Y.encodeStateAsUpdate(current.doc));
         render();
+        renderPeers(current);
         scheduleSelection(current);
       } catch (error) {
         console.error("[collab] Failed to initialize note:", error);
@@ -435,7 +772,13 @@ export function initCollaboration(plugin) {
       }
 
       try {
-        Y.applyUpdate(session.doc, decodeUpdate(msg.update), REMOTE);
+        const bytes = decodeUpdate(msg.update);
+
+        if (session.composing) {
+          session.pendingRemote.push(bytes);
+        } else {
+          Y.applyUpdate(session.doc, bytes, REMOTE);
+        }
       } catch (error) {
         console.error("[collab] Invalid remote update:", error);
       }
@@ -449,6 +792,10 @@ export function initCollaboration(plugin) {
         }
 
         render();
+        renderPeers(session);
+        if (peopleModal?.isOpen) {
+          peopleModal.refreshPeople();
+        }
       }
     }),
     channel.subscribe("cursor", (msg) => {
@@ -467,7 +814,30 @@ export function initCollaboration(plugin) {
     channel.subscribe("error", (msg) => {
       if (session?.path === msg.path) {
         console.error("[collab]", msg.error);
-        status.setText("Collab: " + msg.error);
+        session.protocolError = msg.error;
+        render();
+      }
+    }),
+    channel.subscribe("saved", (msg) => {
+      if (!session || msg.path !== session.path || !Number.isSafeInteger(msg.seq)) {
+        return;
+      }
+
+      session.confirmedSeq = Math.max(session.confirmedSeq, msg.seq);
+      session.serverSaveError = false;
+      session.protocolError = null;
+
+      if (session.confirmedSeq >= session.sentSeq && session.joined) {
+        session.dirty = false;
+      }
+
+      render();
+    }),
+    channel.subscribe("save-error", (msg) => {
+      if (session?.path === msg.path) {
+        session.serverSaveError = true;
+        session.dirty = true;
+        render();
       }
     }),
     ws.onStateChange((state) => {
@@ -489,7 +859,8 @@ export function initCollaboration(plugin) {
   plugin.registerEvent(plugin.app.workspace.on("active-leaf-change", scheduleActive));
   plugin.registerEvent(plugin.app.workspace.on("file-open", scheduleActive));
   plugin.registerEvent(plugin.app.workspace.on("editor-change", (editor) => {
-    if (session?.editor === editor && session.initialized && !session.suppress) {
+    if (session?.editor === editor && session.initialized && !session.suppress &&
+        !session.composing) {
       applyLocalChange(session.text, editor.getValue());
       scheduleSelection(session);
     }
@@ -508,7 +879,8 @@ export function initCollaboration(plugin) {
     }
 
     status.remove();
+    delete window.__ignis.collaboration;
   };
 }
 
-export { changeSpan, applyLocalChange };
+export { applyLocalChange };
