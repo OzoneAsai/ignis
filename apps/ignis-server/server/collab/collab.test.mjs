@@ -215,6 +215,25 @@ describe("collaboration room", () => {
     expect(second.text.toString()).toBe("Recreated while marker remains\n");
   });
 
+  it("retains a protected-path tombstone after deleting a note generation", async () => {
+    const original = await manager.openRoom("test", "test.md");
+    const tombstone = `${historyPath("test.md")}.protected`;
+    expect(fs.existsSync(tombstone)).toBe(true);
+    const restarted = createCollaborationManager({
+      wss,
+      getVaultPath: (id) => (id === "test" ? vaultPath : null),
+      dataRoot: path.join(root, "data"),
+    });
+    await restarted.deleteNote("test", "test.md", () =>
+      fs.promises.unlink(path.join(vaultPath, "test.md")));
+    expect(fs.existsSync(tombstone)).toBe(true);
+    expect(restarted.isCollaborative("test", "test.md")).toBe(true);
+    await fs.promises.writeFile(path.join(vaultPath, "test.md"), "Fresh content\n");
+    const next = await restarted.openRoom("test", "test.md");
+    expect(next.documentId).not.toBe(original.documentId);
+    expect(next.text.toString()).toBe("Fresh content\n");
+  });
+
   it("does not claim remote sync until the canonical Markdown file is durable", async () => {
     const ws = await connect();
     const doc = await join(ws);

@@ -142,12 +142,12 @@ try {
       `Boolean(window.app.vault.getAbstractFileByPath(${JSON.stringify(notePath)}))`),
     40000);
 
-    const opened = await cdp.evaluate(tab, `(async () => {
+    const opened = await poll(() => cdp.evaluate(tab, `(async () => {
       const file = window.app.vault.getAbstractFileByPath(${JSON.stringify(notePath)});
       if (!file) throw new Error("Browser test note is missing");
       await window.app.workspace.getLeaf(false).openFile(file);
       return Boolean(window.app.workspace.activeLeaf?.view?.editor);
-    })()`);
+    })()`), 30000);
 
     if (!opened) {
       throw new Error("Obsidian Markdown editor was not opened");
@@ -279,6 +279,23 @@ try {
   await cdp.evaluate(a, `window.app.workspace.activeLeaf.view.editor.replaceRange(${JSON.stringify(remoteMarker)}, {line:0,ch:0}); true`);
   await poll(async () => (await read(b)).includes(remoteMarker), 15000);
   const afterRemote = await read(b);
+  // Obsidian re-installs its own CodeMirror Undo/Redo when editor views are
+  // reconfigured. Even an explicit reassignment MUST NOT bypass Yjs routing.
+  const guardedCommands = await cdp.evaluate(b, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    const undoDescriptor = Object.getOwnPropertyDescriptor(editor, 'undo');
+    const redoDescriptor = Object.getOwnPropertyDescriptor(editor, 'redo');
+    if (!undoDescriptor?.get || !undoDescriptor?.set ||
+        !redoDescriptor?.get || !redoDescriptor?.set) return false;
+    editor.undo = () => { throw new Error('CodeMirror native Undo leaked'); };
+    editor.redo = () => { throw new Error('CodeMirror native Redo leaked'); };
+    return true;
+  })()`);
+
+  if (!guardedCommands) {
+    throw new Error("Obsidian restored a native history command without a stable guard");
+  }
+
   await cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.undo(); true");
   const afterUndo = await read(b);
   if (afterUndo.includes(localMarker) || !afterUndo.includes(remoteMarker)) {

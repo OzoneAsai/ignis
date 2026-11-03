@@ -224,6 +224,13 @@ try {
   });
   assert(deleted.status === 200, `Inactive collaborative delete failed: ${deleted.status}`);
   await fs.writeFile(note, "Brand-new unrelated note\n");
+  const staleAfterRecreate = await fetch(`http://127.0.0.1:${port}/api/fs/writeFile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vault: "Lab", path: "Shared.md", content: "STALE SNAPSHOT", encoding: "utf-8" }),
+  });
+  assert(staleAfterRecreate.status === 409,
+    "Recreated note accepted an old-generation native whole-file autosave");
   const recreated = await join(port);
   assert(recreated.doc.getText("content").toString() === "Brand-new unrelated note\n",
     "Deleted note's CRDT history contaminated the new note");

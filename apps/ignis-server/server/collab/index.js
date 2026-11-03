@@ -147,6 +147,14 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     return path.join(stateDir, `${digest}.yjs`);
   }
 
+  function protectedPathFor(vaultId, relPath) {
+    // The protection marker survives note deletion: an older browser may
+    // reconnect before a newly created note has initialized its CRDT room.
+    // Without a tombstone, its ordinary queued whole-file autosave could
+    // overwrite the replacement before generation IDs can be compared.
+    return `${statePathFor(vaultId, relPath)}.protected`;
+  }
+
   function operationConflict() {
     const error = new Error("This collaborative note is in use or has a conflicting history. Close active editors before changing its path.");
     error.code = "COLLABORATIVE_FILE_OPERATION_CONFLICT";
@@ -233,6 +241,14 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
             moved.push([oldName, newName]);
           }
         }
+
+        // Only paths with a previous CRDT generation require this tombstone.
+        // An ordinary Markdown rename must not accidentally become a CRDT
+        // note or require a collaboration state directory to already exist.
+        if (moved.length || fs.existsSync(protectedPathFor(vaultId, from))) {
+          await fs.promises.mkdir(stateDir, { recursive: true });
+          await atomicReplace(protectedPathFor(vaultId, to), "collaborative-path-v1");
+        }
       } catch (error) {
         for (const [oldName, newName] of moved.reverse()) {
           await fs.promises.rename(newName, oldName).catch(() => {});
@@ -242,6 +258,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
 
         throw error;
       }
+
     });
   }
 
@@ -504,6 +521,12 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
         await persist(room);
       }
 
+      const protection = protectedPathFor(vaultId, relPath);
+
+      if (!fs.existsSync(protection)) {
+        await atomicReplace(protection, "collaborative-path-v1");
+      }
+
       rooms.set(roomId, room);
       return room;
     })();
@@ -720,7 +743,9 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
 
       return normalized && (
         rooms.has(idFor(vaultId, normalized)) ||
-        fs.existsSync(statePathFor(vaultId, normalized))
+        fs.existsSync(statePathFor(vaultId, normalized)) ||
+        fs.existsSync(protectedPathFor(vaultId, normalized)) ||
+        mutationBlocked(vaultId, normalized)
       );
     },
     getActive(vaultId, notePath) {

@@ -287,6 +287,27 @@ try {
     15000, "same-origin live offline BroadcastChannel sync");
   await poll(async () => (await page.status(secondTab)).includes("saved on device"),
     12000, "second tab local durable edit");
+  // Undo in one disconnected tab may only revert that tab's own Yjs edit.
+  // The other tab's text remains, even when Obsidian re-installs commands.
+  await page.cdp.evaluate(secondTab, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.undo = () => { throw new Error('Native Undo escaped CRDT guard'); };
+    editor.redo = () => { throw new Error('Native Redo escaped CRDT guard'); };
+    editor.undo();
+    return true;
+  })()`);
+  await poll(async () => {
+    const [first, second] = await Promise.all([page.read(), page.read(secondTab)]);
+    return first === second && first.includes("OFFLINE FIRST") &&
+      !first.includes("OFFLINE SECOND TAB");
+  }, 15000, "offline author-isolated Undo");
+  await page.cdp.evaluate(secondTab,
+    "window.app.workspace.activeLeaf.view.editor.redo(); true");
+  await poll(async () => {
+    const [first, second] = await Promise.all([page.read(), page.read(secondTab)]);
+    return first === second && first.includes("OFFLINE SECOND TAB");
+  }, 15000, "offline author-isolated Redo");
+  console.log("PASS: offline Undo/Redo never removes the other tab's edits");
   console.log("PASS: two Chrome tabs converge offline without a running server");
 
   await page.openPage();
@@ -321,13 +342,36 @@ try {
   // note at that path. The old offline updates must never reappear in it.
   await stopServer();
   const replacementText = "A completely different document generation\n";
-  await fs.rm(path.join(dataRoot, "collaboration"), { recursive: true, force: true });
+  const historyDir = path.join(dataRoot, "collaboration");
+  const historical = await fs.readdir(historyDir);
+  await Promise.all(historical
+    .filter((name) => name.endsWith(".yjs") || name.endsWith(".baseline.json"))
+    .map((name) => fs.unlink(path.join(historyDir, name))));
+  assert(historical.some((name) => name.endsWith(".protected")),
+    "The old note lacks a durable stale-writer protection tombstone");
   await fs.writeFile(file, replacementText, "utf-8");
   await startServer(port);
+  const staleWrite = await fetch(`http://127.0.0.1:${port}/api/fs/writeFile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      vault: "Lab", path: "Offline Draft.md", encoding: "utf-8",
+      content: "STALE PREVIOUS GENERATION AUTOSAVE\n",
+    }),
+  });
+  assert(staleWrite.status === 409,
+    "A recreated collaborative note accepted an old whole-file snapshot");
   await poll(async () => (await page.status()).includes("note replaced"),
     30000, "generation mismatch warning");
-  assert(await fs.readFile(file, "utf-8") === replacementText,
-    "Stale offline CRDT state overwrote a replacement note");
+  const changedBody = await fs.readFile(file, "utf-8");
+  assert(changedBody === replacementText,
+    "Stale offline CRDT state overwrote a replacement note: " + JSON.stringify({
+      content: changedBody.slice(0, 200),
+      firstStatus: await page.status(),
+      secondStatus: await page.status(secondTab),
+      firstEditor: (await page.read()).slice(0, 160),
+      secondEditor: (await page.read(secondTab)).slice(0, 160),
+    }));
   assert((await page.read()).includes("OFFLINE FIRST"),
     "Original offline recovery copy was discarded before user consent");
   console.log("PASS: new note generation rejects old offline changes and retains recovery copy");

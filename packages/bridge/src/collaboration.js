@@ -5,6 +5,7 @@ import * as Y from "yjs";
 import { createOfflineDocument, CROSS_TAB_ORIGIN } from "./collaboration-offline.js";
 import { saveOfflineNote } from "../../shim/src/offline-boot.js";
 import { collaborationStatus } from "./collaboration-status.js";
+import { bindCollaborativeHistory } from "./collaboration-undo.js";
 import { fsShim } from "../../shim/src/fs/index.js";
 import {
   localChanges,
@@ -230,6 +231,7 @@ export function initCollaboration(plugin) {
 
   let session = null;
   const sessions = new Map();
+  const editorOwners = new WeakMap();
   let activeTimer = null;
   let peopleModal = null;
 
@@ -512,12 +514,23 @@ export function initCollaboration(plugin) {
       return;
     }
 
+    // A MarkdownView may reuse the SAME Editor object while changing files.
+    // A new note must never acquire a command binding while the previous note
+    // still owns it: otherwise the old note's teardown can restore native
+    // CodeMirror Undo over the new note's Yjs command guard.
+    const previous = editorOwners.get(editor);
+
+    if (previous && previous !== current) {
+      previous.bindings.get(editor)?.detach();
+    }
+
     const binding = {
       editor,
       overlay: createCursorOverlay({ editor, text: current.text }),
       unlock: !current.initialized ? guardEditor(editor) : null,
     };
     current.bindings.set(editor, binding);
+    editorOwners.set(editor, current);
 
     if (current.initialized) {
       current.suppress = true;
@@ -529,28 +542,16 @@ export function initCollaboration(plugin) {
       }
     }
 
-    const originalUndo = editor.undo;
-    const originalRedo = editor.redo;
     const undo = () => current.undoManager.undo();
     const redo = () => current.undoManager.redo();
-    editor.undo = function () {
-      if (current.generationMismatch) {
-        return;
-      }
-
-      return current.initialized && sessions.get(current.path) === current
-        ? undo()
-        : originalUndo.call(editor);
-    };
-    editor.redo = function () {
-      if (current.generationMismatch) {
-        return;
-      }
-
-      return current.initialized && sessions.get(current.path) === current
-        ? redo()
-        : originalRedo.call(editor);
-    };
+    const restoreHistory = bindCollaborativeHistory(editor, {
+      isActive: () => current.initialized && sessions.get(current.path) === current,
+      // The native CodeMirror history is never authoritative while the
+      // editor is waiting for an offline/remote CRDT baseline either.
+      isLocked: () => !current.initialized || Boolean(current.generationMismatch),
+      undo,
+      redo,
+    });
 
     const onUndoShortcut = (event) => {
       if (!current.initialized || sessions.get(current.path) !== current ||
@@ -611,6 +612,10 @@ export function initCollaboration(plugin) {
     document.addEventListener("selectionchange", onSelectionChange);
 
     binding.detach = () => {
+      if (editorOwners.get(editor) === current) {
+        editorOwners.delete(editor);
+      }
+
       if (current.composingEditor === editor) {
         finishComposition(current);
       }
@@ -623,8 +628,7 @@ export function initCollaboration(plugin) {
 
       cmDom?.removeEventListener("compositionstart", onCompositionStart);
       cmDom?.removeEventListener("compositionend", onCompositionEnd);
-      editor.undo = originalUndo;
-      editor.redo = originalRedo;
+      restoreHistory();
       binding.overlay.destroy();
       binding.unlock?.();
       current.bindings.delete(editor);
@@ -825,6 +829,23 @@ export function initCollaboration(plugin) {
       visible.get(path).push(view);
     }
 
+    // Release stale panes BEFORE rebinding any new document. This also makes
+    // the transition atomic at the editor-command ownership boundary.
+    for (const current of sessions.values()) {
+      if (!visible.has(current.path)) {
+        dispose(current);
+        continue;
+      }
+
+      const stillPresent = new Set(visible.get(current.path).map(view => view.editor));
+
+      for (const binding of current.bindings.values()) {
+        if (!stillPresent.has(binding.editor)) {
+          binding.detach();
+        }
+      }
+    }
+
     for (const [path, views] of visible) {
       if (!sessions.has(path)) {
         openSession(views[0]);
@@ -845,12 +866,6 @@ export function initCollaboration(plugin) {
 
       if (!editors.has(current.editor)) {
         current.editor = views[0].editor;
-      }
-    }
-
-    for (const current of sessions.values()) {
-      if (!visible.has(current.path)) {
-        dispose(current);
       }
     }
 
