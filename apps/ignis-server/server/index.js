@@ -97,6 +97,23 @@ const { createMetadataChannel } = require("./cache/metadata-channel");
 const { registerCacheListeners } = require("./cache/listeners");
 const vaultLifecycle = require("./vault/lifecycle");
 const collaboration = require("./collab");
+const { VaultSyncStore, permittedPath } = require("./sync/store");
+const { createSyncRouter, registerSyncChannel } = require("./sync/http");
+const { startDiscoveryFromEnv } = require("./sync/discovery");
+
+// Opt-in until the surrounding Ignis HTTP API has authenticated access
+// control. Keep this state in DATA_ROOT, never in a synced Vault.
+const syncToken = process.env.IGNIS_SYNC_TOKEN;
+const syncStore = syncToken ? new VaultSyncStore({
+  dataRoot: config.dataRoot,
+  getVaultPath: config.getVaultPath,
+  collaboration,
+  writeCoalescer,
+}) : null;
+if (syncStore) {
+  app.use("/api/sync/v1", createSyncRouter({ store: syncStore, token: syncToken }));
+}
+let discoveryHandle = null;
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
@@ -198,6 +215,13 @@ const server = app.listen(...listenArgs, async () => {
   console.log(`[ignis] Vault root: ${config.vaultRoot}`);
   console.log(`[ignis] Vaults: ${Object.keys(config.vaults).join(", ")}`);
 
+  if (syncStore) {
+    // This does not authenticate the existing /api/fs and /ws endpoints.
+    // Remote deployments must protect the entire Ignis origin at the proxy.
+    console.log("[sync] Experimental Vault Sync enabled; protect the entire Ignis origin at the HTTPS reverse proxy");
+    discoveryHandle = startDiscoveryFromEnv();
+  }
+
   getObsidianTerms();
 
   await initPlugins({ app, config, wss, watcher });
@@ -233,6 +257,21 @@ collaboration.register({
   dataRoot: config.dataRoot,
   writeCoalescer,
 });
+if (syncStore) {
+  registerSyncChannel(wss, syncStore, syncToken);
+  const scanTimers = new Map();
+  watcher.addGlobalListener((vaultId, event) => {
+    if (!permittedPath(event.path)) return;
+    clearTimeout(scanTimers.get(vaultId));
+    const timer = setTimeout(() => {
+      scanTimers.delete(vaultId);
+      syncStore.scan(vaultId).catch((e) =>
+        console.warn("[sync] Vault refresh:", e.message));
+    }, 400);
+    timer.unref?.();
+    scanTimers.set(vaultId, timer);
+  });
+}
 vaultLifecycle.setWss(wss);
 
 const metadataChannel = createMetadataChannel(wss);
@@ -274,6 +313,7 @@ writeCoalescer.onFlushGiveUp((absPath) => {
 });
 
 async function gracefulShutdown(signal) {
+  discoveryHandle?.stop();
   console.log(`\n[ignis] Received ${signal}, shutting down gracefully...`);
 
   await collaboration.flushAll();
