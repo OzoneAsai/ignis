@@ -2,7 +2,7 @@
 // The shared Ignis WebSocket transports Yjs updates, not whole-file snapshots.
 import { MarkdownView, Modal } from "obsidian";
 import * as Y from "yjs";
-import { createOfflineDocument } from "./collaboration-offline.js";
+import { createOfflineDocument, CROSS_TAB_ORIGIN } from "./collaboration-offline.js";
 import { saveOfflineNote } from "../../shim/src/offline-boot.js";
 import { fsShim } from "../../shim/src/fs/index.js";
 import {
@@ -60,6 +60,9 @@ class PeopleModal extends Modal {
       this.close();
     });
     const details = this.getDetails();
+    if (details.path) {
+      root.createEl("p", { text: `Current note: ${details.path}` });
+    }
     root.createEl("p", { text: details.status });
 
     if (details.storageError) {
@@ -186,16 +189,6 @@ function applyLocalChange(ytext, value) {
   }, LOCAL);
 }
 
-function reconcileEditor(session) {
-  session.suppress = true;
-
-  try {
-    return reconcileEditorState(session.editor, session.text.toString());
-  } finally {
-    session.suppress = false;
-  }
-}
-
 export function initCollaboration(plugin) {
   const ws = window.__ignis.ws;
   const channel = ws.channel("collab");
@@ -203,11 +196,12 @@ export function initCollaboration(plugin) {
   status.addClass("ignis-collaboration-status");
 
   let session = null;
+  const sessions = new Map();
   let activeTimer = null;
   let peopleModal = null;
 
   window.__ignis.collaboration = {
-    isActivePath: (path) => Boolean(session && session.path === path),
+    isActivePath: (path) => sessions.has(path),
   };
 
   function people() {
@@ -247,6 +241,7 @@ export function initCollaboration(plugin) {
         peopleModal?.refreshPeople();
       }
     }, () => ({
+      path: session?.path,
       status: status.textContent,
       storageError: session?.storageError,
       serverSaveError: session?.serverSaveError,
@@ -285,14 +280,18 @@ export function initCollaboration(plugin) {
       counts.set(member.name, (counts.get(member.name) || 0) + 1);
     }
 
-    current.overlay?.render(members
+    const peers = members
       .filter((member) => member.id !== current.self?.id)
       .map((member) => ({
         ...member,
         label: (counts.get(member.name) || 0) > 1
           ? `${member.name} ·${member.id.slice(0, 4)}`
           : member.name,
-      })));
+      }));
+
+    for (const binding of current.bindings.values()) {
+      binding.overlay.render(peers);
+    }
   }
 
   function render() {
@@ -334,9 +333,9 @@ export function initCollaboration(plugin) {
     }
   }
 
-  function sendJoin() {
-    if (session?.hydrated && ws.isOpen() && !session.joined) {
-      channel.send("join", { path: session.path, name: ownDisplayName() });
+  function sendJoin(current) {
+    if (current?.hydrated && ws.isOpen() && !current.joined) {
+      channel.send("join", { path: current.path, name: ownDisplayName() });
     }
   }
 
@@ -356,17 +355,17 @@ export function initCollaboration(plugin) {
     render();
   }
 
-  function guardEditor(current) {
-    const contentDOM = current.editor.cm?.contentDOM;
+  function guardEditor(editor) {
+    const contentDOM = editor.cm?.contentDOM;
 
     if (!contentDOM) {
-      return;
+      return () => {};
     }
 
     const previous = contentDOM.getAttribute("contenteditable");
     contentDOM.setAttribute("contenteditable", "false");
     contentDOM.setAttribute("aria-busy", "true");
-    current.unlockEditor = () => {
+    return () => {
       if (previous === null) {
         contentDOM.removeAttribute("contenteditable");
       } else {
@@ -374,7 +373,6 @@ export function initCollaboration(plugin) {
       }
 
       contentDOM.removeAttribute("aria-busy");
-      current.unlockEditor = null;
     };
   }
 
@@ -390,7 +388,7 @@ export function initCollaboration(plugin) {
         throw new Error("This note exceeds the offline startup cache limit");
       }
 
-      if (revision === current.previewRevision && session === current) {
+      if (revision === current.previewRevision && sessions.get(current.path) === current) {
         current.previewSaving = false;
         render();
       }
@@ -444,6 +442,19 @@ export function initCollaboration(plugin) {
     current.selectionTimer = setTimeout(() => sendSelection(current), 65);
   }
 
+  function clearSelection(current) {
+    if (!current) {
+      return;
+    }
+
+    clearTimeout(current.selectionTimer);
+    current.lastSelection = null;
+
+    if (current.joined && ws.isOpen()) {
+      channel.send("cursor-away", { path: current.path });
+    }
+  }
+
   function finishComposition(current) {
     clearTimeout(current.compositionTimer);
 
@@ -455,8 +466,19 @@ export function initCollaboration(plugin) {
     // update received mid-composition must not rewrite the composing DOM.
     // Apply the author's completed change first, then merge buffered remote
     // CRDT operations. This preserves both inputs and CodeMirror's IME state.
-    applyLocalChange(current.text, current.editor.getValue());
+    const editor = current.composingEditor || current.editor;
+    current.sourceEditor = editor;
+    try {
+      applyLocalChange(current.text, editor.getValue());
+    } finally {
+      current.sourceEditor = null;
+    }
     current.composing = false;
+    current.composingEditor = null;
+
+    // The same origin may receive edits over BroadcastChannel, bypassing the
+    // WebSocket update handler. Apply both transports only after IME commits.
+    current.local.flushPeerUpdates();
 
     for (const update of current.pendingRemote.splice(0)) {
       Y.applyUpdate(current.doc, update, REMOTE);
@@ -465,49 +487,162 @@ export function initCollaboration(plugin) {
     scheduleSelection(current);
   }
 
-  function dispose() {
-    if (!session) {
+  function bindEditor(current, editor) {
+    if (current.bindings.has(editor)) {
       return;
     }
 
-    const current = session;
-    session = null;
+    const binding = {
+      editor,
+      overlay: createCursorOverlay({ editor, text: current.text }),
+      unlock: !current.initialized ? guardEditor(editor) : null,
+    };
+    current.bindings.set(editor, binding);
+
+    if (current.initialized) {
+      current.suppress = true;
+
+      try {
+        reconcileEditorState(editor, current.text.toString());
+      } finally {
+        current.suppress = false;
+      }
+    }
+
+    const originalUndo = editor.undo;
+    const originalRedo = editor.redo;
+    const undo = () => current.undoManager.undo();
+    const redo = () => current.undoManager.redo();
+    editor.undo = function () {
+      return current.initialized && sessions.get(current.path) === current
+        ? undo()
+        : originalUndo.call(editor);
+    };
+    editor.redo = function () {
+      return current.initialized && sessions.get(current.path) === current
+        ? redo()
+        : originalRedo.call(editor);
+    };
+
+    const onUndoShortcut = (event) => {
+      if (!current.initialized || sessions.get(current.path) !== current ||
+          event.isComposing || !editor.cm?.dom?.contains(event.target) ||
+          !(event.metaKey || event.ctrlKey) || event.altKey) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      const wantsUndo = key === "z" && !event.shiftKey;
+      const wantsRedo = (key === "z" && event.shiftKey) ||
+        (key === "y" && event.ctrlKey && !event.metaKey);
+
+      if (wantsUndo || wantsRedo) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        (wantsUndo ? undo : redo)();
+      }
+    };
+    document.addEventListener("keydown", onUndoShortcut, true);
+
+    const onCursorMotion = () => {
+      if (session === current && (current.editor === editor || editor.cm?.hasFocus)) {
+        current.editor = editor;
+        scheduleSelection(current);
+      }
+    };
+    const cmDom = editor.cm?.dom;
+    const events = ["keyup", "mouseup", "pointerup", "focusin"];
+
+    for (const event of events) {
+      cmDom?.addEventListener(event, onCursorMotion);
+    }
+
+    const onCompositionStart = () => {
+      if (current.initialized) {
+        current.composing = true;
+        current.composingEditor = editor;
+      }
+    };
+    const onCompositionEnd = () => {
+      if (current.composing && current.composingEditor === editor) {
+        clearTimeout(current.compositionTimer);
+        current.compositionTimer = setTimeout(() => finishComposition(current), 0);
+      }
+    };
+    cmDom?.addEventListener("compositionstart", onCompositionStart);
+    cmDom?.addEventListener("compositionend", onCompositionEnd);
+
+    const onSelectionChange = () => {
+      if (editor.cm?.hasFocus) {
+        onCursorMotion();
+      }
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+
+    binding.detach = () => {
+      if (current.composingEditor === editor) {
+        finishComposition(current);
+      }
+
+      document.removeEventListener("keydown", onUndoShortcut, true);
+      document.removeEventListener("selectionchange", onSelectionChange);
+      for (const event of events) {
+        cmDom?.removeEventListener(event, onCursorMotion);
+      }
+
+      cmDom?.removeEventListener("compositionstart", onCompositionStart);
+      cmDom?.removeEventListener("compositionend", onCompositionEnd);
+      editor.undo = originalUndo;
+      editor.redo = originalRedo;
+      binding.overlay.destroy();
+      binding.unlock?.();
+      current.bindings.delete(editor);
+    };
+  }
+
+  function unlockEditors(current) {
+    for (const binding of current.bindings.values()) {
+      binding.unlock?.();
+      binding.unlock = null;
+    }
+  }
+
+  function dispose(current) {
+    if (!current) {
+      return;
+    }
+
+    // Native IME composition must finish against this live Y.Doc before its
+    // room membership is removed, even if the composing pane is closing.
+    finishComposition(current);
+    sessions.delete(current.path);
+
+    if (session === current) {
+      session = null;
+    }
 
     if (current.joined && ws.isOpen()) {
       channel.send("leave", { path: current.path });
     }
 
     clearTimeout(current.selectionTimer);
-    finishComposition(current);
     if (current.previewTimer) {
       writeOfflinePreview(current);
     }
-    current.restoreUndo?.();
     current.undoManager?.destroy();
-    current.removeEditorListeners?.();
-    current.overlay?.destroy();
-    current.unlockEditor?.();
+
+    for (const binding of current.bindings.values()) {
+      binding.detach();
+    }
     current.local?.close().catch((error) => {
       console.warn("[collab] Could not close offline document:", error);
     });
     render();
   }
 
-  function syncActive() {
-    const view = plugin.app.workspace.getActiveViewOfType(MarkdownView);
+  function openSession(view) {
     const file = view?.file;
     const editor = view?.editor;
-
-    if (!file || !editor || !file.path.toLowerCase().endsWith(".md")) {
-      dispose();
-      return;
-    }
-
-    if (session?.path === file.path && session.editor === editor) {
-      return;
-    }
-
-    dispose();
 
     const next = {
       path: file.path,
@@ -533,18 +668,21 @@ export function initCollaboration(plugin) {
       self: null,
       lastSelection: null,
       selectionTimer: null,
+      bindings: new Map(),
+      sourceEditor: null,
       composing: false,
+      composingEditor: null,
       compositionTimer: null,
       pendingRemote: [],
     };
 
     const local = createOfflineDocument(window.__currentVaultId, file.path, (storage) => {
-      if (session === next) {
+      if (sessions.get(next.path) === next) {
         next.localSaving = storage.isSaving;
         next.storageError = storage.error;
         render();
       }
-    });
+    }, () => next.composing);
     const { doc, text } = local;
     next.doc = doc;
     next.text = text;
@@ -554,96 +692,12 @@ export function initCollaboration(plugin) {
       captureTimeout: 500,
     });
 
-    // CodeMirror's stock history cannot distinguish a remote transaction from
-    // the local author's changes. Use Yjs UndoManager for collaborative notes:
-    // remote edits remain untouched, and Undo itself is synced as a CRDT edit.
-    const originalUndo = editor.undo;
-    const originalRedo = editor.redo;
-    const undo = () => next.undoManager.undo();
-    const redo = () => next.undoManager.redo();
-    editor.undo = function () {
-      return next.initialized && session === next
-        ? undo()
-        : originalUndo.call(editor);
-    };
-    editor.redo = function () {
-      return next.initialized && session === next
-        ? redo()
-        : originalRedo.call(editor);
-    };
-
-    const onUndoShortcut = (event) => {
-      if (!next.initialized || session !== next || event.isComposing ||
-          !editor.cm?.dom?.contains(event.target) ||
-          !(event.metaKey || event.ctrlKey) || event.altKey) {
-        return;
-      }
-
-      const key = event.key.toLowerCase();
-      const wantsUndo = key === "z" && !event.shiftKey;
-      const wantsRedo = (key === "z" && event.shiftKey) ||
-        (key === "y" && event.ctrlKey && !event.metaKey);
-
-      if (wantsUndo || wantsRedo) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        (wantsUndo ? undo : redo)();
-      }
-    };
-
-    document.addEventListener("keydown", onUndoShortcut, true);
-    next.restoreUndo = () => {
-      document.removeEventListener("keydown", onUndoShortcut, true);
-      editor.undo = originalUndo;
-      editor.redo = originalRedo;
-    };
-
-    guardEditor(next);
-
-    next.overlay = createCursorOverlay(next);
-
-    const onCursorMotion = () => scheduleSelection(next);
-    const cmDom = editor.cm?.dom;
-    const events = ["keyup", "mouseup", "pointerup", "focusin"];
-
-    for (const event of events) {
-      cmDom?.addEventListener(event, onCursorMotion);
-    }
-
-    const onCompositionStart = () => {
-      if (next.initialized) {
-        next.composing = true;
-      }
-    };
-    const onCompositionEnd = () => {
-      if (next.composing) {
-        clearTimeout(next.compositionTimer);
-        // Native compositionend can precede its final editor-change event.
-        next.compositionTimer = setTimeout(() => finishComposition(next), 0);
-      }
-    };
-    cmDom?.addEventListener("compositionstart", onCompositionStart);
-    cmDom?.addEventListener("compositionend", onCompositionEnd);
-
-    const onSelectionChange = () => {
-      if (editor.cm?.hasFocus) {
-        onCursorMotion();
-      }
-    };
-
-    document.addEventListener("selectionchange", onSelectionChange);
-    next.removeEditorListeners = () => {
-      for (const event of events) {
-        cmDom?.removeEventListener(event, onCursorMotion);
-      }
-
-      document.removeEventListener("selectionchange", onSelectionChange);
-      cmDom?.removeEventListener("compositionstart", onCompositionStart);
-      cmDom?.removeEventListener("compositionend", onCompositionEnd);
-    };
+    sessions.set(next.path, next);
+    bindEditor(next, editor);
 
     doc.on("update", (update, origin) => {
-      if ((origin === LOCAL || origin === next.undoManager) && session === next) {
+      if ((origin === LOCAL || origin === next.undoManager || origin === CROSS_TAB_ORIGIN) &&
+          sessions.get(next.path) === next) {
         next.dirty = true;
         sendUpdate(next, update);
         render();
@@ -651,22 +705,23 @@ export function initCollaboration(plugin) {
     });
 
     text.observe((event, transaction) => {
-      if (session === next) {
+      if (sessions.get(next.path) === next) {
         fsShim._contentCache.set(next.path, next.text.toString());
       }
 
-      if (session === next && next.initialized) {
-        if (transaction.origin !== LOCAL) {
-          next.suppress = true;
+      if (sessions.get(next.path) === next && next.initialized) {
+        next.suppress = true;
 
-          try {
-            if (!patchEditor(next.editor, next.text, event.delta)) {
-              // One fallback CM6 transaction, not a DOM replacement.
-              reconcileEditor(next);
+        try {
+          for (const binding of next.bindings.values()) {
+            if (binding.editor !== next.sourceEditor) {
+              if (!patchEditor(binding.editor, next.text, event.delta)) {
+                reconcileEditorState(binding.editor, next.text.toString());
+              }
             }
-          } finally {
-            next.suppress = false;
           }
+        } finally {
+          next.suppress = false;
         }
 
         renderPeers(next);
@@ -674,11 +729,10 @@ export function initCollaboration(plugin) {
       }
     });
 
-    session = next;
     render();
 
     local.ready.then((hasLocalCopy) => {
-      if (session !== next) {
+      if (sessions.get(next.path) !== next) {
         return;
       }
 
@@ -686,16 +740,18 @@ export function initCollaboration(plugin) {
 
       if (hasLocalCopy) {
         next.initialized = true;
-        reconcileEditor(next);
+        for (const binding of next.bindings.values()) {
+          reconcileEditorState(binding.editor, next.text.toString());
+        }
         fsShim._contentCache.set(next.path, next.text.toString());
-        next.unlockEditor?.();
+        unlockEditors(next);
         scheduleOfflinePreview(next);
       }
 
       render();
-      sendJoin();
+      sendJoin(next);
       next.local.persistence.get("unsent-startup-draft").then((draft) => {
-        if (session === next && typeof draft === "string") {
+        if (sessions.get(next.path) === next && typeof draft === "string") {
           next.pendingConflict = draft;
           render();
         }
@@ -703,11 +759,81 @@ export function initCollaboration(plugin) {
     }).catch((error) => {
       console.error("[collab] Local draft initialization failed:", error);
 
-      if (session === next) {
+      if (sessions.get(next.path) === next) {
         next.storageError = error;
         render();
       }
     });
+  }
+
+  function syncActive() {
+    // A Yjs document is owned by its vault/path, not by whichever pane most
+    // recently gained focus. Every visible editor is a view of that document.
+    const visible = new Map();
+
+    for (const leaf of plugin.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      const path = view?.file?.path;
+
+      if (!path?.toLowerCase().endsWith(".md") || !view.editor) {
+        continue;
+      }
+
+      if (!visible.has(path)) {
+        visible.set(path, []);
+      }
+
+      visible.get(path).push(view);
+    }
+
+    for (const [path, views] of visible) {
+      if (!sessions.has(path)) {
+        openSession(views[0]);
+      }
+
+      const current = sessions.get(path);
+      const editors = new Set(views.map((view) => view.editor));
+
+      for (const view of views) {
+        bindEditor(current, view.editor);
+      }
+
+      for (const binding of current.bindings.values()) {
+        if (!editors.has(binding.editor)) {
+          binding.detach();
+        }
+      }
+
+      if (!editors.has(current.editor)) {
+        current.editor = views[0].editor;
+      }
+    }
+
+    for (const current of sessions.values()) {
+      if (!visible.has(current.path)) {
+        dispose(current);
+      }
+    }
+
+    const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
+    const active = activeView?.file ? sessions.get(activeView.file.path) || null : null;
+
+    if (session !== active) {
+      clearSelection(session);
+      peopleModal?.close();
+    }
+
+    session = active;
+    status.setAttribute("title", session
+      ? `Collaboration status for ${session.path}`
+      : "No active Markdown note");
+
+    if (session && session.bindings.has(activeView.editor)) {
+      session.editor = activeView.editor;
+      scheduleSelection(session);
+    }
+
+    render();
   }
 
   function scheduleActive() {
@@ -717,11 +843,12 @@ export function initCollaboration(plugin) {
 
   const unsubscribe = [
     channel.subscribe("init", (msg) => {
-      if (!session || msg.path !== session.path || !session.hydrated) {
+      const current = sessions.get(msg.path);
+
+      if (!current?.hydrated) {
         return;
       }
 
-      const current = session;
       const preJoinText = current.editor.getValue();
       const changedWhileJoining = !current.initialized && preJoinText !== current.initial;
 
@@ -748,9 +875,11 @@ export function initCollaboration(plugin) {
           }
         }
 
-        reconcileEditor(current);
+        for (const binding of current.bindings.values()) {
+          reconcileEditorState(binding.editor, current.text.toString());
+        }
         fsShim._contentCache.set(current.path, current.text.toString());
-        current.unlockEditor?.();
+        unlockEditors(current);
         current.local.markInitialized().catch((error) => {
           current.storageError = error;
           render();
@@ -767,102 +896,132 @@ export function initCollaboration(plugin) {
       }
     }),
     channel.subscribe("update", (msg) => {
-      if (!session || msg.path !== session.path || !session.initialized) {
+      const current = sessions.get(msg.path);
+
+      if (!current?.initialized) {
         return;
       }
 
       try {
         const bytes = decodeUpdate(msg.update);
 
-        if (session.composing) {
-          session.pendingRemote.push(bytes);
+        if (current.composing) {
+          current.pendingRemote.push(bytes);
         } else {
-          Y.applyUpdate(session.doc, bytes, REMOTE);
+          Y.applyUpdate(current.doc, bytes, REMOTE);
         }
       } catch (error) {
         console.error("[collab] Invalid remote update:", error);
       }
     }),
     channel.subscribe("presence", (msg) => {
-      if (session?.path === msg.path) {
-        session.participants = msg.participants;
+      const current = sessions.get(msg.path);
+
+      if (current) {
+        current.participants = msg.participants;
         if (Array.isArray(msg.people)) {
-          session.people = new Map(msg.people.map((person) => [person.id, person]));
-          session.self = session.people.get(session.self?.id) || session.self;
+          current.people = new Map(msg.people.map((person) => [person.id, person]));
+          current.self = current.people.get(current.self?.id) || current.self;
         }
 
         render();
-        renderPeers(session);
-        if (peopleModal?.isOpen) {
+        renderPeers(current);
+        if (peopleModal?.isOpen && current === session) {
           peopleModal.refreshPeople();
         }
       }
     }),
     channel.subscribe("cursor", (msg) => {
-      if (!session || msg.path !== session.path || msg.id === session.self?.id) {
+      const current = sessions.get(msg.path);
+
+      if (!current || msg.id === current.self?.id) {
         return;
       }
 
-      const person = session.people.get(msg.id);
+      const person = current.people.get(msg.id);
 
       if (person) {
         person.anchor = msg.anchor;
         person.head = msg.head;
-        renderPeers(session);
+        renderPeers(current);
       }
     }),
     channel.subscribe("error", (msg) => {
-      if (session?.path === msg.path) {
+      const current = sessions.get(msg.path);
+
+      if (current) {
         console.error("[collab]", msg.error);
-        session.protocolError = msg.error;
+        current.protocolError = msg.error;
         render();
       }
     }),
     channel.subscribe("saved", (msg) => {
-      if (!session || msg.path !== session.path || !Number.isSafeInteger(msg.seq)) {
+      const current = sessions.get(msg.path);
+
+      if (!current || !Number.isSafeInteger(msg.seq)) {
         return;
       }
 
-      session.confirmedSeq = Math.max(session.confirmedSeq, msg.seq);
-      session.serverSaveError = false;
-      session.protocolError = null;
+      current.confirmedSeq = Math.max(current.confirmedSeq, msg.seq);
+      current.serverSaveError = false;
+      current.protocolError = null;
 
-      if (session.confirmedSeq >= session.sentSeq && session.joined) {
-        session.dirty = false;
+      if (current.confirmedSeq >= current.sentSeq && current.joined) {
+        current.dirty = false;
       }
 
       render();
     }),
     channel.subscribe("save-error", (msg) => {
-      if (session?.path === msg.path) {
-        session.serverSaveError = true;
-        session.dirty = true;
+      const current = sessions.get(msg.path);
+
+      if (current) {
+        current.serverSaveError = true;
+        current.dirty = true;
         render();
       }
     }),
     ws.onStateChange((state) => {
-      if (session) {
-        session.joined = false;
+      for (const current of sessions.values()) {
+        current.joined = false;
 
         if (state === "open") {
-          sendJoin();
+          sendJoin(current);
         } else {
-          session.people.clear();
-          session.participants = 1;
+          current.people.clear();
+          current.participants = 1;
+          renderPeers(current);
         }
-
-        render();
       }
+
+      render();
     }),
   ];
 
   plugin.registerEvent(plugin.app.workspace.on("active-leaf-change", scheduleActive));
   plugin.registerEvent(plugin.app.workspace.on("file-open", scheduleActive));
+  plugin.registerEvent(plugin.app.workspace.on("layout-change", scheduleActive));
   plugin.registerEvent(plugin.app.workspace.on("editor-change", (editor) => {
-    if (session?.editor === editor && session.initialized && !session.suppress &&
-        !session.composing) {
-      applyLocalChange(session.text, editor.getValue());
-      scheduleSelection(session);
+    for (const current of sessions.values()) {
+      if (!current.bindings.has(editor) || !current.initialized ||
+          current.suppress || current.composing) {
+        continue;
+      }
+
+      current.sourceEditor = editor;
+
+      try {
+        applyLocalChange(current.text, editor.getValue());
+      } finally {
+        current.sourceEditor = null;
+      }
+
+      if (current === session) {
+        current.editor = editor;
+        scheduleSelection(current);
+      }
+
+      break;
     }
   }));
 
@@ -872,7 +1031,10 @@ export function initCollaboration(plugin) {
   return () => {
     clearTimeout(activeTimer);
     peopleModal?.close();
-    dispose();
+
+    for (const current of sessions.values()) {
+      dispose(current);
+    }
 
     for (const off of unsubscribe) {
       off();

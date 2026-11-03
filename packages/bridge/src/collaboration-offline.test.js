@@ -65,6 +65,57 @@ describe("IndexedDB offline CRDT lifecycle", () => {
     await next.close();
   });
 
+  it("synchronizes two open browser tabs locally without any server", async () => {
+    const first = createOfflineDocument("offline-lab", "draft.md");
+    const second = createOfflineDocument("offline-lab", "draft.md");
+    await Promise.all([first.ready, second.ready]);
+    first.text.insert(0, "Alice offline ");
+
+    async function until(condition) {
+      for (let i = 0; i < 80; i++) {
+        if (condition()) {
+          return;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      throw new Error("Timed out waiting for a same-browser offline update");
+    }
+
+    await until(() => second.text.toString().includes("Alice offline "));
+    second.text.insert(second.text.length, "Bob offline");
+    await until(() => first.text.toString() === second.text.toString());
+
+    const expected = first.text.toString();
+    expect(expected).toContain("Alice offline ");
+    expect(expected).toContain("Bob offline");
+    await Promise.all([first.close(), second.close()]);
+
+    const reopened = createOfflineDocument("offline-lab", "draft.md");
+    await reopened.ready;
+    expect(reopened.text.toString()).toBe(expected);
+    await reopened.close();
+  });
+
+  it("buffers cross-tab messages during IME composition until explicitly released", async () => {
+    let composing = true;
+    const editor = createOfflineDocument("offline-lab", "draft.md", () => {}, () => composing);
+    const peer = createOfflineDocument("offline-lab", "draft.md");
+    await Promise.all([editor.ready, peer.ready]);
+    peer.text.insert(0, "REMOTE PEER ");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(editor.text.toString()).not.toContain("REMOTE PEER");
+
+    // The completed local input is committed before the buffered peer update.
+    editor.text.insert(0, "日本語");
+    composing = false;
+    editor.flushPeerUpdates();
+    expect(editor.text.toString()).toContain("日本語");
+    expect(editor.text.toString()).toContain("REMOTE PEER");
+    await Promise.all([editor.close(), peer.close()]);
+  });
+
   it("compacts more than 512 committed updates without dropping a character", async () => {
     const first = createOfflineDocument("offline-lab", "draft.md");
     await first.ready;

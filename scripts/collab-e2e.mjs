@@ -194,6 +194,40 @@ try {
   const restored = await join(port);
   assert(restored.doc.getText("content").toString() === expected, "Saved CRDT state did not survive restart");
   console.log("PASS: full CRDT state survives process restart");
+
+  const post = async (endpoint, body) => fetch(`http://127.0.0.1:${port}/api/fs/${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vault: "Lab", ...body }),
+  });
+  const activeRename = await post("rename", {
+    oldPath: "Shared.md", newPath: "Moved.md",
+  });
+  assert(activeRename.status === 409, "Active collaborative room allowed a destructive rename");
+  const activeDelete = await fetch(`http://127.0.0.1:${port}/api/fs/unlink?vault=Lab&path=Shared.md`, {
+    method: "DELETE",
+  });
+  assert(activeDelete.status === 409, "Active collaborative room allowed a destructive delete");
+  console.log("PASS: active note rename/delete fail explicitly without losing edits");
+
+  await stopServer();
+  await startServer(port);
+  const renamed = await post("rename", { oldPath: "Shared.md", newPath: "Moved.md" });
+  assert(renamed.status === 200, `Inactive collaborative rename failed: ${renamed.status}`);
+  const renamedBack = await post("rename", { oldPath: "Moved.md", newPath: "Shared.md" });
+  assert(renamedBack.status === 200, "Inactive collaborative rename back to original path failed");
+  assert(await fs.readFile(note, "utf-8") === expected, "Rename altered collaborative note body");
+  console.log("PASS: historical CRDT state follows inactive note renames");
+
+  const deleted = await fetch(`http://127.0.0.1:${port}/api/fs/unlink?vault=Lab&path=Shared.md`, {
+    method: "DELETE",
+  });
+  assert(deleted.status === 200, `Inactive collaborative delete failed: ${deleted.status}`);
+  await fs.writeFile(note, "Brand-new unrelated note\n");
+  const recreated = await join(port);
+  assert(recreated.doc.getText("content").toString() === "Brand-new unrelated note\n",
+    "Deleted note's CRDT history contaminated the new note");
+  console.log("PASS: deleting then recreating the same note path does not resurrect old CRDT text");
   await stopServer();
 } finally {
   await stopServer();

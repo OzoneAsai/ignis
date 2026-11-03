@@ -105,6 +105,7 @@ async function atomicReplace(target, content) {
 function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalescer }) {
   const rooms = new Map();
   const loading = new Map();
+  const mutations = new Set();
   const channel = wss.channel(CHANNEL);
   const stateDir = path.join(dataRoot, "collaboration");
 
@@ -115,6 +116,178 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
   function statePathFor(vaultId, relPath) {
     const digest = crypto.createHash("sha256").update(idFor(vaultId, relPath)).digest("hex");
     return path.join(stateDir, `${digest}.yjs`);
+  }
+
+  function operationConflict() {
+    const error = new Error("This collaborative note is in use or has a conflicting history. Close active editors before changing its path.");
+    error.code = "COLLABORATIVE_FILE_OPERATION_CONFLICT";
+    return error;
+  }
+
+  function within(notePath, targetPath) {
+    return notePath === targetPath || notePath.startsWith(`${targetPath}/`);
+  }
+
+  function hasLiveRoom(vaultId, targetPath) {
+    for (const id of [...rooms.keys(), ...loading.keys()]) {
+      const [vault, note] = JSON.parse(id);
+
+      if (vault === vaultId && within(note, targetPath)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function mutationBlocked(vaultId, targetPath) {
+    for (const id of mutations) {
+      const [vault, name] = JSON.parse(id);
+
+      if (vault === vaultId && (within(targetPath, name) || within(name, targetPath))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async function withMutation(vaultId, paths, work) {
+    const ids = paths.map((notePath) => idFor(vaultId, notePath));
+
+    if (paths.some((notePath) => hasLiveRoom(vaultId, notePath) ||
+        mutationBlocked(vaultId, notePath))) {
+      throw operationConflict();
+    }
+
+    for (const id of ids) {
+      mutations.add(id);
+    }
+
+    try {
+      return await work();
+    } finally {
+      for (const id of ids) {
+        mutations.delete(id);
+      }
+    }
+  }
+
+  async function renameNote(vaultId, source, destination, renameFile, rollbackFile) {
+    const from = normalizeNotePath(source);
+    const to = normalizeNotePath(destination);
+
+    if (!from || !to || from === to) {
+      throw operationConflict();
+    }
+
+    return withMutation(vaultId, [from, to], async () => {
+      const sourceState = statePathFor(vaultId, from);
+      const destinationState = statePathFor(vaultId, to);
+
+      if (fs.existsSync(destinationState) || fs.existsSync(`${destinationState}.baseline.json`)) {
+        throw operationConflict();
+      }
+
+      const moved = [];
+      const files = [[sourceState, destinationState],
+        [`${sourceState}.baseline.json`, `${destinationState}.baseline.json`]];
+
+      // Move the readable file first, then both history files. During this
+      // interval the mutation lock prevents a new CRDT room being initialized.
+      await renameFile();
+
+      try {
+        for (const [oldName, newName] of files) {
+          if (fs.existsSync(oldName)) {
+            await fs.promises.rename(oldName, newName);
+            moved.push([oldName, newName]);
+          }
+        }
+      } catch (error) {
+        for (const [oldName, newName] of moved.reverse()) {
+          await fs.promises.rename(newName, oldName).catch(() => {});
+        }
+
+        await rollbackFile?.().catch(() => {});
+
+        throw error;
+      }
+    });
+  }
+
+  async function deleteNote(vaultId, notePath, deleteFile) {
+    const normalized = normalizeNotePath(notePath);
+
+    if (!normalized) {
+      return deleteFile();
+    }
+
+    return withMutation(vaultId, [normalized], async () => {
+      const state = statePathFor(vaultId, normalized);
+      const saved = [];
+
+      try {
+        for (const file of [state, `${state}.baseline.json`]) {
+          if (fs.existsSync(file)) {
+            const backup = `${file}.deleted-${crypto.randomUUID()}`;
+            await fs.promises.rename(file, backup);
+            saved.push([file, backup]);
+          }
+        }
+
+        await deleteFile();
+      } catch (error) {
+        for (const [file, backup] of saved) {
+          await fs.promises.rename(backup, file).catch(() => {});
+        }
+
+        throw error;
+      }
+
+      await Promise.all(saved.map(([, backup]) => fs.promises.unlink(backup)));
+    });
+  }
+
+  async function ensureNoHistoricSubtree(vaultId, relativePath, absolutePath) {
+    const queue = [absolutePath];
+
+    while (queue.length) {
+      const directory = queue.pop();
+      const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const full = path.join(directory, entry.name);
+
+        if (entry.isDirectory()) {
+          queue.push(full);
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+          const relative = path.relative(absolutePath, full).replace(/\\/g, "/");
+          const note = [relativePath, relative].filter(Boolean).join("/");
+
+          if (fs.existsSync(statePathFor(vaultId, note))) {
+            throw operationConflict();
+          }
+        }
+      }
+    }
+  }
+
+  async function assertSafeSubtree(vaultId, relativePath, absolutePath) {
+    if (hasLiveRoom(vaultId, relativePath) || mutationBlocked(vaultId, relativePath)) {
+      throw operationConflict();
+    }
+
+    await ensureNoHistoricSubtree(vaultId, relativePath, absolutePath);
+  }
+
+  async function mutateDirectory(vaultId, sourcePath, absolutePath, destinationPath, operation) {
+    const names = destinationPath ? [sourcePath, destinationPath] : [sourcePath];
+
+    return withMutation(vaultId, names, async () => {
+      await ensureNoHistoricSubtree(vaultId, sourcePath, absolutePath);
+      return operation();
+    });
   }
 
   function send(ws, type, data) {
@@ -201,6 +374,10 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     }
 
     const roomId = idFor(vaultId, relPath);
+
+    if (mutationBlocked(vaultId, relPath)) {
+      throw operationConflict();
+    }
 
     if (rooms.has(roomId)) {
       return rooms.get(roomId);
@@ -457,6 +634,20 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     }
   });
 
+  channel.on("cursor-away", (msg, ws) => {
+    const relPath = normalizeNotePath(msg.path);
+    const room = relPath && rooms.get(idFor(ws.ignisVaultId, relPath));
+    const person = room?.people.get(ws);
+
+    if (!person) {
+      return;
+    }
+
+    person.anchor = null;
+    person.head = null;
+    broadcast(room, "cursor", { id: person.id, anchor: null, head: null }, ws);
+  });
+
   wss.on("connection", (ws) => {
     ws.on("close", () => {
       for (const room of rooms.values()) {
@@ -468,6 +659,15 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
   });
 
   return {
+    renameNote,
+    deleteNote,
+    assertSafeSubtree,
+    mutateDirectory,
+    checkLivePath: (vaultId, relativePath) => {
+      if (hasLiveRoom(vaultId, relativePath) || mutationBlocked(vaultId, relativePath)) {
+        throw operationConflict();
+      }
+    },
     isCollaborative(vaultId, notePath) {
       const normalized = normalizeNotePath(notePath);
 
@@ -506,6 +706,30 @@ async function flushAll() {
   await manager?.flushAll();
 }
 
+async function renameNote(vaultId, source, destination, renameFile, rollbackFile) {
+  return manager
+    ? manager.renameNote(vaultId, source, destination, renameFile, rollbackFile)
+    : renameFile();
+}
+
+async function deleteNote(vaultId, notePath, deleteFile) {
+  return manager ? manager.deleteNote(vaultId, notePath, deleteFile) : deleteFile();
+}
+
+async function assertSafeSubtree(vaultId, relativePath, absolutePath) {
+  return manager?.assertSafeSubtree(vaultId, relativePath, absolutePath);
+}
+
+async function mutateDirectory(vaultId, sourcePath, absolutePath, destinationPath, operation) {
+  return manager
+    ? manager.mutateDirectory(vaultId, sourcePath, absolutePath, destinationPath, operation)
+    : operation();
+}
+
+function checkLivePath(vaultId, relativePath) {
+  return manager?.checkLivePath(vaultId, relativePath);
+}
+
 module.exports = {
   CHANNEL,
   cleanDisplayName,
@@ -516,4 +740,9 @@ module.exports = {
   getActive,
   isCollaborative,
   flushAll,
+  renameNote,
+  deleteNote,
+  assertSafeSubtree,
+  mutateDirectory,
+  checkLivePath,
 };

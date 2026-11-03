@@ -7,6 +7,8 @@ export function collaborationStorageKey(vault, note) {
 }
 
 const COMPACT_EVERY = 512;
+const CROSS_TAB = Symbol("ignis-cross-tab-yjs");
+export const CROSS_TAB_ORIGIN = CROSS_TAB;
 
 function openDatabase(name) {
   return new Promise((resolve, reject) => {
@@ -105,7 +107,9 @@ function compact(database) {
   });
 }
 
-export function createOfflineDocument(vaultId, notePath, onDurabilityChange = () => {}) {
+export function createOfflineDocument(
+  vaultId, notePath, onDurabilityChange = () => {}, shouldDeferPeerUpdate = () => false,
+) {
   const doc = new Y.Doc();
   const text = doc.getText("content");
   let localRevision = 0;
@@ -115,6 +119,9 @@ export function createOfflineDocument(vaultId, notePath, onDurabilityChange = ()
   let pending = Promise.resolve();
   let database = null;
   let writesSinceCompaction = 0;
+  let peerChannel = null;
+  const bufferedPeerUpdates = [];
+  const peerId = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
 
   const announce = () => {
     if (!closed) {
@@ -139,9 +146,22 @@ export function createOfflineDocument(vaultId, notePath, onDurabilityChange = ()
       }, "offline-hydration");
 
       // Bind only AFTER hydration, so replay cannot be counted as a new edit.
-      doc.on("update", (update) => {
+      doc.on("update", (update, origin) => {
         if (closed) {
           return;
+        }
+
+        // A nearby tab receives the same operation immediately, even while
+        // the Ignis server is offline. Do not rebroadcast received operations.
+        if (origin !== CROSS_TAB) {
+          try {
+            peerChannel?.postMessage({
+              type: "update", sender: peerId, update,
+              fromServer: origin === "remote",
+            });
+          } catch (error) {
+            console.warn("[collab] Same-browser-tab sync unavailable:", error);
+          }
         }
 
         const revision = ++localRevision;
@@ -167,6 +187,38 @@ export function createOfflineDocument(vaultId, notePath, onDurabilityChange = ()
           throw error;
         });
       });
+
+      if (typeof BroadcastChannel !== "undefined") {
+        try {
+          peerChannel = new BroadcastChannel(collaborationStorageKey(vaultId, notePath));
+          peerChannel.onmessage = ({ data }) => {
+            if (closed || data?.sender === peerId) {
+              return;
+            }
+
+            if (data?.type === "sync-request") {
+              peerChannel.postMessage({
+                type: "update", sender: peerId,
+                update: Y.encodeStateAsUpdate(doc),
+              });
+            } else if (data?.type === "update" && data.update instanceof Uint8Array) {
+              try {
+                if (shouldDeferPeerUpdate()) {
+                  bufferedPeerUpdates.push({ update: data.update, fromServer: data.fromServer });
+                } else {
+                  Y.applyUpdate(doc, data.update, data.fromServer ? "remote" : CROSS_TAB);
+                }
+              } catch (error) {
+                console.warn("[collab] Invalid update from another local tab:", error);
+              }
+            }
+          };
+          // Also handles a peer that opened while our IndexedDB was loading.
+          peerChannel.postMessage({ type: "sync-request", sender: peerId });
+        } catch (error) {
+          console.warn("[collab] Same-browser-tab sync unavailable:", error);
+        }
+      }
 
       return snapshot.initialized || snapshot.updates.length > 0;
     }).catch((error) => {
@@ -194,6 +246,11 @@ export function createOfflineDocument(vaultId, notePath, onDurabilityChange = ()
     get status() {
       return { isSaving: savedRevision < localRevision, error: failure };
     },
+    flushPeerUpdates() {
+      for (const { update, fromServer } of bufferedPeerUpdates.splice(0)) {
+        Y.applyUpdate(doc, update, fromServer ? "remote" : CROSS_TAB);
+      }
+    },
     async markInitialized() {
       // The empty/nonempty initialization marker must never outrun the
       // accompanying Yjs update. Otherwise an offline reload could see an
@@ -203,6 +260,7 @@ export function createOfflineDocument(vaultId, notePath, onDurabilityChange = ()
     },
     async close() {
       closed = true;
+      peerChannel?.close();
       try {
         await ready;
         await pending;

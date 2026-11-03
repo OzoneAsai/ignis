@@ -45,6 +45,17 @@ function toRelative(vaultRoot, resolved) {
   return toVaultRel(path.relative(vaultRoot, resolved));
 }
 
+function respondMutationError(res, error) {
+  if (error.code === "COLLABORATIVE_FILE_OPERATION_CONFLICT") {
+    return res.status(409).json({
+      code: error.code,
+      error: "Collaborative note is in use or has conflicting history. Close editors before moving or deleting it.",
+    });
+  }
+
+  return res.status(500).json(sanitizeError(error));
+}
+
 function isApplicable(event) {
   return (
     !watcher.isIgnoredPath(event.path) &&
@@ -371,11 +382,52 @@ router.post("/rename", async (req, res) => {
   }
 
   try {
+    const from = toRelative(vaultRoot, oldResolved);
+    const to = toRelative(vaultRoot, newResolved);
+    const stat = await fs.promises.stat(oldResolved);
+
+    if (oldResolved === newResolved) {
+      return res.json({ ok: true });
+    }
+
+    // Do not silently replace a separate note (and potentially its CRDT
+    // history) by using the OS's overwrite-on-rename semantics.
+    if (fs.existsSync(newResolved) && (
+      collaboration.isCollaborative(req._vaultId, from) ||
+      collaboration.isCollaborative(req._vaultId, to)
+    )) {
+      return res.status(409).json({
+        code: "FILE_ALREADY_EXISTS",
+        error: "A file or folder already exists at the destination",
+      });
+    }
+
     await flushPendingSubtree(oldResolved);
-    // Drop the destination's buffer so a stale write cannot land on the renamed file.
-    await supersedePending(newResolved, () =>
-      fs.promises.rename(oldResolved, newResolved),
-    );
+
+    if (stat.isDirectory()) {
+      // Directory operations may cover many CRDT identities. Until folder
+      // history migration is supported, preserve all those histories by
+      // refusing a move that would silently orphan any of them.
+      await collaboration.mutateDirectory(req._vaultId, from, oldResolved, to,
+        () => supersedePending(newResolved, () => fs.promises.rename(oldResolved, newResolved)));
+    } else if (from.toLowerCase().endsWith(".md") && to.toLowerCase().endsWith(".md")) {
+      await collaboration.renameNote(req._vaultId, from, to,
+        () => supersedePending(newResolved, () => fs.promises.rename(oldResolved, newResolved)),
+        () => fs.promises.rename(newResolved, oldResolved));
+    } else {
+      collaboration.checkLivePath(req._vaultId, from);
+      collaboration.checkLivePath(req._vaultId, to);
+
+      if (collaboration.isCollaborative(req._vaultId, from) ||
+          collaboration.isCollaborative(req._vaultId, to)) {
+        return res.status(409).json({
+          code: "COLLABORATIVE_FILE_OPERATION_CONFLICT",
+          error: "Cannot change a collaborative note into a different file type",
+        });
+      }
+
+      await supersedePending(newResolved, () => fs.promises.rename(oldResolved, newResolved));
+    }
 
     res.json({ ok: true });
 
@@ -388,7 +440,7 @@ router.post("/rename", async (req, res) => {
       ),
     );
   } catch (e) {
-    res.status(500).json(sanitizeError(e));
+    respondMutationError(res, e);
   }
 });
 
@@ -412,6 +464,18 @@ router.post("/copyFile", async (req, res) => {
   }
 
   try {
+    const from = toRelative(vaultRoot, srcResolved);
+    const to = toRelative(vaultRoot, destResolved);
+    collaboration.checkLivePath(req._vaultId, from);
+    collaboration.checkLivePath(req._vaultId, to);
+
+    if (collaboration.isCollaborative(req._vaultId, to)) {
+      return res.status(409).json({
+        code: "FILE_ALREADY_EXISTS",
+        error: "Copy cannot replace another note or its collaboration history",
+      });
+    }
+
     await flushPending(srcResolved);
     await supersedePending(destResolved, () =>
       fs.promises.copyFile(srcResolved, destResolved),
@@ -424,7 +488,7 @@ router.post("/copyFile", async (req, res) => {
       path: toRelative(vaultRoot, destResolved),
     });
   } catch (e) {
-    res.status(500).json(sanitizeError(e));
+    respondMutationError(res, e);
   }
 });
 
@@ -439,7 +503,7 @@ router.delete("/unlink", async (req, res) => {
   const rel = toRelative(req._vaultRoot, resolved);
 
   try {
-    await supersedePending(resolved, () =>
+    const performDelete = () => supersedePending(resolved, () =>
       fs.promises.unlink(resolved).catch((e) => {
         // already gone counts as deleted
         if (e.code !== "ENOENT") {
@@ -448,11 +512,13 @@ router.delete("/unlink", async (req, res) => {
       }),
     );
 
+    await collaboration.deleteNote(req._vaultId, rel, performDelete);
+
     res.json({ ok: true });
 
     applyToTree(req, { type: "deleted", path: rel });
   } catch (e) {
-    res.status(500).json(sanitizeError(e));
+    respondMutationError(res, e);
   }
 });
 
@@ -465,7 +531,9 @@ router.delete("/rmdir", async (req, res) => {
   }
 
   try {
-    await supersedePendingSubtree(resolved, () => fs.promises.rmdir(resolved));
+    const relative = toRelative(req._vaultRoot, resolved);
+    await collaboration.mutateDirectory(req._vaultId, relative, resolved, null,
+      () => supersedePendingSubtree(resolved, () => fs.promises.rmdir(resolved)));
 
     const rel = toRelative(req._vaultRoot, resolved);
 
@@ -473,7 +541,7 @@ router.delete("/rmdir", async (req, res) => {
 
     applyToTree(req, { type: "deleted", path: rel });
   } catch (e) {
-    res.status(500).json(sanitizeError(e));
+    respondMutationError(res, e);
   }
 });
 
@@ -487,6 +555,25 @@ router.delete("/rm", async (req, res) => {
 
   try {
     const recursive = req.query.recursive === "true";
+    const relative = toRelative(req._vaultRoot, resolved);
+    const stat = await fs.promises.stat(resolved).catch(() => null);
+
+    if (stat?.isDirectory()) {
+      await collaboration.mutateDirectory(req._vaultId, relative, resolved, null,
+        () => supersedePendingSubtree(resolved, () => fs.promises.rm(resolved, { recursive })));
+      res.json({ ok: true });
+      applyToTree(req, { type: "deleted", path: relative });
+      return;
+    } else if (stat?.isFile() && relative.toLowerCase().endsWith(".md")) {
+      await collaboration.deleteNote(req._vaultId, relative, () =>
+        supersedePending(resolved, () => fs.promises.rm(resolved)));
+      res.json({ ok: true });
+      applyToTree(req, { type: "deleted", path: relative });
+      return;
+    } else {
+      collaboration.checkLivePath(req._vaultId, relative);
+    }
+
     const remove = () => fs.promises.rm(resolved, { recursive });
 
     if (recursive) {
@@ -501,7 +588,7 @@ router.delete("/rm", async (req, res) => {
 
     applyToTree(req, { type: "deleted", path: rel });
   } catch (e) {
-    res.status(500).json(sanitizeError(e));
+    respondMutationError(res, e);
   }
 });
 

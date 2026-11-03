@@ -4,6 +4,7 @@ import http from "http";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import crypto from "node:crypto";
 
 const require = createRequire(import.meta.url);
 const Y = require("yjs");
@@ -252,6 +253,13 @@ describe("collaboration room", () => {
     expect(received.anchor).toBe(relative(1));
     expect(received.head).toBe(relative(4));
 
+    const away = waitFor(bob, "cursor");
+    alice.send(JSON.stringify({ channel: "collab", type: "cursor-away", path: "test.md" }));
+    const cleared = await away;
+    expect(cleared.id).toBe(aInfo.self.id);
+    expect(cleared.anchor).toBeNull();
+    expect(cleared.head).toBeNull();
+
     const updated = waitFor(bob, "presence");
     alice.send(JSON.stringify({ channel: "collab", type: "identity", path: "test.md", name: "Alice New" }));
     const list = await updated;
@@ -262,5 +270,84 @@ describe("collaboration room", () => {
     const reduced = await left;
     expect(reduced.people).toHaveLength(1);
     expect(reduced.people[0].id).toBe(bInfo.self.id);
+  });
+
+  function historyPath(notePath) {
+    const name = crypto.createHash("sha256")
+      .update(JSON.stringify(["test", notePath])).digest("hex");
+    return path.join(root, "data", "collaboration", `${name}.yjs`);
+  }
+
+  async function createHistoricalState(notePath, content = "Start\n") {
+    const note = new Y.Doc();
+    note.getText("content").insert(0, content);
+    const sidecar = historyPath(notePath);
+    await fs.promises.mkdir(path.dirname(sidecar), { recursive: true });
+    await fs.promises.writeFile(sidecar, Y.encodeStateAsUpdate(note));
+    await fs.promises.writeFile(`${sidecar}.baseline.json`, JSON.stringify({
+      digest: crypto.createHash("sha256").update(content).digest("hex"),
+    }));
+    note.destroy();
+  }
+
+  it("migrates CRDT history with an inactive note rename instead of losing revisions", async () => {
+    await createHistoricalState("test.md");
+    const before = path.join(vaultPath, "test.md");
+    const after = path.join(vaultPath, "new-title.md");
+    await manager.renameNote("test", "test.md", "new-title.md",
+      () => fs.promises.rename(before, after),
+      () => fs.promises.rename(after, before));
+
+    await expect(fs.promises.stat(historyPath("test.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.promises.stat(historyPath("new-title.md"))).isFile()).toBe(true);
+    expect((await fs.promises.stat(`${historyPath("new-title.md")}.baseline.json`)).isFile()).toBe(true);
+    expect((await manager.openRoom("test", "new-title.md")).text.toString()).toBe("Start\n");
+  });
+
+  it("removes historical state on deletion so a recreated note has fresh identity", async () => {
+    await createHistoricalState("test.md");
+    const note = path.join(vaultPath, "test.md");
+    await manager.deleteNote("test", "test.md", () => fs.promises.unlink(note));
+    expect(fs.existsSync(historyPath("test.md"))).toBe(false);
+    expect(fs.existsSync(`${historyPath("test.md")}.baseline.json`)).toBe(false);
+    await fs.promises.writeFile(note, "Unrelated new note\n");
+    const fresh = await manager.openRoom("test", "test.md");
+    expect(fresh.text.toString()).toBe("Unrelated new note\n");
+  });
+
+  it("refuses to rename a note currently joined by another participant", async () => {
+    const client = await connect();
+    await join(client);
+    await expect(manager.renameNote("test", "test.md", "moved.md",
+      () => fs.promises.rename(path.join(vaultPath, "test.md"), path.join(vaultPath, "moved.md"))))
+      .rejects.toMatchObject({ code: "COLLABORATIVE_FILE_OPERATION_CONFLICT" });
+    expect(fs.existsSync(path.join(vaultPath, "test.md"))).toBe(true);
+  });
+
+  it("rejects a directory move containing historical collaborative notes", async () => {
+    const directory = path.join(vaultPath, "notes");
+    await fs.promises.mkdir(directory);
+    await fs.promises.writeFile(path.join(directory, "older.md"), "Earlier\n");
+    await createHistoricalState("notes/older.md", "Earlier\n");
+    await expect(manager.assertSafeSubtree("test", "notes", directory))
+      .rejects.toMatchObject({ code: "COLLABORATIVE_FILE_OPERATION_CONFLICT" });
+  });
+
+  it("locks the identity path during a long rename operation", async () => {
+    let begin;
+    let finish;
+    const underway = new Promise((resolve) => { begin = resolve; });
+    const held = new Promise((resolve) => { finish = resolve; });
+    const operation = manager.renameNote("test", "test.md", "moved.md", async () => {
+      begin();
+      await held;
+      await fs.promises.rename(path.join(vaultPath, "test.md"), path.join(vaultPath, "moved.md"));
+    });
+    await underway;
+    await expect(manager.openRoom("test", "test.md"))
+      .rejects.toMatchObject({ code: "COLLABORATIVE_FILE_OPERATION_CONFLICT" });
+    finish();
+    await operation;
+    expect(fs.existsSync(path.join(vaultPath, "moved.md"))).toBe(true);
   });
 });

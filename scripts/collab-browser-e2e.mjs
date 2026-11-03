@@ -285,6 +285,7 @@ try {
     throw new Error("Undo affected another participant's change: " + JSON.stringify({
       before: beforeOwnEdit.slice(0, 60), afterRemote: afterRemote.slice(0, 90),
       afterUndo: afterUndo.slice(0, 90),
+      remoteKeptByOtherBrowser: (await read(a)).includes(remoteMarker),
     }));
   }
 
@@ -316,7 +317,15 @@ try {
 
 
   if (!composingView.includes(composingText) || composingView.includes(concurrentText)) {
-    throw new Error("Incoming remote edit interfered with the active composition");
+    throw new Error("Incoming remote edit interfered with the active composition: " + JSON.stringify({
+      localPresent: composingView.includes(composingText),
+      remotePresent: composingView.includes(concurrentText),
+      status: await status(b),
+      active: await cdp.evaluate(b, `(() => ({
+        leaves: window.app.workspace.getLeavesOfType('markdown').map(l => l.view.file?.path),
+        focused: Boolean(window.app.workspace.activeLeaf?.view?.editor?.cm?.hasFocus),
+      }))()`),
+    }));
   }
 
   await cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.cm.dom.dispatchEvent(new CompositionEvent('compositionend', {bubbles:true})); true");
@@ -325,6 +334,95 @@ try {
     return first === second && first.includes(composingText) && first.includes(concurrentText);
   }, 15000);
   console.log("PASS: IME composition and simultaneous remote edit merge without interrupting input");
+
+  // Two Obsidian panes in ONE browser share one Y.Doc for the same note.
+  // They must not trigger a leave/join each time focus changes, nor create a
+  // second independent selection history or replace each other's DOM.
+  const split = await cdp.evaluate(b, `(async () => {
+    const workspace = window.app.workspace;
+    const original = workspace.activeLeaf;
+    const note = original.view.file;
+    const second = workspace.getLeaf('split');
+    await second.openFile(note);
+    window.__ignisCollabTestPanes = {original, second};
+    return {
+      leaves: workspace.getLeavesOfType('markdown').map(leaf => ({
+        path: leaf.view.file?.path, identical: leaf === original,
+      })),
+      differentEditors: original.view.editor !== second.view.editor,
+    };
+  })()`);
+
+  if (split.leaves.filter((leaf) => leaf.path === notePath).length < 2 ||
+      !split.differentEditors) {
+    throw new Error("Unable to open two independent Markdown panes: " + JSON.stringify(split));
+  }
+
+  const splitLeft = `[SPLIT-L-${markerId}]`;
+  const splitRight = `[SPLIT-R-${markerId}]`;
+  const splitFromPeer = `[SPLIT-REMOTE-${markerId}]`;
+  await cdp.evaluate(b, `(() => {
+    const panes = window.__ignisCollabTestPanes;
+    panes.original.view.editor.cm.contentDOM.__sameSplitNode = 'left';
+    panes.second.view.editor.cm.contentDOM.__sameSplitNode = 'right';
+    panes.original.view.editor.replaceRange(${JSON.stringify(splitLeft)}, {line:0,ch:0});
+    return true;
+  })()`);
+  await poll(async () => cdp.evaluate(b, `(() => {
+    const {original,second} = window.__ignisCollabTestPanes;
+    return original.view.editor.getValue().includes(${JSON.stringify(splitLeft)}) &&
+      second.view.editor.getValue().includes(${JSON.stringify(splitLeft)});
+  })()`), 15000);
+  await cdp.evaluate(b, `(() => {
+    const editor = window.__ignisCollabTestPanes.second.view.editor;
+    editor.replaceRange(${JSON.stringify(splitRight)}, editor.offsetToPos(editor.getValue().length));
+    return true;
+  })()`);
+  await poll(async () => cdp.evaluate(b, `(() => {
+    const {original,second} = window.__ignisCollabTestPanes;
+    return original.view.editor.getValue() === second.view.editor.getValue() &&
+      original.view.editor.getValue().includes(${JSON.stringify(splitRight)});
+  })()`), 15000);
+  await cdp.evaluate(a, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.replaceRange(${JSON.stringify(splitFromPeer)}, {line:0,ch:0});
+    return true;
+  })()`);
+  await poll(async () => cdp.evaluate(b, `(() => {
+    const {original,second} = window.__ignisCollabTestPanes;
+    return [original,second].every(leaf => leaf.view.editor.getValue().includes(
+      ${JSON.stringify(splitFromPeer)})) &&
+      original.view.editor.cm.contentDOM.__sameSplitNode === 'left' &&
+      second.view.editor.cm.contentDOM.__sameSplitNode === 'right';
+  })()`), 15000);
+  console.log("PASS: two independent panes share one CRDT, preserve both DOM nodes and receive peer edits");
+
+  // Switching to a different note in one pane must not unsubscribe the other
+  // pane from its still-open room. Both notes have independent state and ACKs.
+  const otherNote = "Collab Multi Pane Secondary.md";
+  await cdp.evaluate(b, `(async () => {
+    const {second} = window.__ignisCollabTestPanes;
+    const file = window.app.vault.getAbstractFileByPath(${JSON.stringify(otherNote)}) ||
+      await window.app.vault.create(${JSON.stringify(otherNote)}, '# Second room\\n');
+    await second.openFile(file);
+    window.app.workspace.setActiveLeaf(second);
+    return true;
+  })()`);
+  await poll(async () => (await status(b)).includes("online"), 15000);
+  const backgroundMarker = `[BACKGROUND-ROOM-${markerId}]`;
+  await cdp.evaluate(a, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.replaceRange(${JSON.stringify(backgroundMarker)}, {line:0,ch:0});
+    return true;
+  })()`);
+  await poll(async () => cdp.evaluate(b, `(() => {
+    const {original,second} = window.__ignisCollabTestPanes;
+    return original.view.file.path === ${JSON.stringify(notePath)} &&
+      second.view.file.path === ${JSON.stringify(otherNote)} &&
+      original.view.editor.getValue().includes(${JSON.stringify(backgroundMarker)}) &&
+      !second.view.editor.getValue().includes(${JSON.stringify(backgroundMarker)});
+  })()`), 15000);
+  console.log("PASS: background Markdown pane stays synchronized while another note is active");
 
   await cdp.command("Target.closeTarget", { targetId: cdp.targets.get(a) });
   await cdp.activate(b);

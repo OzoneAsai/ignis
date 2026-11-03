@@ -178,37 +178,47 @@ async function browser(port) {
   await cdp.command("Runtime.enable", {}, sessionId);
   const address = `http://127.0.0.1:${port}/?vault=Lab`;
 
-  async function openPage() {
-    await cdp.command("Page.navigate", { url: address }, sessionId);
-    await poll(() => cdp.evaluate(sessionId,
+  async function newTab() {
+    const { targetId: another } = await cdp.command("Target.createTarget", { url: "about:blank" });
+    const { sessionId: next } = await cdp.command("Target.attachToTarget", {
+      targetId: another, flatten: true,
+    });
+    await cdp.command("Page.enable", {}, next);
+    await cdp.command("Runtime.enable", {}, next);
+    return next;
+  }
+
+  async function openPage(tab = sessionId) {
+    await cdp.command("Page.navigate", { url: address }, tab);
+    await poll(() => cdp.evaluate(tab,
       "Boolean(window.app?.workspace?.getLeaf && window.app?.vault?.getAbstractFileByPath)"),
     60000, "Obsidian startup");
-    await poll(() => cdp.evaluate(sessionId,
+    await poll(() => cdp.evaluate(tab,
       "Boolean(window.app.vault.getAbstractFileByPath('Offline Draft.md'))"),
     30000, "offline note metadata");
-    const opened = await cdp.evaluate(sessionId, `(async () => {
+    const opened = await cdp.evaluate(tab, `(async () => {
       const note = window.app.vault.getAbstractFileByPath('Offline Draft.md');
       await window.app.workspace.getLeaf(false).openFile(note);
       return Boolean(window.app.workspace.activeLeaf?.view?.editor);
     })()`);
     assert(opened, "Could not open Markdown editor");
-    await poll(() => cdp.evaluate(sessionId, `(() => {
+    await poll(() => cdp.evaluate(tab, `(() => {
       const status = document.querySelector('.ignis-collaboration-status')?.textContent || '';
       return status.includes('saved') || status.includes('offline');
     })()`), 30000, "collaboration initialization");
   }
 
-  const read = () => cdp.evaluate(sessionId,
+  const read = (tab = sessionId) => cdp.evaluate(tab,
     "window.app.workspace.activeLeaf.view.editor.getValue()");
-  const status = () => cdp.evaluate(sessionId,
+  const status = (tab = sessionId) => cdp.evaluate(tab,
     "document.querySelector('.ignis-collaboration-status')?.textContent || ''");
-  const append = (content) => cdp.evaluate(sessionId, `(() => {
+  const append = (content, tab = sessionId) => cdp.evaluate(tab, `(() => {
     const editor = window.app.workspace.activeLeaf.view.editor;
     editor.replaceRange(${JSON.stringify(content)}, editor.offsetToPos(editor.getValue().length));
     return editor.getValue();
   })()`);
 
-  return { cdp, sessionId, address, openPage, read, status, append };
+  return { cdp, sessionId, address, newTab, openPage, read, status, append };
 }
 
 try {
@@ -266,8 +276,20 @@ try {
   await poll(async () => (await page.status()).includes("saved on device"),
     12000, "locally durable first edit");
 
+  const secondTab = await page.newTab();
+  await page.openPage(secondTab);
+  await poll(async () => (await page.read(secondTab)).includes("OFFLINE FIRST"),
+    15000, "second tab recovery while disconnected");
+  await page.append("OFFLINE SECOND TAB\n", secondTab);
+  await poll(async () => (await page.read()).includes("OFFLINE SECOND TAB"),
+    15000, "same-origin live offline BroadcastChannel sync");
+  await poll(async () => (await page.status(secondTab)).includes("saved on device"),
+    12000, "second tab local durable edit");
+  console.log("PASS: two Chrome tabs converge offline without a running server");
+
   await page.openPage();
-  assert((await page.read()).includes("OFFLINE FIRST"), "Lost offline edit on page reload");
+  assert((await page.read()).includes("OFFLINE FIRST") &&
+    (await page.read()).includes("OFFLINE SECOND TAB"), "Lost cross-tab offline edits on page reload");
   console.log("PASS: browser reloaded while server offline, Yjs note recovered from IndexedDB");
 
   await page.append("OFFLINE AFTER RELOAD\n");
@@ -283,7 +305,8 @@ try {
     const value = await page.read();
     const state = await page.status();
     return value.includes("REMOTE EDIT") && value.includes("OFFLINE FIRST") &&
-      value.includes("OFFLINE AFTER RELOAD") && state.includes("saved");
+      value.includes("OFFLINE SECOND TAB") && value.includes("OFFLINE AFTER RELOAD") &&
+      state.includes("saved");
   }, 30000, "CRDT reconnection merge and server durability");
   const merged = await page.read();
   await poll(async () => (await fs.readFile(file, "utf-8")) === merged,
