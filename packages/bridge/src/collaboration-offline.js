@@ -110,6 +110,7 @@ function compact(database) {
 export function createOfflineDocument(
   vaultId, notePath, onDurabilityChange = () => {}, shouldDeferPeerUpdate = () => false,
 ) {
+  const legacyKey = collaborationStorageKey(vaultId, notePath);
   const doc = new Y.Doc();
   const text = doc.getText("content");
   let localRevision = 0;
@@ -118,6 +119,8 @@ export function createOfflineDocument(
   let closed = false;
   let pending = Promise.resolve();
   let database = null;
+  let activeGeneration = null;
+  let localGeneration = null;
   let writesSinceCompaction = 0;
   let peerChannel = null;
   const bufferedPeerUpdates = [];
@@ -134,10 +137,20 @@ export function createOfflineDocument(
     }
   };
 
-  const ready = openDatabase(collaborationStorageKey(vaultId, notePath))
-    .then(async (db) => {
+  const ready = openDatabase(legacyKey)
+    .then(async (legacy) => {
+      activeGeneration = await getMetadata(legacy, "active-generation") || null;
+      const db = activeGeneration
+        ? await openDatabase(`${legacyKey}:generation:${activeGeneration}`)
+        : legacy;
+
+      if (db !== legacy) {
+        legacy.close();
+      }
+
       database = db;
       const snapshot = await readSnapshot(db);
+      localGeneration = activeGeneration || await getMetadata(db, "server-document-id") || null;
 
       doc.transact(() => {
         for (const update of snapshot.updates) {
@@ -157,6 +170,7 @@ export function createOfflineDocument(
           try {
             peerChannel?.postMessage({
               type: "update", sender: peerId, update,
+              generation: localGeneration,
               fromServer: origin === "remote",
             });
           } catch (error) {
@@ -190,15 +204,19 @@ export function createOfflineDocument(
 
       if (typeof BroadcastChannel !== "undefined") {
         try {
-          peerChannel = new BroadcastChannel(collaborationStorageKey(vaultId, notePath));
+          peerChannel = new BroadcastChannel(
+            activeGeneration ? `${legacyKey}:generation:${activeGeneration}` : legacyKey,
+          );
           peerChannel.onmessage = ({ data }) => {
-            if (closed || data?.sender === peerId) {
+            if (closed || data?.sender === peerId ||
+                (data?.generation || null) !== localGeneration) {
               return;
             }
 
             if (data?.type === "sync-request") {
               peerChannel.postMessage({
                 type: "update", sender: peerId,
+                generation: localGeneration,
                 update: Y.encodeStateAsUpdate(doc),
               });
             } else if (data?.type === "update" && data.update instanceof Uint8Array) {
@@ -214,7 +232,9 @@ export function createOfflineDocument(
             }
           };
           // Also handles a peer that opened while our IndexedDB was loading.
-          peerChannel.postMessage({ type: "sync-request", sender: peerId });
+          peerChannel.postMessage({
+            type: "sync-request", sender: peerId, generation: localGeneration,
+          });
         } catch (error) {
           console.warn("[collab] Same-browser-tab sync unavailable:", error);
         }
@@ -245,6 +265,66 @@ export function createOfflineDocument(
     ready,
     get status() {
       return { isSaving: savedRevision < localRevision, error: failure };
+    },
+    get activeGeneration() {
+      return activeGeneration;
+    },
+    stageServerIdentity(documentId) {
+      // Label the incoming server snapshot with its generation BEFORE Yjs
+      // observers rebroadcast it to other local tabs. This guards the narrow
+      // window between joining a room and committing the IDB metadata record.
+      localGeneration = documentId;
+      peerChannel?.postMessage({
+        type: "sync-request", sender: peerId, generation: localGeneration,
+      });
+    },
+    async setServerIdentity(documentId) {
+      await persistence.set("server-document-id", documentId);
+      this.stageServerIdentity(documentId);
+    },
+    async recoverReplacedDraft() {
+      const pointer = await openDatabase(legacyKey);
+
+      try {
+        return await getMetadata(pointer, "replaced-note-recovery") || null;
+      } finally {
+        pointer.close();
+      }
+    },
+    async clearReplacedDraft() {
+      const pointer = await openDatabase(legacyKey);
+
+      try {
+        await setMetadata(pointer, "replaced-note-recovery", null);
+      } finally {
+        pointer.close();
+      }
+    },
+    async activateGeneration(newGeneration, recoveredText) {
+      await ready;
+      await pending;
+
+      if (!/^[a-f0-9-]{36}$/.test(newGeneration)) {
+        throw new Error("Invalid server document generation");
+      }
+
+      // Two pointer changes MUST commit together. The old Yjs journal is not
+      // deleted; a human-readable recovery copy is kept across browser restarts
+      // before the next generation's clean IndexedDB namespace is selected.
+      const pointer = await openDatabase(legacyKey);
+
+      try {
+        await new Promise((resolve, reject) => {
+          const transaction = transactionFor(pointer, ["custom"]);
+          transaction.objectStore("custom").put(recoveredText, "replaced-note-recovery");
+          transaction.objectStore("custom").put(newGeneration, "active-generation");
+          transaction.oncomplete = resolve;
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        });
+      } finally {
+        pointer.close();
+      }
     },
     flushPeerUpdates() {
       for (const { update, fromServer } of bufferedPeerUpdates.splice(0)) {

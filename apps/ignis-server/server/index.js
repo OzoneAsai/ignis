@@ -188,7 +188,12 @@ app.use(express.static(path.join(REPO_ROOT, "packages", "shim", "dist")));
 
 app.use(express.static(config.obsidianAssetsPath));
 
-const server = app.listen(config.port, async () => {
+// Explicitly support loopback-only development instances. Keep the ordinary
+// Ignis binding unchanged unless the operator selects a specific interface.
+const listenArgs = process.env.IGNIS_BIND_HOST
+  ? [config.port, process.env.IGNIS_BIND_HOST]
+  : [config.port];
+const server = app.listen(...listenArgs, async () => {
   console.log(`[ignis] Server running on http://localhost:${config.port}`);
   console.log(`[ignis] Vault root: ${config.vaultRoot}`);
   console.log(`[ignis] Vaults: ${Object.keys(config.vaults).join(", ")}`);

@@ -63,6 +63,7 @@ async function startServer(port) {
     env: {
       ...process.env,
       PORT: String(port),
+      IGNIS_BIND_HOST: "127.0.0.1",
       VAULT_ROOT: vaultRoot,
       DATA_ROOT: dataRoot,
       OBSIDIAN_ASSETS_PATH: obsidianAssets,
@@ -196,15 +197,16 @@ async function browser(port) {
     await poll(() => cdp.evaluate(tab,
       "Boolean(window.app.vault.getAbstractFileByPath('Offline Draft.md'))"),
     30000, "offline note metadata");
-    const opened = await cdp.evaluate(tab, `(async () => {
+    const opened = await poll(() => cdp.evaluate(tab, `(async () => {
       const note = window.app.vault.getAbstractFileByPath('Offline Draft.md');
       await window.app.workspace.getLeaf(false).openFile(note);
       return Boolean(window.app.workspace.activeLeaf?.view?.editor);
-    })()`);
+    })()`), 30000, "Markdown pane startup");
     assert(opened, "Could not open Markdown editor");
     await poll(() => cdp.evaluate(tab, `(() => {
       const status = document.querySelector('.ignis-collaboration-status')?.textContent || '';
-      return status.includes('saved') || status.includes('offline');
+      return status.includes('saved') || status.includes('offline') ||
+        status.includes('review unsent') || status.includes('note replaced');
     })()`), 30000, "collaboration initialization");
   }
 
@@ -312,6 +314,49 @@ try {
   await poll(async () => (await fs.readFile(file, "utf-8")) === merged,
     15000, "canonical Markdown persistence");
   console.log("PASS: server restart + remote edit merged with both offline edits");
+
+  // A deleted-and-recreated note is a NEW document, despite the same path.
+  // Keep both browser tabs open with their old IndexedDB histories, remove the
+  // server's CRDT history as a deletion would, then recreate a new Markdown
+  // note at that path. The old offline updates must never reappear in it.
+  await stopServer();
+  const replacementText = "A completely different document generation\n";
+  await fs.rm(path.join(dataRoot, "collaboration"), { recursive: true, force: true });
+  await fs.writeFile(file, replacementText, "utf-8");
+  await startServer(port);
+  await poll(async () => (await page.status()).includes("note replaced"),
+    30000, "generation mismatch warning");
+  assert(await fs.readFile(file, "utf-8") === replacementText,
+    "Stale offline CRDT state overwrote a replacement note");
+  assert((await page.read()).includes("OFFLINE FIRST"),
+    "Original offline recovery copy was discarded before user consent");
+  console.log("PASS: new note generation rejects old offline changes and retains recovery copy");
+
+  await page.cdp.evaluate(page.sessionId, `(() => {
+    document.querySelector('.ignis-collaboration-status').click();
+    const button = [...document.querySelectorAll('button')].find(
+      (element) => element.textContent.includes('Open new server note'));
+    if (!button) throw new Error('Missing safe generation switch action');
+    button.click();
+    return true;
+  })()`);
+  await poll(async () => (await page.read()) === replacementText,
+    30000, "replaced note loading from its own IndexedDB generation");
+  await poll(async () => (await fs.readFile(file, "utf-8")) === replacementText,
+    15000, "replacement Markdown still unmodified");
+  const recovered = await page.cdp.evaluate(page.sessionId, `(() => {
+    document.querySelector('.ignis-collaboration-status').click();
+    return [...document.querySelectorAll('textarea')].map((item) => item.value)
+      .find((text) => text.includes('OFFLINE FIRST')) || null;
+  })()`);
+  assert(recovered?.includes("OFFLINE SECOND TAB"),
+    "Protected previous generation was not accessible through the recovery UI");
+  await page.openPage();
+  assert((await page.read()) === replacementText,
+    "The selected new note generation did not survive a page reload");
+  assert(await fs.readFile(file, "utf-8") === replacementText,
+    "Reload mixed two distinct note generations");
+  console.log("PASS: explicit safe switch opens new note and preserves old draft across reload");
 } finally {
   socket?.close();
   chrome?.kill("SIGTERM");

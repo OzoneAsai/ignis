@@ -4,6 +4,7 @@ import { MarkdownView, Modal } from "obsidian";
 import * as Y from "yjs";
 import { createOfflineDocument, CROSS_TAB_ORIGIN } from "./collaboration-offline.js";
 import { saveOfflineNote } from "../../shim/src/offline-boot.js";
+import { collaborationStatus } from "./collaboration-status.js";
 import { fsShim } from "../../shim/src/fs/index.js";
 import {
   localChanges,
@@ -32,7 +33,7 @@ function ownDisplayName() {
 }
 
 class PeopleModal extends Modal {
-  constructor(app, getPeople, getName, setName, getDetails, retrySync, dismissDraft) {
+  constructor(app, getPeople, getName, setName, getDetails, retrySync, dismissDraft, activateServerCopy) {
     super(app);
     this.getPeople = getPeople;
     this.getName = getName;
@@ -40,6 +41,7 @@ class PeopleModal extends Modal {
     this.getDetails = getDetails;
     this.retrySync = retrySync;
     this.dismissDraft = dismissDraft;
+    this.activateServerCopy = activateServerCopy;
   }
 
   onOpen() {
@@ -83,10 +85,22 @@ class PeopleModal extends Modal {
         });
     }
 
-    if (typeof details.pendingDraft === "string") {
-      root.createEl("h4", { text: "Recovered unsent draft" });
+    if (details.generationMismatch) {
+      root.createEl("h4", { text: "This note was replaced on the server" });
       root.createEl("p", {
-        text: "An editor changed this note before the shared version finished loading. The unsent text is preserved separately. Review and copy it; it was NOT merged over other people's edits.",
+        text: "The same filename now refers to a different note. Your previous offline draft has NOT been merged into it. Keep a recovery copy and open the new server version separately.",
+      });
+    }
+
+    if (typeof details.pendingDraft === "string") {
+      root.createEl("h4", {
+        text: details.generationMismatch || details.recoveredGenerationDraft
+          ? "Protected copy of previous note" : "Recovered unsent draft",
+      });
+      root.createEl("p", {
+        text: details.generationMismatch || details.recoveredGenerationDraft
+          ? "This is your earlier note's text, stored separately so it cannot overwrite the new server note. You may copy it for comparison or recovery."
+          : "An editor changed this note before the shared version finished loading. The unsent text is preserved separately. Review and copy it; it was NOT merged over other people's edits.",
       });
       const area = root.createEl("textarea");
       area.readOnly = true;
@@ -113,6 +127,25 @@ class PeopleModal extends Modal {
           this.close();
         }, { once: true });
       }, { once: true });
+    }
+
+    if (details.generationMismatch) {
+      const openNew = root.createEl("button", {
+        text: "Open new server note (preserve old draft)", type: "button",
+      });
+      openNew.addEventListener("click", async () => {
+        openNew.disabled = true;
+
+        try {
+          await this.activateServerCopy();
+          this.close();
+        } catch (error) {
+          openNew.disabled = false;
+          root.createEl("p", {
+            text: `Could not safely switch note copies: ${String(error.message || error)}`,
+          });
+        }
+      });
     }
 
     root.createEl("h4", { text: "People in this note" });
@@ -246,6 +279,8 @@ export function initCollaboration(plugin) {
       storageError: session?.storageError,
       serverSaveError: session?.serverSaveError,
       pendingDraft: session?.pendingConflict,
+      generationMismatch: session?.generationMismatch,
+      recoveredGenerationDraft: session?.recoveredGenerationDraft,
     }), () => {
       if (session?.joined && ws.isOpen()) {
         sendUpdate(session, Y.encodeStateAsUpdate(session.doc));
@@ -255,7 +290,23 @@ export function initCollaboration(plugin) {
         session.pendingConflict = null;
         session.local.persistence.set("unsent-startup-draft", null)
           .catch((error) => console.warn("[collab] Could not clear recovery copy:", error));
+        session.local.clearReplacedDraft().catch(
+          (error) => console.warn("[collab] Could not clear replaced-note recovery:", error),
+        );
         render();
+      }
+    }, async () => {
+      const current = session;
+
+      if (!current?.generationMismatch) {
+        return;
+      }
+
+      await current.local.activateGeneration(current.generationMismatch, current.text.toString());
+
+      if (sessions.get(current.path) === current) {
+        dispose(current);
+        scheduleActive();
       }
     });
     peopleModal.open();
@@ -295,38 +346,7 @@ export function initCollaboration(plugin) {
   }
 
   function render() {
-    if (!session) {
-      if (status.textContent) {
-        status.setText("");
-      }
-      return;
-    }
-
-    let label;
-
-    if (session.storageError) {
-      label = "Collab: local storage failed · keep this tab open";
-    } else if (!session.hydrated) {
-      label = "Collab: loading local draft…";
-    } else if (!session.initialized) {
-      label = ws.isOpen() ? "Collab: loading note…" : "Collab: offline · note unavailable";
-    } else if (session.pendingConflict) {
-      label = "Collab: review unsent startup changes";
-    } else if (session.serverSaveError) {
-      label = "Collab: server save failed · local draft retained";
-    } else if (session.protocolError) {
-      label = "Collab: synchronization error · check this note";
-    } else if (session.localSaving || session.previewSaving) {
-      label = ws.isOpen() ? "Collab: saving to device…" : "Collab: offline · saving locally…";
-    } else if (!ws.isOpen()) {
-      label = "Collab: offline · saved on device";
-    } else if (!session.joined) {
-      label = "Collab: reconnecting · local copy ready";
-    } else if (session.dirty || session.confirmedSeq < session.sentSeq) {
-      label = `Collab: syncing · ${session.participants} online`;
-    } else {
-      label = `Collab: ${session.participants} online · saved`;
-    }
+    const label = collaborationStatus(session, ws.isOpen());
 
     if (status.textContent !== label) {
       status.setText(label);
@@ -334,13 +354,13 @@ export function initCollaboration(plugin) {
   }
 
   function sendJoin(current) {
-    if (current?.hydrated && ws.isOpen() && !current.joined) {
+    if (current?.hydrated && !current.generationMismatch && ws.isOpen() && !current.joined) {
       channel.send("join", { path: current.path, name: ownDisplayName() });
     }
   }
 
   function sendUpdate(current, bytes) {
-    if (!current.joined || !ws.isOpen()) {
+    if (!current.joined || current.generationMismatch || !ws.isOpen()) {
       return;
     }
 
@@ -514,11 +534,19 @@ export function initCollaboration(plugin) {
     const undo = () => current.undoManager.undo();
     const redo = () => current.undoManager.redo();
     editor.undo = function () {
+      if (current.generationMismatch) {
+        return;
+      }
+
       return current.initialized && sessions.get(current.path) === current
         ? undo()
         : originalUndo.call(editor);
     };
     editor.redo = function () {
+      if (current.generationMismatch) {
+        return;
+      }
+
       return current.initialized && sessions.get(current.path) === current
         ? redo()
         : originalRedo.call(editor);
@@ -539,7 +567,10 @@ export function initCollaboration(plugin) {
       if (wantsUndo || wantsRedo) {
         event.preventDefault();
         event.stopImmediatePropagation();
-        (wantsUndo ? undo : redo)();
+
+        if (!current.generationMismatch) {
+          (wantsUndo ? undo : redo)();
+        }
       }
     };
     document.addEventListener("keydown", onUndoShortcut, true);
@@ -657,6 +688,10 @@ export function initCollaboration(plugin) {
       localSaving: false,
       storageError: null,
       serverSaveError: false,
+      serverDocumentId: null,
+      generationMismatch: null,
+      identitySaving: false,
+      recoveredGenerationDraft: false,
       protocolError: null,
       previewSaving: false,
       previewRevision: 0,
@@ -682,7 +717,7 @@ export function initCollaboration(plugin) {
         next.storageError = storage.error;
         render();
       }
-    }, () => next.composing);
+    }, () => next.composing || Boolean(next.generationMismatch));
     const { doc, text } = local;
     next.doc = doc;
     next.text = text;
@@ -731,11 +766,21 @@ export function initCollaboration(plugin) {
 
     render();
 
-    local.ready.then((hasLocalCopy) => {
+    local.ready.then(async (hasLocalCopy) => {
+      const [storedId, unsentDraft, replacedDraft] = await Promise.all([
+        next.local.persistence.get("server-document-id"),
+        next.local.persistence.get("unsent-startup-draft"),
+        next.local.recoverReplacedDraft(),
+      ]);
+
       if (sessions.get(next.path) !== next) {
         return;
       }
 
+      next.serverDocumentId = storedId || next.local.activeGeneration || null;
+      next.pendingConflict = typeof unsentDraft === "string"
+        ? unsentDraft : (typeof replacedDraft === "string" ? replacedDraft : null);
+      next.recoveredGenerationDraft = typeof replacedDraft === "string";
       next.hydrated = true;
 
       if (hasLocalCopy) {
@@ -750,12 +795,6 @@ export function initCollaboration(plugin) {
 
       render();
       sendJoin(next);
-      next.local.persistence.get("unsent-startup-draft").then((draft) => {
-        if (sessions.get(next.path) === next && typeof draft === "string") {
-          next.pendingConflict = draft;
-          render();
-        }
-      }).catch((error) => console.warn("[collab] Could not read startup recovery copy:", error));
     }).catch((error) => {
       console.error("[collab] Local draft initialization failed:", error);
 
@@ -849,10 +888,35 @@ export function initCollaboration(plugin) {
         return;
       }
 
+      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(msg.documentId)) {
+        current.protocolError = "Server did not provide a valid note identity";
+        channel.send("leave", { path: current.path });
+        render();
+        return;
+      }
+
+      if (current.serverDocumentId && current.serverDocumentId !== msg.documentId) {
+        // A deleted/recreated path is NOT the old note. It cannot accept old
+        // offline operations merely because the filename was reused.
+        current.generationMismatch = msg.documentId;
+        current.joined = false;
+        current.pendingConflict = current.text.toString();
+        current.people.clear();
+
+        for (const binding of current.bindings.values()) {
+          binding.unlock ||= guardEditor(binding.editor);
+        }
+
+        channel.send("leave", { path: current.path });
+        render();
+        return;
+      }
+
       const preJoinText = current.editor.getValue();
       const changedWhileJoining = !current.initialized && preJoinText !== current.initial;
 
       try {
+        current.local.stageServerIdentity(msg.documentId);
         Y.applyUpdate(current.doc, decodeUpdate(msg.state), REMOTE);
         current.initialized = true;
         current.joined = true;
@@ -880,10 +944,16 @@ export function initCollaboration(plugin) {
         }
         fsShim._contentCache.set(current.path, current.text.toString());
         unlockEditors(current);
-        current.local.markInitialized().catch((error) => {
-          current.storageError = error;
-          render();
-        });
+        current.serverDocumentId = msg.documentId;
+        current.identitySaving = true;
+        current.local.markInitialized()
+          .then(() => current.local.setServerIdentity(msg.documentId))
+          .catch((error) => {
+            current.storageError = error;
+          }).finally(() => {
+            current.identitySaving = false;
+            render();
+          });
         scheduleOfflinePreview(current);
         // Full state exchange includes local edits retained while disconnected.
         sendUpdate(current, Y.encodeStateAsUpdate(current.doc));
@@ -898,7 +968,7 @@ export function initCollaboration(plugin) {
     channel.subscribe("update", (msg) => {
       const current = sessions.get(msg.path);
 
-      if (!current?.initialized) {
+      if (!current?.initialized || current.generationMismatch) {
         return;
       }
 
@@ -1004,7 +1074,7 @@ export function initCollaboration(plugin) {
   plugin.registerEvent(plugin.app.workspace.on("editor-change", (editor) => {
     for (const current of sessions.values()) {
       if (!current.bindings.has(editor) || !current.initialized ||
-          current.suppress || current.composing) {
+          current.suppress || current.composing || current.generationMismatch) {
         continue;
       }
 

@@ -36,13 +36,42 @@ function normalizeNotePath(notePath) {
     return null;
   }
 
-  const normalized = notePath.replace(/\\/g, "/").replace(/^\/+/, "");
+  const normalized = notePath.replace(/\\/g, "/");
 
-  if (!normalized.toLowerCase().endsWith(".md") || normalized.includes("\0")) {
+  // Room IDs are document identities, not merely filesystem locators. A path
+  // with another spelling of the same file would create two Yjs documents
+  // that could overwrite one another's Markdown projection.
+  if (!normalized.toLowerCase().endsWith(".md") || normalized.includes("\0") ||
+      normalized.startsWith("/") || normalized.includes("//") ||
+      normalized.split("/").some((segment) => !segment || segment === "." ||
+        segment === "..")) {
     return null;
   }
 
   return normalized;
+}
+
+async function assertCanonicalNotePath(vaultRoot, notePath) {
+  // Case-insensitive filesystems (notably default macOS volumes) resolve
+  // `Notes.md` and `notes.md` to the same inode. Distinct CRDT room names for
+  // those spellings would silently clobber each other's Markdown projection.
+  // Check actual directory entries, not realpath(), which retains the caller's
+  // spelling on some macOS filesystems.
+  let directory = vaultRoot;
+
+  for (const part of notePath.split("/")) {
+    const entries = await fs.promises.readdir(directory);
+
+    if (!entries.includes(part)) {
+      throw new Error("Noncanonical collaborative note path");
+    }
+
+    directory = path.join(directory, part);
+
+    if ((await fs.promises.lstat(directory)).isSymbolicLink()) {
+      throw new Error("Collaborative notes cannot be opened through symlink aliases");
+    }
+  }
 }
 
 function applyTextChange(text, before, after, origin) {
@@ -325,7 +354,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
       // Commit record is written LAST. On restart it distinguishes a newer
       // Yjs state that survived a crash from a deliberate external file edit.
       const marker = `${room.statePath}.baseline.json`;
-      await atomicReplace(marker, JSON.stringify({ digest }));
+      await atomicReplace(marker, JSON.stringify({ digest, documentId: room.documentId }));
 
       for (const { ws, seq } of acknowledgements) {
         send(ws, "saved", { path: room.path, seq });
@@ -390,6 +419,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     const operation = (async () => {
       // Establish the CRDT baseline after all conventional pending writes.
       await writeCoalescer?.flushPending?.(filePath);
+      await assertCanonicalNotePath(vaultRoot, relPath);
       const stat = await fs.promises.stat(filePath);
 
       if (!stat.isFile() || stat.size > MAX_NOTE_BYTES) {
@@ -399,6 +429,8 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
       const diskText = await fs.promises.readFile(filePath, "utf-8");
       const diskDigest = crypto.createHash("sha256").update(diskText).digest("hex");
       const statePath = statePathFor(vaultId, relPath);
+      const marker = await fs.promises.readFile(`${statePath}.baseline.json`, "utf-8")
+        .then((value) => JSON.parse(value)).catch(() => null);
       const doc = new Y.Doc();
       const text = doc.getText("content");
       const saved = await fs.promises.readFile(statePath).catch((error) => {
@@ -408,12 +440,18 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
 
         return null;
       });
+      // A marker without its matching Yjs state is NOT proof that a newly
+      // recreated file still belongs to the preceding document generation.
+      const documentId = saved && typeof marker?.documentId === "string" &&
+        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(marker.documentId)
+        ? marker.documentId
+        : crypto.randomUUID();
+      let needsBaseline = !saved || documentId !== marker?.documentId;
 
       if (saved) {
         Y.applyUpdate(doc, saved);
         if (text.toString() !== diskText) {
-          const marker = await fs.promises.readFile(`${statePath}.baseline.json`, "utf-8")
-            .then((value) => JSON.parse(value)).catch(() => null);
+          needsBaseline = true;
           const stateStat = await fs.promises.stat(statePath);
           const diskIsExternal = marker?.digest
             ? marker.digest !== diskDigest
@@ -444,6 +482,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
         vaultId,
         filePath,
         statePath,
+        documentId,
         doc,
         text,
         members: new Set(),
@@ -457,6 +496,13 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
         broadcast(room, "update", { update: Buffer.from(update).toString("base64") }, origin);
         schedulePersist(room);
       });
+
+      // A document generation cannot be advertised to a browser until it has
+      // a durable marker. Otherwise a crash between first join and first edit
+      // would assign a new generation on restart, stranding an offline draft.
+      if (needsBaseline) {
+        await persist(room);
+      }
 
       rooms.set(roomId, room);
       return room;
@@ -543,6 +589,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
 
       send(ws, "init", {
         path: room.path,
+        documentId: room.documentId,
         state: Buffer.from(Y.encodeStateAsUpdate(room.doc)).toString("base64"),
         participants: room.members.size,
         self: { ...room.people.get(ws) },

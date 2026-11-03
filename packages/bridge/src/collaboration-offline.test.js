@@ -116,6 +116,55 @@ describe("IndexedDB offline CRDT lifecycle", () => {
     await Promise.all([editor.close(), peer.close()]);
   });
 
+  it("keeps a replaced note generation in a separate durable journal", async () => {
+    const old = createOfflineDocument("offline-lab", "draft.md");
+    await old.ready;
+    old.text.insert(0, "Offline edits to deleted original");
+    await old.markInitialized();
+    const newId = "11111111-1111-4111-8111-111111111111";
+    await old.activateGeneration(newId, old.text.toString());
+    await old.close();
+
+    const replacement = createOfflineDocument("offline-lab", "draft.md");
+    expect(await replacement.ready).toBe(false);
+    expect(replacement.activeGeneration).toBe(newId);
+    expect(replacement.text.toString()).toBe("");
+    expect(await replacement.recoverReplacedDraft())
+      .toBe("Offline edits to deleted original");
+    replacement.text.insert(0, "A genuinely new note");
+    await replacement.markInitialized();
+    await replacement.close();
+
+    const reopened = createOfflineDocument("offline-lab", "draft.md");
+    expect(await reopened.ready).toBe(true);
+    expect(reopened.text.toString()).toBe("A genuinely new note");
+    expect(await reopened.recoverReplacedDraft())
+      .toBe("Offline edits to deleted original");
+    await reopened.clearReplacedDraft();
+    await reopened.close();
+
+    expect(await clearDocument(key)).toBeUndefined();
+    // The selected new-generation journal must also be released before cleanup.
+    await clearDocument(`${key}:generation:${newId}`);
+  });
+
+  it("never exchanges CRDT updates between tabs with different document generations", async () => {
+    const first = createOfflineDocument("offline-lab", "draft.md");
+    const second = createOfflineDocument("offline-lab", "draft.md");
+    await Promise.all([first.ready, second.ready]);
+    const oldId = "11111111-1111-4111-8111-111111111111";
+    const newId = "22222222-2222-4222-8222-222222222222";
+    first.stageServerIdentity(oldId);
+    second.stageServerIdentity(newId);
+    first.text.insert(0, "OLD DOCUMENT");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(second.text.toString()).toBe("");
+    second.text.insert(0, "NEW DOCUMENT");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(first.text.toString()).toBe("OLD DOCUMENT");
+    await Promise.all([first.close(), second.close()]);
+  });
+
   it("compacts more than 512 committed updates without dropping a character", async () => {
     const first = createOfflineDocument("offline-lab", "draft.md");
     await first.ready;

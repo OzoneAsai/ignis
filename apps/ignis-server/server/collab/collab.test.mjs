@@ -146,13 +146,73 @@ describe("collaboration room", () => {
   });
 
   it("reconciles external text while retaining CRDT identity", async () => {
-    expect(normalizeNotePath("/folder/note.md")).toBe("folder/note.md");
+    expect(normalizeNotePath("/folder/note.md")).toBe(null);
+    expect(normalizeNotePath("folder/../note.md")).toBe(null);
+    expect(normalizeNotePath("folder//note.md")).toBe(null);
+    expect(normalizeNotePath("./note.md")).toBe(null);
+    expect(normalizeNotePath("folder/note.md")).toBe("folder/note.md");
     expect(normalizeNotePath("folder/note.png")).toBe(null);
     const doc = new Y.Doc();
     const text = doc.getText("content");
     text.insert(0, "abc");
     applyTextChange(text, "abc", "abXYZc", "external");
     expect(text.toString()).toBe("abXYZc");
+  });
+
+  it("refuses alternate spellings of a note to prevent duplicate CRDT rooms", async () => {
+    await expect(manager.openRoom("test", "folder/../test.md"))
+      .rejects.toThrow();
+    await expect(manager.openRoom("test", "TEST.md"))
+      .rejects.toThrow();
+    await expect(manager.openRoom("test", "./test.md"))
+      .rejects.toThrow();
+    await fs.promises.symlink("test.md", path.join(vaultPath, "alias.md"));
+    await expect(manager.openRoom("test", "alias.md"))
+      .rejects.toThrow(/symlink/);
+    const canonical = await manager.openRoom("test", "test.md");
+    expect(canonical.text.toString()).toBe("Start\n");
+  });
+
+  it("persists stable document generations and allocates fresh identity after deletion", async () => {
+    const first = await manager.openRoom("test", "test.md");
+    expect(first.documentId).toMatch(/^[a-f0-9-]{36}$/);
+    await manager.flushAll();
+    const recreated = createCollaborationManager({
+      wss,
+      getVaultPath: (id) => (id === "test" ? vaultPath : null),
+      dataRoot: path.join(root, "data"),
+    });
+    const second = await recreated.openRoom("test", "test.md");
+    expect(second.documentId).toBe(first.documentId);
+    const originalPath = path.join(vaultPath, "test.md");
+    // A deletion cannot race with an open room. Model a fresh server process
+    // with no retained membership rather than deleting from the live manager.
+    const next = createCollaborationManager({
+      wss,
+      getVaultPath: (id) => (id === "test" ? vaultPath : null),
+      dataRoot: path.join(root, "data"),
+    });
+    await next.deleteNote("test", "test.md", () => fs.promises.unlink(originalPath));
+    await fs.promises.writeFile(originalPath, "New generation\n");
+    const after = await next.openRoom("test", "test.md");
+    expect(after.documentId).not.toBe(first.documentId);
+    expect(after.text.toString()).toBe("New generation\n");
+  });
+
+  it("does not trust a leftover generation marker when its Yjs state was deleted", async () => {
+    const first = await manager.openRoom("test", "test.md");
+    await manager.flushAll();
+    const history = historyPath("test.md");
+    await fs.promises.unlink(history);
+    await fs.promises.writeFile(path.join(vaultPath, "test.md"), "Recreated while marker remains\n");
+    const restarted = createCollaborationManager({
+      wss,
+      getVaultPath: (id) => (id === "test" ? vaultPath : null),
+      dataRoot: path.join(root, "data"),
+    });
+    const second = await restarted.openRoom("test", "test.md");
+    expect(second.documentId).not.toBe(first.documentId);
+    expect(second.text.toString()).toBe("Recreated while marker remains\n");
   });
 
   it("does not claim remote sync until the canonical Markdown file is durable", async () => {
