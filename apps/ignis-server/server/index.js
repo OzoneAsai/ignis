@@ -55,6 +55,24 @@ app.use((req, res, next) => {
   next();
 });
 
+// The legacy file API has a configurable, much larger body ceiling. Native
+// Sync is intentionally bounded to 4 MiB file payloads; parse it with its
+// own 6 MiB wire limit BEFORE the legacy global JSON parser allocates RAM.
+// This also bounds chunked requests with no Content-Length header.
+app.use("/api/sync/v1", express.json({ limit: "6mb" }));
+app.use("/api/sync/v1", (error, _req, res, next) => {
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({
+      code: "PAYLOAD_TOO_LARGE", error: "Sync request exceeds 6 MiB"
+    });
+  }
+  if (error?.type === "entity.parse.failed") {
+    return res.status(400).json({
+      code: "INVALID_JSON", error: "Invalid Sync JSON payload"
+    });
+  }
+  next(error);
+});
 app.use(express.json({ limit: settings.MAX_BODY_BACKSTOP }));
 app.use(compression());
 
