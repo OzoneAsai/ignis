@@ -5,6 +5,7 @@ const mockRequest = vi.hoisted(() => vi.fn());
 vi.mock("obsidian", () => ({
   Plugin: class {},
   PluginSettingTab: class {},
+  Modal: class {},
   Setting: class {},
   Notice: class {},
   TFile: class {},
