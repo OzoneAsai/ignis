@@ -1,16 +1,21 @@
 import {
-  Plugin, PluginSettingTab, Setting, Notice, TFile, editorInfoField, requestUrl
+  Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, editorInfoField, requestUrl
 } from "obsidian";
 import { NativeYjs } from "./live";
 import {
   queueRename, queueDelete, acknowledgePending, localPaths,
   type TrackedFile, type PendingMutation
 } from "./pending";
+import {
+  stageWrite, acknowledgeWrite, type StagedWrite
+} from "./writes";
+import { classifyAbsence, readChangesThrough } from "./reconcile";
 
 // The same Web APIs and Obsidian Vault APIs run on macOS, Windows, Linux,
 // Android and iOS. Never import Node/Electron into this plugin bundle.
 type Base = TrackedFile;
 type Pending = PendingMutation;
+type SyncIssue = { path: string; reason: string };
 type Settings = {
   serverUrl: string;
   discoveryUrl: string;
@@ -20,6 +25,9 @@ type Settings = {
   cursor: number;
   baselines: Record<string, Base>;
   pending: Pending[];
+  pendingWrites: StagedWrite[];
+  applyRemoteDeletes: boolean;
+  syncIssues: SyncIssue[];
   yjsIds: Record<string, string>;
   scope: string;
   archivedScopes: Array<{
@@ -27,6 +35,8 @@ type Settings = {
     cursor: number;
     baselines: Record<string, Base>;
     pending: Pending[];
+    pendingWrites: StagedWrite[];
+    syncIssues: SyncIssue[];
     yjsIds: Record<string, string>;
   }>;
 };
@@ -46,7 +56,8 @@ type OperationResult = {
 
 const DEFAULT: Settings = {
   serverUrl: "", discoveryUrl: "", serverDeviceId: "", vaultId: "", deviceId: "",
-  cursor: 0, baselines: {}, pending: [], yjsIds: {},
+  cursor: 0, baselines: {}, pending: [], pendingWrites: [],
+  applyRemoteDeletes: false, syncIssues: [], yjsIds: {},
   scope: "", archivedScopes: []
 };
 const SECRET_PREFIX = "ignis-connector-vault-";
@@ -55,11 +66,14 @@ const textEncoder = new TextEncoder();
 
 function isSyncablePath(path: string): boolean {
   const parts = path.split("/");
-  return !!path && !parts.some((part) =>
-    !part || part === "." || part === ".." ||
-    [".obsidian", ".git", ".ignis-connector"].includes(part) ||
-    part.startsWith(".ignis-sync-tmp-") ||
-    part.startsWith(".ignis-collab-tmp-"));
+  return !!path && !path.includes("\\") && !path.includes("\0") &&
+    !path.startsWith("/") && !parts.some((part) => {
+      const lower = part.toLowerCase();
+      return !part || part === "." || part === ".." ||
+        [".obsidian", ".git", ".ignis-connector", ".trash"].includes(lower) ||
+        lower.startsWith(".ignis-sync-tmp-") ||
+        lower.startsWith(".ignis-collab-tmp-");
+    });
 }
 function isMarkdown(path: string): boolean {
   return path.toLowerCase().endsWith(".md") && isSyncablePath(path);
@@ -122,6 +136,18 @@ export default class IgnisConnector extends Plugin {
   private needsReload = false;
   private authBlocked = false;
   private retryCount = 0;
+  private persistTail: Promise<void> = Promise.resolve();
+
+  private persistSettings(): Promise<void> {
+    // Obsidian Plugin.saveData is asynchronous. Two overlapping Vault events
+    // must never let an older JSON snapshot overwrite a newer pending opId.
+    // Snapshot at enqueue time and write in FIFO order, including failures.
+    const snapshot = JSON.parse(JSON.stringify(this.settings)) as Settings;
+    const next = this.persistTail.catch(() => {}).then(() =>
+      this.saveData(snapshot));
+    this.persistTail = next;
+    return next;
+  }
 
   async onload() {
     const saved = (await this.loadData()) as Partial<Settings> | null;
@@ -129,6 +155,9 @@ export default class IgnisConnector extends Plugin {
       ...DEFAULT, ...saved,
       baselines: saved?.baselines || {},
       pending: saved?.pending || [],
+      pendingWrites: saved?.pendingWrites || [],
+      applyRemoteDeletes: saved?.applyRemoteDeletes === true,
+      syncIssues: saved?.syncIssues || [],
       yjsIds: saved?.yjsIds || {},
       archivedScopes: saved?.archivedScopes || []
     };
@@ -144,7 +173,7 @@ export default class IgnisConnector extends Plugin {
       knownId: (path) => this.settings.yjsIds[path] || null,
       rememberId: async (path, id) => {
         this.settings.yjsIds[path] = id;
-        await this.saveData(this.settings);
+        await this.persistSettings();
       },
       send: (message) => {
         if (this.socket?.readyState === WebSocket.OPEN) {
@@ -172,8 +201,10 @@ export default class IgnisConnector extends Plugin {
     });
     this.addCommand({
       id: "show-sync-issues",
-      name: "Show last Ignis sync issue",
-      callback: () => new Notice(this.lastError || "No sync issue recorded")
+      name: "Review Ignis sync issues",
+      callback: () => new SyncIssuesModal(
+        this.app, this.settings.syncIssues, this.lastError
+      ).open()
     });
     this.addCommand({
       id: "archive-and-switch-server",
@@ -200,13 +231,13 @@ export default class IgnisConnector extends Plugin {
         this.lastError = "Cannot queue conflicting local rename: " + oldPath;
         this.showStatus("Rename needs review");
       }
-      void this.saveData(this.settings).then(() => this.schedule());
+      void this.persistSettings().then(() => this.schedule());
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (!(file instanceof TFile) || this.quiet.has(file.path) ||
           !isSyncablePath(file.path)) return;
       queueDelete(this.settings, file.path, crypto.randomUUID());
-      void this.saveData(this.settings).then(() => this.schedule());
+      void this.persistSettings().then(() => this.schedule());
     }));
     this.registerInterval(window.setInterval(() => this.schedule(), 45000));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.schedule()));
@@ -282,7 +313,7 @@ export default class IgnisConnector extends Plugin {
     }
     this.token = token;
     this.settings.deviceId = session.deviceId;
-    await this.saveData(this.settings);
+    await this.persistSettings();
     this.authBlocked = false;
     this.retryCount = 0;
     this.connectSocket();
@@ -291,7 +322,7 @@ export default class IgnisConnector extends Plugin {
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.persistSettings();
     // SecretStorage is not guaranteed on every supported mobile build.
     // A token held only in memory must survive an unrelated settings edit,
     // but it must never carry over to a different server/Vault identity.
@@ -332,12 +363,16 @@ export default class IgnisConnector extends Plugin {
       cursor: this.settings.cursor,
       baselines: this.settings.baselines,
       pending: this.settings.pending,
+      pendingWrites: this.settings.pendingWrites,
+      syncIssues: this.settings.syncIssues,
       yjsIds: this.settings.yjsIds
     });
     this.settings.scope = newScope;
     this.settings.cursor = 0;
     this.settings.baselines = {};
     this.settings.pending = [];
+    this.settings.pendingWrites = [];
+    this.settings.syncIssues = [];
     this.settings.yjsIds = {};
     this.settings.deviceId = "";
     this.token = "";
@@ -346,7 +381,7 @@ export default class IgnisConnector extends Plugin {
     this.needsReload = true;
     this.live.disconnected();
     this.socket?.close();
-    await this.saveData(this.settings);
+    await this.persistSettings();
     this.showStatus("Archived old state · restart plugin before connecting");
     new Notice("Old pending work was archived, not deleted. Disable and re-enable Ignis Connector before entering a token.");
   }
@@ -363,7 +398,9 @@ export default class IgnisConnector extends Plugin {
   private url(path: string): string {
     return validServerUrl(this.settings.serverUrl) + "/api/sync/v1" + path;
   }
-  private async deviceRequest(path: string, method = "GET", body?: unknown) {
+  private async deviceRequest(
+    path: string, method = "GET", body?: unknown, allowNotFound = false
+  ) {
     const response = await requestUrl({
       url: this.url(path),
       method,
@@ -381,7 +418,7 @@ export default class IgnisConnector extends Plugin {
       this.showStatus("Device revoked or no longer authorized");
       throw new Error("Sync device authorization rejected");
     }
-    if (response.status >= 400) {
+    if (response.status >= 400 && !(allowNotFound && response.status === 404)) {
       throw new Error("Ignis Sync HTTP " + response.status);
     }
     return response;
@@ -569,9 +606,70 @@ export default class IgnisConnector extends Plugin {
       if (pending.toPath) {
         this.live.rejoinPath(pending.toPath);
       }
-      this.settings.cursor = Math.max(this.settings.cursor, result.seq);
-      await this.saveData(this.settings);
+      await this.persistSettings();
     }
+  }
+  private async replayWrites() {
+    const vaultId = encodeURIComponent(this.settings.vaultId);
+    while (this.settings.pendingWrites.length) {
+      const staged = this.settings.pendingWrites[0];
+      // A lost response may mean that the server has already committed.
+      // Query the durable receipt before inspecting the mutable local file.
+      const receiptResponse = await this.deviceRequest(
+        "/vaults/" + vaultId + "/operations/" + encodeURIComponent(staged.opId),
+        "GET", undefined, true
+      );
+      let receipt: OperationResult;
+      if (receiptResponse.status === 200) {
+        receipt = receiptResponse.json;
+      } else if (receiptResponse.status === 404) {
+        const local = this.app.vault.getAbstractFileByPath(staged.path);
+        if (!(local instanceof TFile) ||
+            await this.localHash(local) !== staged.localHash) {
+          throw new Error("Staged write differs from current local file; review before replay: " +
+            staged.path);
+        }
+        receipt = await this.sendOperation({
+          opId: staged.opId, type: staged.type, path: staged.path,
+          ...(staged.content !== undefined ? { content: staged.content } :
+            { contentBase64: staged.contentBase64 }),
+          ...(staged.type === "modify" ? {
+            fileId: staged.fileId, generationId: staged.generationId,
+            baseHash: staged.baseHash
+          } : {})
+        });
+      } else {
+        throw new Error("Could not verify staged write receipt: HTTP " + receiptResponse.status);
+      }
+      // Check the receipt before mutating any local tracking state.
+      acknowledgeWrite(this.settings.pendingWrites, receipt);
+      this.saveBase(staged.path, receipt);
+      await this.persistSettings();
+    }
+  }
+  private async stageAndSend(
+    type: "create" | "modify", file: TFile, base?: Base
+  ): Promise<void> {
+    const payload = await this.payloadFor(file);
+    const bytes = "content" in payload ?
+      textEncoder.encode(payload.content) :
+      Uint8Array.from(atob(payload.contentBase64), (ch) => ch.charCodeAt(0));
+    const digest = await sha256(bytes);
+    const staged = stageWrite(this.settings.pendingWrites, {
+      type, path: file.path, opId: crypto.randomUUID(),
+      ...payload, localHash: digest,
+      ...(base ? {
+        fileId: base.fileId, generationId: base.generationId,
+        baseHash: base.hash
+      } : {})
+    });
+    // The immutable payload and operation ID must be on disk BEFORE the
+    // first network send. A timeout or app kill can now retry exactly.
+    await this.persistSettings();
+    if (staged.localHash !== digest) {
+      throw new Error("Another staged version exists for " + file.path);
+    }
+    await this.replayWrites();
   }
 
   async syncNow() {
@@ -580,17 +678,26 @@ export default class IgnisConnector extends Plugin {
     this.syncing = true;
     this.showStatus("Syncing");
     try {
+      // A local operation receipt proves only that ONE operation committed,
+      // not that all intervening remote changes were reconciled.
+      const startingCursor = this.settings.cursor;
+      await this.replayWrites();
       await this.replayPending();
       const vaultId = encodeURIComponent(this.settings.vaultId);
       const manifest = await this.api("/vaults/" + vaultId + "/manifest") as Manifest;
+      const changes = await readChangesThrough(startingCursor, manifest.vaultSeq,
+        (since, limit) => this.api("/vaults/" + vaultId +
+          "/changes?since=" + since + "&limit=" + limit));
       const local = this.localFiles();
       const remotePaths = new Set<string>();
-      const conflicts: string[] = [];
+      const conflicts: SyncIssue[] = [];
+      const report = (path: string, reason: string) =>
+        conflicts.push({ path, reason });
       for (const remote of manifest.files) {
         if (!isSyncablePath(remote.path)) continue;
         remotePaths.add(remote.path);
         if (remote.size > MAX_FILE_BYTES) {
-          conflicts.push(remote.path + " (attachment exceeds preview size limit)");
+          report(remote.path, "Attachment exceeds preview size limit");
           continue;
         }
         // Live Yjs handles in-memory panes. A file-level REST write cannot
@@ -606,7 +713,7 @@ export default class IgnisConnector extends Plugin {
           const isClean = previousLocal &&
             await this.localHash(previousLocal) === oldBase.hash;
           if (!isClean || targetLocal || this.openInEditor(oldPath)) {
-            conflicts.push(remote.path + " (remote move requires review)");
+            report(remote.path, "Remote move requires review");
             continue;
           }
           this.quiet.add(oldPath);
@@ -635,41 +742,35 @@ export default class IgnisConnector extends Plugin {
         const localDigest = existing ? await this.localHash(existing) : null;
         if (base && (base.fileId !== remote.fileId ||
                      base.generationId !== remote.generationId)) {
-          conflicts.push(remote.path + " (replaced generation)");
+          report(remote.path, "Replaced document generation");
           continue;
         }
         if (!existing) {
-          if (base) { conflicts.push(remote.path + " (local deletion unresolved)"); continue; }
+          if (base) { report(remote.path, "Local deletion unresolved"); continue; }
           const data = await this.remoteBytes(remote);
           await this.writeLocal(remote.path, isMarkdown(remote.path) ?
             new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         } else if (!base) {
           if (localDigest === remote.hash) this.saveBase(remote.path, remote);
-          else conflicts.push(remote.path + " (existing on both devices)");
+          else report(remote.path, "Existing on both devices");
         } else if (localDigest === null) {
-          conflicts.push(remote.path + " (size limit)");
+          report(remote.path, "Size limit");
         } else if (localDigest === remote.hash) {
           this.saveBase(remote.path, remote);
         } else if (localDigest !== base.hash && remote.hash !== base.hash) {
-          conflicts.push(remote.path + " (concurrent edit)");
+          report(remote.path, "Concurrent edit");
         } else if (localDigest !== base.hash) {
           if (this.openInEditor(remote.path)) {
             // The native editor may have unsaved changes. CM6/Yjs binding
             // comes in the next phase; do not overwrite the open editor.
-            conflicts.push(remote.path + " (open editor, pending Yjs integration)");
+            report(remote.path, "Open editor; file-level write deferred");
             continue;
           }
-          const result = await this.sendOperation({
-            type: "modify", path: remote.path,
-            ...await this.payloadFor(existing),
-            opId: crypto.randomUUID(), fileId: remote.fileId,
-            generationId: remote.generationId, baseHash: base.hash
-          });
-          this.saveBase(remote.path, result);
+          await this.stageAndSend("modify", existing, base);
         } else {
           if (this.openInEditor(remote.path)) {
-            conflicts.push(remote.path + " (open editor)");
+            report(remote.path, "Open editor");
             continue;
           }
           const data = await this.remoteBytes(remote);
@@ -677,42 +778,64 @@ export default class IgnisConnector extends Plugin {
             new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         }
-        await this.saveData(this.settings);
+        await this.persistSettings();
       }
       for (const [path, file] of local) {
         if (this.live.isManaged(path)) continue;
         if (!this.settings.baselines[path] && this.settings.yjsIds[path] &&
             !remotePaths.has(path)) {
-          conflicts.push(path + " (collaborative move has no confirmed file identity)");
+          report(path, "Collaborative move has no confirmed file identity");
           continue;
         }
         if (remotePaths.has(path) || this.settings.baselines[path] ||
             this.settings.pending.some((op) => op.toPath === path)) continue;
         const bytes = file.stat.size;
         if (bytes > MAX_FILE_BYTES) {
-          conflicts.push(path + " (attachment exceeds preview size limit)");
+          report(path, "Attachment exceeds preview size limit");
           continue;
         }
         if (this.openInEditor(path)) continue;
-        const result = await this.sendOperation({
-          type: "create", path,
-          ...await this.payloadFor(file), opId: crypto.randomUUID()
-        });
-        this.saveBase(path, result);
-        await this.saveData(this.settings);
+        await this.stageAndSend("create", file);
+        await this.persistSettings();
       }
-      // Missing server files are never inferred to be a safe local deletion.
+      // Only an explicit tombstone for the same file generation may trigger
+      // local trash, and only after verifying the local bytes are unchanged.
       for (const path of Object.keys(this.settings.baselines)) {
-        if (!remotePaths.has(path)) conflicts.push(path + " (remote missing; retained locally)");
+        const base = this.settings.baselines[path];
+        const absence = classifyAbsence(path, base, remotePaths, changes);
+        if (absence === "present") continue;
+        if (absence !== "tombstone" || !this.settings.applyRemoteDeletes ||
+            this.live.isManaged(path) || this.openInEditor(path)) {
+          report(path, "Remote missing; retained locally");
+          continue;
+        }
+        const localFile = this.app.vault.getAbstractFileByPath(path);
+        if (!(localFile instanceof TFile) ||
+            await this.localHash(localFile) !== base.hash) {
+          report(path, "Remote deleted; local changes retained");
+          continue;
+        }
+        this.quiet.add(path);
+        try {
+          // Obsidian's local .trash is recoverable and excluded from sync.
+          await this.app.vault.trash(localFile, false);
+          delete this.settings.baselines[path];
+          delete this.settings.yjsIds[path];
+          await this.persistSettings();
+        } finally {
+          window.setTimeout(() => this.quiet.delete(path), 1000);
+        }
       }
       if (conflicts.length) {
-        this.lastError = conflicts.slice(0, 4).join("; ");
+        this.lastError = conflicts.slice(0, 4)
+          .map((issue) => issue.path + ": " + issue.reason).join("; ");
         this.showStatus(conflicts.length + " items need review");
       } else {
-        this.settings.cursor = Math.max(this.settings.cursor, manifest.vaultSeq);
+        this.settings.cursor = manifest.vaultSeq;
         this.showStatus("Synced · server acknowledged");
       }
-      await this.saveData(this.settings);
+      this.settings.syncIssues = conflicts;
+      await this.persistSettings();
     } catch (error) {
       this.lastError = String(error);
       this.showStatus("Pending · locally retained");
@@ -740,6 +863,41 @@ export default class IgnisConnector extends Plugin {
       }
     } catch (error) {
       new Notice("Discovery failed: " + String(error));
+    }
+  }
+}
+
+class SyncIssuesModal extends Modal {
+  constructor(app: IgnisConnector["app"], private readonly issues: SyncIssue[],
+    private readonly lastError: string) {
+    super(app);
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Ignis sync review" });
+    if (!this.issues.length) {
+      contentEl.createEl("p", {
+        text: this.lastError || "No unresolved file conflicts from the last completed sync."
+      });
+      return;
+    }
+    contentEl.createEl("p", {
+      text: "No conflicting content has been overwritten. Review each local file before deciding how to reconcile it."
+    });
+    const list = contentEl.createEl("ul");
+    for (const issue of this.issues) {
+      const item = list.createEl("li");
+      item.createEl("strong", { text: issue.path });
+      item.appendText(" — " + issue.reason);
+      if (this.app.vault.getAbstractFileByPath(issue.path) instanceof TFile) {
+        new Setting(item).addButton((button) => button
+          .setButtonText("Open local")
+          .onClick(async () => {
+            await this.app.workspace.openLinkText(issue.path, "", false);
+            this.close();
+          }));
+      }
     }
   }
 }
@@ -790,7 +948,15 @@ class ConnectorSettings extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
     new Setting(containerEl).setName("Sync now")
-      .setDesc("Markdown-only experimental preview. Local conflicts are never overwritten.")
+      .setDesc("Experimental preview. Conflicting local content is never overwritten.")
       .addButton((b) => b.setButtonText("Sync").onClick(() => void this.plugin.syncNow()));
+    new Setting(containerEl).setName("Move verified remote deletions to local trash")
+      .setDesc("Off by default. Only a server tombstone for the same file ID and unchanged local content can move a file into Obsidian's recoverable .trash.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.applyRemoteDeletes)
+        .onChange(async (value) => {
+          this.plugin.settings.applyRemoteDeletes = value;
+          await this.plugin.saveSettings();
+        }));
   }
 }
