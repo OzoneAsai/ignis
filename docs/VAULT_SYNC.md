@@ -1,9 +1,11 @@
 # Ignis Vault Sync: experimental implementation
 
 The existing Ignis HTTP server now supports a single HTTPS/WSS sync path for
-native Obsidian desktop and mobile. The ordinary Obsidian Connector currently
-synchronizes **closed Markdown files**. Native live Yjs/CodeMirror editing,
-binary files, and automatic deletion propagation are not implemented.
+native Obsidian desktop and mobile. The ordinary Obsidian Connector supports
+closed Markdown file synchronization **and an experimental native CodeMirror 6
+Yjs live-editing binding** using the existing Ignis collaboration rooms.
+Binary files, automatic deletion propagation and complete folder operations
+are not implemented.
 
 ## Architecture
 
@@ -12,7 +14,7 @@ binary files, and automatic deletion propagation are not implemented.
 | server/sync/store.js | One SQLite WAL/FULL journal, file identities, sequences, conditional operations |
 | server/sync/http.js | Bearer-guarded REST API and authenticated sync channel on the existing WebSocket |
 | server/sync/discovery.js | Optional HTTPS Global Discovery v3 announcement with client certificate |
-| apps/obsidian-ignis-connector | One desktop/iOS/Android plugin using Obsidian Vault APIs and HTTPS/WSS |
+| apps/obsidian-ignis-connector | One desktop/iOS/Android plugin using Obsidian Vault APIs, CodeMirror 6, Yjs and HTTPS/WSS |
 
 No extra raw TCP listener, desktop-only transport, or Syncthing BEP exists.
 The existing reverse proxy should terminate HTTPS/WSS on the same hostname.
@@ -94,15 +96,44 @@ recovery, not as a falsely acknowledged operation.
 The Connector keeps local user text in the ordinary Obsidian Vault and records
 observed pending rename/delete operations in plugin data. It never infers a
 deletion simply from an absent file; first-sync collisions and concurrent
-edits require review. Open native Markdown editors are never overwritten:
-native CodeMirror/Yjs integration is a separate future step. Hidden Obsidian
-settings and plugin state are excluded, and iOS background execution is not
-promised. Current plugin sync is Markdown-only.
+edits require review. Open native Markdown editors are **never overwritten by
+the whole-file REST sync**. Instead, they join the existing Yjs collaboration
+channel, using a shared Y.Doc and CodeMirror 6 compartment that only activates
+when the native editor and the established document state match.
+
+Local Yjs state is also stored in IndexedDB, scoped to the origin, Vault,
+path and the server collaboration document ID. The client sends its full Yjs
+state on reconnect; the server acknowledges only after persisting its merged
+CRDT state and Markdown projection. Native Obsidian save events continue to
+persist the local Vault file. IndexedDB may be evicted on iOS, so a changed
+native file that lacks a matching Yjs baseline is **not** silently merged:
+the Connector keeps the draft locally and requests review. If a deleted note
+is recreated under the same path with a new document ID, old offline Yjs
+updates are not transmitted to it. IME composition defers incoming Yjs
+updates until the native editor has committed the composition transaction;
+the Yjs UndoManager tracks local operations, not remote author changes.
+
+The current native binding has no remote-selection overlay. Existing Ignis
+browser collaboration remains unchanged and interoperates through the same
+Yjs room wire format. Note: the Sync file registry's fileId/generationId and
+the older path-indexed Yjs documentId are **not yet unified**. Rename/delete
+of an actively collaborative note still follows existing server constraints.
+
+The configured HTTPS origin and Vault ID form a persistent client state
+scope. Access tokens are stored under this scope in Obsidian SecretStorage.
+Changing either requires explicitly archiving the previous pending queue and
+restarting the plugin; the archive remains in plugin data so unsent metadata
+is not silently thrown away. Tokens from the earlier unscoped preview
+must be entered again.
+
+Hidden Obsidian settings and plugin state are excluded, and iOS background
+execution is not promised. Current file sync is Markdown-only.
 
 ## Validation
 
     npm run lint
     npm test
+    npm run typecheck --workspace @ignis/obsidian-connector
     npm run build --workspace @ignis/obsidian-connector
     node scripts/sync-smoke.mjs
 
@@ -113,8 +144,10 @@ No installed Ignis process is stopped or modified.
 
 ## Next milestones
 
-1. Link stable file identities to existing Yjs room generations; bind native
-   Obsidian CodeMirror 6 and verify composition/Undo on a real iPhone.
+1. Verify the native CodeMirror 6 / Yjs binding on **real iOS hardware**,
+   especially Japanese IME, native background suspension and Undo in
+   multiple editor panes. Automated CM6/IndexedDB tests are not a substitute.
+   Link stable fileId and Yjs room generation for safe cross-device moves.
 2. Replace the shared preview token with per-device pairing and revocation.
 3. Incremental journal capture, external rename reconciliation, recovery UI.
 4. Content-addressed resumable binary attachments and bounded iOS memory use.
