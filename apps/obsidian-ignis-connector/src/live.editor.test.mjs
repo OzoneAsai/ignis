@@ -182,4 +182,20 @@ describe("real CodeMirror 6 native binding", () => {
     expect(editor.state.doc.toString()).toBe("あいうInitial");
     server.destroy();
   });
+
+  it("bounds deferred remote updates during long iOS IME composition", async () => {
+    const { manager, editor, sent, notifications, server } = await mount();
+    const room = manager.rooms.get("test.md");
+    manager.setComposing(editor, true);
+    manager.deferRemote(room, new Uint8Array(4 * 1024 * 1024 + 1));
+    expect(room.blocked).toBe(true);
+    expect(room.joined).toBe(false);
+    expect(room.waiting).toEqual([]);
+    expect(room.waitingBytes).toBe(0);
+    expect(editor.state.doc.toString()).toBe("Initial");
+    expect(sent.some((message) => message.type === "leave")).toBe(true);
+    expect(notifications.some((item) => item.status.includes("IME buffer")))
+      .toBe(true);
+    server.destroy();
+  });
 });
