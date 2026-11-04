@@ -207,16 +207,58 @@ try {
   });
   assert.equal(changedAsset.status, 200);
   assert.equal((await changedAsset.json()).seq, 5);
+
+  // A mobile device can rename the same tracked file twice while offline.
+  // Replaying each durable path transition must preserve the original
+  // fileId/generation and the idempotent operation receipts.
+  const chained = [
+    { type: "rename", path: "beta.md", toPath: "gamma.md" },
+    { type: "rename", path: "gamma.md", toPath: "delta.md" },
+    { type: "delete", path: "delta.md" }
+  ];
+  for (let i = 0; i < chained.length; i++) {
+    const operation = {
+      ...chained[i], fileId: created.fileId,
+      generationId: created.generationId,
+      baseHash: created.hash, opId: crypto.randomUUID()
+    };
+    const send = () => request("/api/sync/v1/vaults/lab/operations", {
+      method: "POST", body: JSON.stringify(operation)
+    });
+    const response = await send();
+    assert.equal(response.status, 200, "chained mutation must succeed");
+    const receipt = await response.json();
+    assert.equal(receipt.seq, 6 + i);
+    assert.equal(receipt.opId, operation.opId);
+    assert.equal((await (await send()).json()).seq, receipt.seq,
+      "a retry cannot create a second change");
+  }
+  assert.equal(fs.existsSync(path.join(vault, "beta.md")), false);
+  assert.equal(fs.existsSync(path.join(vault, "gamma.md")), false);
+  assert.equal(fs.existsSync(path.join(vault, "delta.md")), false);
+
+  // An authenticated client must not force a huge out-of-band file into RAM
+  // through a preview GET: the 4 MiB mobile bound is checked at the server.
+  fs.writeFileSync(path.join(vault, "large.bin"), Buffer.alloc(4 * 1024 * 1024 + 1));
+  const oversizedManifest = await (
+    await request("/api/sync/v1/vaults/lab/manifest")
+  ).json();
+  const oversized = oversizedManifest.files.find((f) => f.path === "large.bin");
+  assert.ok(oversized);
+  assert.equal((await request(
+    "/api/sync/v1/vaults/lab/files/" + oversized.fileId
+  )).status, 413);
+
   await stop();
   await launch();
   const reboot = await (await request("/api/sync/v1/vaults/lab/manifest")).json();
-  assert.equal(reboot.vaultSeq, 5);
-  assert.equal(reboot.files.find((f) => f.path === "beta.md").fileId, created.fileId);
+  assert.equal(reboot.vaultSeq, 9);
+  assert.equal(reboot.files.some((f) => f.fileId === created.fileId), false);
   assert.equal(reboot.files.find((f) => f.path === "media/picture.png").fileId, asset.fileId);
   assert.deepEqual(fs.readFileSync(path.join(vault, "media", "picture.png")), updatedAsset);
   assert.equal(reboot.files.find((f) => f.path === "alpha.md").generationId,
     init.documentId);
-  console.log("Sync smoke passed: shared Yjs/Sync generation, persisted CRDT journal ACK, binary attachments, auth, WSS, idempotency, conflicts, reboot");
+  console.log("Sync smoke passed: shared Yjs/Sync generation, persisted CRDT ACK, binary attachments, chained offline renames/deletion, bounded download, auth, WSS, idempotency, conflicts, reboot");
 } catch (e) {
   console.error("Sync smoke failed:", e.message);
   console.error(output.slice(-6000));

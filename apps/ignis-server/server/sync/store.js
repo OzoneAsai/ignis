@@ -388,9 +388,53 @@ class VaultSyncStore {
       e.status = 404;
       throw e;
     }
+    // The native Vault API buffers binary files on mobile, so the preview
+    // protocol has a hard limit. Enforce it server-side *before* allocating
+    // a response; an authenticated request must not load a 10 GiB attachment.
+    const downloadLimit = Math.max(MAX_TEXT_BYTES, MAX_BINARY_BYTES);
+    if (file.size > downloadLimit) {
+      const e = new Error("File exceeds the preview download limit");
+      e.status = 413;
+      throw e;
+    }
     const absolute = await safeFile(this.root(vaultId), file.path);
     await this.writeCoalescer.flushPending(absolute);
-    const bytes = await fs.promises.readFile(absolute);
+    const pathStat = await fs.promises.lstat(absolute);
+    if (pathStat.isSymbolicLink() || !pathStat.isFile()) {
+      throw conflict("INVALID_PATH", "File is not a regular file");
+    }
+    // Open a regular file without following the final symlink. Verify the
+    // opened handle, then read at most the size approved by that fstat.
+    const handle = await fs.promises.open(
+      absolute, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    ).catch((e) => {
+      if (e.code === "ELOOP") throw conflict("INVALID_PATH", "File is not a regular file");
+      throw e;
+    });
+    let bytes;
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > downloadLimit ||
+          stat.size !== file.size) {
+        throw conflict("STALE_MANIFEST", "File changed; retry manifest");
+      }
+      bytes = Buffer.alloc(stat.size);
+      let offset = 0;
+      while (offset < stat.size) {
+        const { bytesRead } = await handle.read(
+          bytes, offset, stat.size - offset, offset
+        );
+        if (!bytesRead) {
+          throw conflict("STALE_MANIFEST", "File changed; retry manifest");
+        }
+        offset += bytesRead;
+      }
+      if ((await handle.stat()).size !== stat.size) {
+        throw conflict("STALE_MANIFEST", "File changed; retry manifest");
+      }
+    } finally {
+      await handle.close();
+    }
     if (hash(bytes) !== file.hash) {
       throw conflict("STALE_MANIFEST", "File changed; retry manifest");
     }

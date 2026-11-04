@@ -109,7 +109,9 @@ missing parent folders while refusing symlinked parents. This is a
 deliberately bounded, memory-resident *preview* of binary synchronization,
 not the eventual streamed content-addressed blob protocol. Large files are
 retained locally and reported as needing review, not silently skipped as
-fully synced.
+fully synced. The HTTP file download independently enforces the 4 MiB bound
+before allocating a response. It reads a size-verified regular-file handle,
+not a final-path symlink, and refuses stale file content.
 
 The Connector keeps local user text in the ordinary Obsidian Vault and records
 observed pending rename/delete operations in plugin data. It never infers a
@@ -142,12 +144,43 @@ note cannot be renamed/deleted by the old server APIs until the room is
 released. The Connector keeps unsent rename operations pending until it
 receives a server ACK, then rejoins the new room path.
 
+### Offline transitions and iOS resumption
+
+A pending operation describes a transition of a confirmed **file identity**,
+not a detached filename. The Connector evaluates the ordered pending queue
+over its last acknowledged baselines before recording a new rename or
+deletion. Thus a sequence such as A.md -> B.md -> C.md -> delete(C.md)
+replays in the original order with stable fileId, generationId, baseHash and
+per-operation opId, even after restart. A mismatched operation receipt cannot
+consume another pending transition. Untracked collaborative moves are not
+silently uploaded as unrelated replacement files.
+
+Mobile WebViews may suspend without firing WebSocket close. On
+visibilitychange (return to visible), pageshow or an online network event,
+the Connector tears down an apparently open but potentially stale socket,
+re-authenticates to the **same approved origin**, rejoins Yjs rooms and
+reconciles native Vault files. Messages and onopen callbacks belonging to
+an old socket are ignored; a newly entered token is never sent by an
+obsolete socket. Transport errors use capped exponential reconnection
+delays, while rejected authentication or a mismatched server Vault stops
+automatic retries until reconfiguration. This is foreground recovery, **not
+background synchronization**.
+
+After a transient Yjs save-error, the Connector resends its idempotent full
+CRDT state with bounded backoff; a successful durability ACK cancels the
+retry. If an individual Yjs update exceeds the current WebSocket protocol's
+1 MiB limit, the room stops transmitting dependent partial updates and keeps
+the local draft rather than claiming synchronization. A later resumable
+transport upgrade is required for such histories.
+
 The configured HTTPS origin and Vault ID form a persistent client state
 scope. Access tokens are stored under this scope in Obsidian SecretStorage.
 Changing either requires explicitly archiving the previous pending queue and
 restarting the plugin; the archive remains in plugin data so unsent metadata
 is not silently thrown away. Tokens from the earlier unscoped preview
-must be entered again.
+must be entered again. If a particular Obsidian build has no SecretStorage,
+the access token can only be kept in memory, not in plugin data; it survives
+unrelated settings edits but must be re-entered after restarting Obsidian.
 
 Hidden Obsidian settings and plugin state are excluded, and iOS background
 execution is not promised. The Connector is built from a single JavaScript
@@ -164,7 +197,8 @@ bundle for desktop and mobile, with no Node-only networking path.
 The smoke script creates an isolated temporary Vault and Ignis process,
 checks REST auth, manifest and cursor behavior, WSS notifications,
 collaborative edits and their durable journal ACK, binary create/download/
-modify, duplicate operation retries, stale-write refusal and server restart,
+modify, chained offline rename/delete operations, bounded downloads, duplicate
+operation retries, stale-write refusal and server restart,
 then cleans up.
 No installed Ignis process is stopped or modified.
 

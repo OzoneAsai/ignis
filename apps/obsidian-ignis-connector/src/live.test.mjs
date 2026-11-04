@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import "fake-indexeddb/auto";
 import * as Y from "yjs";
 
@@ -57,6 +57,7 @@ function harness(initialId = null, value = "Initial") {
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const instance of testInstances.splice(0)) await instance.dispose();
 });
 
@@ -198,5 +199,47 @@ describe("Native Obsidian offline Yjs bridge", () => {
     s.manager.setComposing(s.view.view, false);
     expect(room.pendingHandshake).toBe(false);
     expect(s.sent.filter((m) => m.type === "update")).toHaveLength(1);
+  });
+
+  it("retries an uncommitted Yjs save with the complete state and backoff", async () => {
+    const s = harness();
+    s.manager.connected();
+    await s.manager.handle(serverInit("test.md", ID, "Initial"));
+    const room = s.manager.rooms.get("test.md");
+    vi.useFakeTimers();
+    await s.manager.handle({
+      channel: "collab", type: "save-error", path: "test.md",
+      seq: 1, error: "Temporary disk failure"
+    });
+    expect(room.retryCount).toBe(1);
+    expect(s.sent.filter((m) => m.type === "update")).toHaveLength(1);
+    vi.advanceTimersByTime(999);
+    expect(s.sent.filter((m) => m.type === "update")).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(s.sent.filter((m) => m.type === "update")).toHaveLength(2);
+    expect(s.sent.filter((m) => m.type === "update").at(-1).seq).toBe(2);
+    await s.manager.handle({
+      channel: "collab", type: "saved", path: "test.md", seq: 2
+    });
+    expect(room.retryCount).toBe(0);
+    expect(room.retryTimer).toBeNull();
+  });
+
+  it("blocks an oversize update rather than sending broken partial Yjs history", async () => {
+    const s = harness();
+    s.manager.connected();
+    await s.manager.handle(serverInit("test.md", ID, "Initial"));
+    const room = s.manager.rooms.get("test.md");
+    const before = s.sent.filter((m) => m.type === "update").length;
+    const large = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(32000);
+    room.text.insert(room.text.length, large);
+    expect(room.text.toString()).toBe("Initial" + large);
+    expect(room.blocked).toBe(true);
+    expect(room.joined).toBe(false);
+    expect(s.sent.filter((m) => m.type === "update")).toHaveLength(before);
+    expect(s.sent.at(-1)).toMatchObject({
+      channel: "collab", type: "leave", path: "test.md"
+    });
+    expect(s.notices.at(-1).status).toMatch(/retained on device/);
   });
 });

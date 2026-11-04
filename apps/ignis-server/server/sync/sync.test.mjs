@@ -39,6 +39,27 @@ afterEach(() => {
 });
 
 describe("one durable Vault change journal", () => {
+  it("refuses a huge server download before allocating the response in memory", async () => {
+    const { store, vault } = testStore();
+    fs.writeFileSync(path.join(vault, "huge.bin"), Buffer.alloc(4 * 1024 * 1024 + 1));
+    const entry = (await store.scan("vault")).files[0];
+    expect(entry.size).toBe(4 * 1024 * 1024 + 1);
+    await expect(store.read("vault", entry.fileId))
+      .rejects.toMatchObject({ status: 413 });
+  });
+
+  it("does not follow a final-path symlink even if its contents match the old hash", async () => {
+    const { store, vault, root } = testStore();
+    fs.writeFileSync(path.join(vault, "secret.bin"), "same bytes");
+    const entry = (await store.scan("vault")).files[0];
+    const outside = path.join(root, "outside.bin");
+    fs.writeFileSync(outside, "same bytes");
+    fs.unlinkSync(path.join(vault, "secret.bin"));
+    fs.symlinkSync(outside, path.join(vault, "secret.bin"));
+    await expect(store.read("vault", entry.fileId))
+      .rejects.toMatchObject({ code: "INVALID_PATH" });
+  });
+
   it("creates and conditionally updates binary attachments without text conversion", async () => {
     const { store } = testStore();
     // Server owns the Vault projection, including required parent folders.

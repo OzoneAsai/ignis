@@ -41,6 +41,8 @@ type Room = {
   waiting: Uint8Array[];
   sentSeq: number;
   savedSeq: number;
+  retryCount: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
   snapshot: string | null;
 };
 
@@ -67,6 +69,7 @@ function newRoom(path: string, documentId: string | null): Room {
     persistence: null, hydrated: false, hydration: null, views: new Set(),
     initializing: false, joined: false, blocked: false,
     composing: false, pendingHandshake: false, waiting: [], sentSeq: 0, savedSeq: 0,
+    retryCount: 0, retryTimer: null,
     snapshot: null
   };
 }
@@ -288,7 +291,13 @@ export class NativeYjs {
 
   disconnected() {
     this.online = false;
-    for (const room of this.rooms.values()) room.joined = false;
+    for (const room of this.rooms.values()) {
+      room.joined = false;
+      if (room.retryTimer !== null) {
+        clearTimeout(room.retryTimer);
+        room.retryTimer = null;
+      }
+    }
   }
 
   // A native Vault rename changes the locator, not the document. Preserve
@@ -320,6 +329,14 @@ export class NativeYjs {
 
   private sendUpdate(room: Room, update: Uint8Array) {
     if (update.byteLength > MAX_UPDATE_BYTES) {
+      // A whole-document replay larger than the current wire bound cannot
+      // truthfully claim synchronization. Keep local Yjs/Obsidian content and
+      // stop sending dependent partial updates until the protocol is upgraded.
+      room.blocked = true;
+      if (room.joined) this.opts.send({
+        channel: "collab", type: "leave", path: room.path
+      });
+      room.joined = false;
       this.opts.notify(room.path, "Yjs update exceeds server limit; retained on device");
       return;
     }
@@ -328,6 +345,22 @@ export class NativeYjs {
       channel: "collab", type: "update", path: room.path,
       seq: room.sentSeq, update: encode(update)
     });
+  }
+
+  private retryDurableSave(room: Room) {
+    if (room.retryTimer !== null || room.blocked || !room.joined || !this.online) return;
+    const delay = Math.min(30000, 1000 * 2 ** Math.min(room.retryCount++, 5));
+    room.retryTimer = setTimeout(() => {
+      room.retryTimer = null;
+      if (!this.online || !room.joined || room.blocked || !room.doc) return;
+      if (room.composing) {
+        room.pendingHandshake = true;
+        return;
+      }
+      // Yjs applies repeated updates idempotently. The server must return
+      // "saved" only after its canonical Markdown and journal both commit.
+      this.sendUpdate(room, Y.encodeStateAsUpdate(room.doc));
+    }, delay);
   }
 
   async handle(message: WireMessage) {
@@ -415,11 +448,19 @@ export class NativeYjs {
     }
     if (message.type === "saved" && Number.isSafeInteger(message.seq)) {
       room.savedSeq = Math.max(room.savedSeq, message.seq!);
+      room.retryCount = 0;
+      if (room.retryTimer !== null) {
+        clearTimeout(room.retryTimer);
+        room.retryTimer = null;
+      }
       if (room.savedSeq >= room.sentSeq) {
         this.opts.notify(room.path, "Server persisted collaborative edits");
       }
     }
-    if (message.type === "error" || message.type === "save-error") {
+    if (message.type === "save-error") {
+      this.opts.notify(room.path, message.error || "Server could not persist Yjs state");
+      this.retryDurableSave(room);
+    } else if (message.type === "error") {
       this.opts.notify(room.path, message.error || "Server rejected Yjs update");
     }
   }
@@ -435,6 +476,7 @@ export class NativeYjs {
     this.paths.clear();
     this.bound.clear();
     for (const room of this.rooms.values()) {
+      if (room.retryTimer !== null) clearTimeout(room.retryTimer);
       await room.persistence?.destroy().catch(() => {});
       room.undo?.destroy();
       room.doc?.destroy();

@@ -9859,6 +9859,8 @@ function newRoom(path, documentId) {
     waiting: [],
     sentSeq: 0,
     savedSeq: 0,
+    retryCount: 0,
+    retryTimer: null,
     snapshot: null
   };
 }
@@ -10079,8 +10081,13 @@ var NativeYjs = class {
   }
   disconnected() {
     this.online = false;
-    for (const room of this.rooms.values())
+    for (const room of this.rooms.values()) {
       room.joined = false;
+      if (room.retryTimer !== null) {
+        clearTimeout(room.retryTimer);
+        room.retryTimer = null;
+      }
+    }
   }
   // A native Vault rename changes the locator, not the document. Preserve
   // the in-memory Y.Doc and its generation-scoped IndexedDB history.
@@ -10112,6 +10119,14 @@ var NativeYjs = class {
   }
   sendUpdate(room, update) {
     if (update.byteLength > MAX_UPDATE_BYTES) {
+      room.blocked = true;
+      if (room.joined)
+        this.opts.send({
+          channel: "collab",
+          type: "leave",
+          path: room.path
+        });
+      room.joined = false;
       this.opts.notify(room.path, "Yjs update exceeds server limit; retained on device");
       return;
     }
@@ -10123,6 +10138,21 @@ var NativeYjs = class {
       seq: room.sentSeq,
       update: encode(update)
     });
+  }
+  retryDurableSave(room) {
+    if (room.retryTimer !== null || room.blocked || !room.joined || !this.online)
+      return;
+    const delay = Math.min(3e4, 1e3 * 2 ** Math.min(room.retryCount++, 5));
+    room.retryTimer = setTimeout(() => {
+      room.retryTimer = null;
+      if (!this.online || !room.joined || room.blocked || !room.doc)
+        return;
+      if (room.composing) {
+        room.pendingHandshake = true;
+        return;
+      }
+      this.sendUpdate(room, encodeStateAsUpdate(room.doc));
+    }, delay);
   }
   async handle(message) {
     if (this.disposed || message.channel !== "collab" || !message.path)
@@ -10210,11 +10240,19 @@ var NativeYjs = class {
     }
     if (message.type === "saved" && Number.isSafeInteger(message.seq)) {
       room.savedSeq = Math.max(room.savedSeq, message.seq);
+      room.retryCount = 0;
+      if (room.retryTimer !== null) {
+        clearTimeout(room.retryTimer);
+        room.retryTimer = null;
+      }
       if (room.savedSeq >= room.sentSeq) {
         this.opts.notify(room.path, "Server persisted collaborative edits");
       }
     }
-    if (message.type === "error" || message.type === "save-error") {
+    if (message.type === "save-error") {
+      this.opts.notify(room.path, message.error || "Server could not persist Yjs state");
+      this.retryDurableSave(room);
+    } else if (message.type === "error") {
       this.opts.notify(room.path, message.error || "Server rejected Yjs update");
     }
   }
@@ -10228,6 +10266,8 @@ var NativeYjs = class {
     this.paths.clear();
     this.bound.clear();
     for (const room of this.rooms.values()) {
+      if (room.retryTimer !== null)
+        clearTimeout(room.retryTimer);
       await room.persistence?.destroy().catch(() => {
       });
       room.undo?.destroy();
@@ -10236,6 +10276,82 @@ var NativeYjs = class {
     this.rooms.clear();
   }
 };
+
+// src/pending.ts
+function sameIdentity(file, operation) {
+  return file.fileId === operation.fileId && file.generationId === operation.generationId;
+}
+function localPaths(state) {
+  const paths = new Map(Object.entries(state.baselines));
+  for (const operation of state.pending) {
+    const identity = paths.get(operation.path);
+    if (!identity || !sameIdentity(identity, operation))
+      continue;
+    paths.delete(operation.path);
+    if (operation.type === "rename" && operation.toPath) {
+      paths.set(operation.toPath, identity);
+    }
+  }
+  return paths;
+}
+function queueRename(state, oldPath, newPath, opId) {
+  if (!oldPath || !newPath || oldPath === newPath)
+    return false;
+  const paths = localPaths(state);
+  const identity = paths.get(oldPath);
+  if (!identity || paths.has(newPath))
+    return false;
+  state.pending.push({
+    opId,
+    type: "rename",
+    path: oldPath,
+    toPath: newPath,
+    fileId: identity.fileId,
+    generationId: identity.generationId,
+    baseHash: identity.hash
+  });
+  return true;
+}
+function queueDelete(state, path, opId) {
+  const identity = localPaths(state).get(path);
+  if (!identity)
+    return false;
+  state.pending.push({
+    opId,
+    type: "delete",
+    path,
+    fileId: identity.fileId,
+    generationId: identity.generationId,
+    baseHash: identity.hash
+  });
+  return true;
+}
+function acknowledgePending(state, received) {
+  const pending = state.pending[0];
+  if (!pending || pending.fileId !== received.fileId || pending.generationId !== received.generationId || pending.opId !== received.opId || pending.type !== received.type || pending.path !== received.path || pending.type === "rename" && pending.toPath !== received.toPath) {
+    throw new Error("Server acknowledged a different queued operation");
+  }
+  const tracked = state.baselines[pending.path];
+  if (!tracked || !sameIdentity(tracked, pending)) {
+    throw new Error("Confirmed file baseline does not match queued operation");
+  }
+  if (pending.type === "rename" && !pending.toPath) {
+    throw new Error("Rename has no destination");
+  }
+  if (pending.type === "rename" && state.baselines[pending.toPath]) {
+    throw new Error("Rename destination already has a confirmed identity");
+  }
+  delete state.baselines[pending.path];
+  if (pending.type === "rename") {
+    state.baselines[pending.toPath] = {
+      ...tracked,
+      hash: received.hash ?? tracked.hash,
+      generationId: received.generationId
+    };
+  }
+  state.pending.shift();
+  return pending;
+}
 
 // src/main.ts
 var DEFAULT = {
@@ -10313,6 +10429,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   reconnectTimer = null;
   stopped = false;
   needsReload = false;
+  authBlocked = false;
+  retryCount = 0;
   async onload() {
     const saved = await this.loadData();
     this.settings = {
@@ -10387,36 +10505,28 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         this.settings.yjsIds[file.path] = yjsId;
         delete this.settings.yjsIds[oldPath];
       }
-      const base = this.settings.baselines[oldPath];
-      if (base)
-        this.settings.pending.push({
-          opId: crypto.randomUUID(),
-          type: "rename",
-          path: oldPath,
-          toPath: file.path,
-          fileId: base.fileId,
-          generationId: base.generationId,
-          baseHash: base.hash
-        });
+      const tracked = localPaths(this.settings).has(oldPath);
+      const queued = queueRename(this.settings, oldPath, file.path, crypto.randomUUID());
+      if (tracked && !queued) {
+        this.lastError = "Cannot queue conflicting local rename: " + oldPath;
+        this.showStatus("Rename needs review");
+      }
       void this.saveData(this.settings).then(() => this.schedule());
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(file.path))
         return;
-      const base = this.settings.baselines[file.path];
-      if (base)
-        this.settings.pending.push({
-          opId: crypto.randomUUID(),
-          type: "delete",
-          path: file.path,
-          fileId: base.fileId,
-          generationId: base.generationId,
-          baseHash: base.hash
-        });
+      queueDelete(this.settings, file.path, crypto.randomUUID());
       void this.saveData(this.settings).then(() => this.schedule());
     }));
     this.registerInterval(window.setInterval(() => this.schedule(), 45e3));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.schedule()));
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible")
+        this.recoverConnection();
+    });
+    this.registerDomEvent(window, "pageshow", () => this.recoverConnection());
+    this.registerDomEvent(window, "online", () => this.recoverConnection());
     this.token = this.getSavedSecret();
     if (this.ready()) {
       this.connectSocket();
@@ -10457,14 +10567,20 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       secrets.setSecret(SECRET_PREFIX + this.settings.scope, token);
     }
     this.token = token;
+    this.authBlocked = false;
+    this.retryCount = 0;
     this.connectSocket();
     this.schedule();
   }
   async saveSettings() {
     await this.saveData(this.settings);
-    this.token = this.getSavedSecret();
+    const sameScope = this.matchesScope();
+    const storedToken = this.getSavedSecret();
+    this.token = sameScope ? storedToken || this.token : "";
     this.live.disconnected();
-    this.socket?.close();
+    const previous = this.socket;
+    this.socket = null;
+    previous?.close();
     if (!this.matchesScope()) {
       this.showStatus("Server/Vault changed \xB7 archive old state before switching");
       return;
@@ -10484,7 +10600,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     }
   }
   ready() {
-    return !!(!this.needsReload && this.matchesScope() && this.settings.vaultId && this.token);
+    return !!(!this.authBlocked && !this.needsReload && this.matchesScope() && this.settings.vaultId && this.token);
   }
   async archiveAndSwitch() {
     const newScope = this.currentScope();
@@ -10505,6 +10621,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings.pending = [];
     this.settings.yjsIds = {};
     this.token = "";
+    this.authBlocked = false;
+    this.retryCount = 0;
     this.needsReload = true;
     this.live.disconnected();
     this.socket?.close();
@@ -10553,7 +10671,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.socket?.close();
+    this.live.disconnected();
+    const previous = this.socket;
+    this.socket = null;
+    previous?.close();
     if (!this.ready())
       return;
     try {
@@ -10562,25 +10683,43 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       base.pathname = "/ws";
       base.searchParams.set("vault", this.settings.vaultId);
       const socket = new WebSocket(base.toString());
+      const scope = this.settings.scope;
+      const token = this.token;
+      let authorized = false;
       this.socket = socket;
-      socket.onopen = () => socket.send(JSON.stringify({
-        channel: "sync",
-        type: "auth",
-        token: this.token
-      }));
+      socket.onopen = () => {
+        if (this.socket !== socket || this.stopped || !this.ready() || this.settings.scope !== scope || this.token !== token) {
+          socket.close();
+          return;
+        }
+        socket.send(JSON.stringify({ channel: "sync", type: "auth", token }));
+      };
       socket.onmessage = (event) => {
+        if (this.socket !== socket || this.stopped || !this.ready())
+          return;
         try {
           const message = JSON.parse(event.data);
           if (message.channel === "collab") {
-            void this.live.handle(message);
+            if (authorized)
+              void this.live.handle(message);
           } else if (message.channel === "sync") {
             if (message.type === "ready") {
+              if (message.vaultId !== this.settings.vaultId) {
+                this.authBlocked = true;
+                this.showStatus("Server returned the wrong Vault");
+                socket.close();
+                return;
+              }
+              authorized = true;
+              this.retryCount = 0;
               this.live.connected();
               this.schedule();
             }
             if (message.type === "changed")
               this.schedule();
             if (message.type === "auth-error") {
+              this.authBlocked = true;
+              this.live.disconnected();
               this.showStatus("Authorization failed");
               socket.close();
             }
@@ -10588,19 +10727,33 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         } catch {
         }
       };
-      socket.onerror = () => this.showStatus("Offline \xB7 local Vault retained");
+      socket.onerror = () => {
+        if (this.socket === socket)
+          this.showStatus("Offline \xB7 local Vault retained");
+      };
       socket.onclose = () => {
         if (this.socket === socket) {
           this.live.disconnected();
           this.socket = null;
-          if (!this.stopped && this.ready()) {
-            this.reconnectTimer = window.setTimeout(() => this.connectSocket(), 5e3);
-          }
+          if (!this.stopped && this.ready() && !document.hidden)
+            this.retryConnection();
         }
       };
     } catch (error) {
       this.lastError = String(error);
     }
+  }
+  retryConnection() {
+    if (this.reconnectTimer !== null || this.stopped || !this.ready())
+      return;
+    const delay = Math.min(3e4, 1e3 * 2 ** Math.min(this.retryCount++, 5));
+    this.reconnectTimer = window.setTimeout(() => this.connectSocket(), delay);
+  }
+  recoverConnection() {
+    if (this.stopped || !this.ready())
+      return;
+    this.connectSocket();
+    this.schedule();
   }
   openInEditor(path) {
     return this.app.workspace.getLeavesOfType("markdown").some((leaf) => leaf.view.file?.path === path);
@@ -10678,17 +10831,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   async replayPending() {
     for (const pending of [...this.settings.pending]) {
       const result = await this.sendOperation(pending);
-      if (pending.type === "delete")
-        delete this.settings.baselines[pending.path];
-      else if (pending.toPath) {
-        const old = this.settings.baselines[pending.path];
-        delete this.settings.baselines[pending.path];
-        if (old)
-          this.settings.baselines[pending.toPath] = old;
+      acknowledgePending(this.settings, result);
+      if (pending.toPath) {
         this.live.rejoinPath(pending.toPath);
       }
       this.settings.cursor = Math.max(this.settings.cursor, result.seq);
-      this.settings.pending.shift();
       await this.saveData(this.settings);
     }
   }
@@ -10806,6 +10953,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       for (const [path, file] of local) {
         if (this.live.isManaged(path))
           continue;
+        if (!this.settings.baselines[path] && this.settings.yjsIds[path] && !remotePaths.has(path)) {
+          conflicts.push(path + " (collaborative move has no confirmed file identity)");
+          continue;
+        }
         if (remotePaths.has(path) || this.settings.baselines[path] || this.settings.pending.some((op) => op.toPath === path))
           continue;
         const bytes = file.stat.size;

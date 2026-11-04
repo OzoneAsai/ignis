@@ -2,24 +2,15 @@ import {
   Plugin, PluginSettingTab, Setting, Notice, TFile, editorInfoField, requestUrl
 } from "obsidian";
 import { NativeYjs } from "./live";
+import {
+  queueRename, queueDelete, acknowledgePending, localPaths,
+  type TrackedFile, type PendingMutation
+} from "./pending";
 
 // The same Web APIs and Obsidian Vault APIs run on macOS, Windows, Linux,
 // Android and iOS. Never import Node/Electron into this plugin bundle.
-type Base = {
-  fileId: string;
-  generationId: string;
-  hash: string;
-  revision: number;
-};
-type Pending = {
-  opId: string;
-  type: "rename" | "delete";
-  path: string;
-  toPath?: string;
-  fileId: string;
-  generationId: string;
-  baseHash: string;
-};
+type Base = TrackedFile;
+type Pending = PendingMutation;
 type Settings = {
   serverUrl: string;
   discoveryUrl: string;
@@ -43,6 +34,7 @@ type Manifest = { vaultId: string; vaultSeq: number; files: RemoteFile[] };
 type OperationResult = {
   vaultId: string;
   seq: number;
+  opId: string;
   fileId: string;
   generationId: string;
   type: string;
@@ -127,6 +119,8 @@ export default class IgnisConnector extends Plugin {
   private reconnectTimer: number | null = null;
   private stopped = false;
   private needsReload = false;
+  private authBlocked = false;
+  private retryCount = 0;
 
   async onload() {
     const saved = (await this.loadData()) as Partial<Settings> | null;
@@ -199,27 +193,29 @@ export default class IgnisConnector extends Plugin {
         this.settings.yjsIds[file.path] = yjsId;
         delete this.settings.yjsIds[oldPath];
       }
-      const base = this.settings.baselines[oldPath];
-      if (base) this.settings.pending.push({
-        opId: crypto.randomUUID(), type: "rename", path: oldPath,
-        toPath: file.path, fileId: base.fileId,
-        generationId: base.generationId, baseHash: base.hash
-      });
+      const tracked = localPaths(this.settings).has(oldPath);
+      const queued = queueRename(this.settings, oldPath, file.path, crypto.randomUUID());
+      if (tracked && !queued) {
+        this.lastError = "Cannot queue conflicting local rename: " + oldPath;
+        this.showStatus("Rename needs review");
+      }
       void this.saveData(this.settings).then(() => this.schedule());
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (!(file instanceof TFile) || this.quiet.has(file.path) ||
           !isSyncablePath(file.path)) return;
-      const base = this.settings.baselines[file.path];
-      if (base) this.settings.pending.push({
-        opId: crypto.randomUUID(), type: "delete", path: file.path,
-        fileId: base.fileId, generationId: base.generationId,
-        baseHash: base.hash
-      });
+      queueDelete(this.settings, file.path, crypto.randomUUID());
       void this.saveData(this.settings).then(() => this.schedule());
     }));
     this.registerInterval(window.setInterval(() => this.schedule(), 45000));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.schedule()));
+    // iOS suspends the WebView rather than reliably firing WebSocket close.
+    // An apparently OPEN socket can be dead after wake or a network handoff.
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible") this.recoverConnection();
+    });
+    this.registerDomEvent(window, "pageshow", () => this.recoverConnection());
+    this.registerDomEvent(window, "online", () => this.recoverConnection());
     this.token = this.getSavedSecret();
     if (this.ready()) {
       this.connectSocket();
@@ -258,15 +254,24 @@ export default class IgnisConnector extends Plugin {
       secrets.setSecret(SECRET_PREFIX + this.settings.scope, token);
     }
     this.token = token;
+    this.authBlocked = false;
+    this.retryCount = 0;
     this.connectSocket();
     this.schedule();
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
-    this.token = this.getSavedSecret();
+    // SecretStorage is not guaranteed on every supported mobile build.
+    // A token held only in memory must survive an unrelated settings edit,
+    // but it must never carry over to a different server/Vault identity.
+    const sameScope = this.matchesScope();
+    const storedToken = this.getSavedSecret();
+    this.token = sameScope ? (storedToken || this.token) : "";
     this.live.disconnected();
-    this.socket?.close();
+    const previous = this.socket;
+    this.socket = null;
+    previous?.close();
     if (!this.matchesScope()) {
       this.showStatus("Server/Vault changed · archive old state before switching");
       return;
@@ -282,7 +287,8 @@ export default class IgnisConnector extends Plugin {
     catch { return false; }
   }
   private ready(): boolean {
-    return !!(!this.needsReload && this.matchesScope() && this.settings.vaultId && this.token);
+    return !!(!this.authBlocked && !this.needsReload &&
+      this.matchesScope() && this.settings.vaultId && this.token);
   }
   async archiveAndSwitch() {
     const newScope = this.currentScope();
@@ -303,6 +309,8 @@ export default class IgnisConnector extends Plugin {
     this.settings.pending = [];
     this.settings.yjsIds = {};
     this.token = "";
+    this.authBlocked = false;
+    this.retryCount = 0;
     this.needsReload = true;
     this.live.disconnected();
     this.socket?.close();
@@ -348,7 +356,10 @@ export default class IgnisConnector extends Plugin {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.socket?.close();
+    this.live.disconnected();
+    const previous = this.socket;
+    this.socket = null;
+    previous?.close();
     if (!this.ready()) return;
     try {
       const base = new URL(validServerUrl(this.settings.serverUrl));
@@ -356,44 +367,72 @@ export default class IgnisConnector extends Plugin {
       base.pathname = "/ws";
       base.searchParams.set("vault", this.settings.vaultId);
       const socket = new WebSocket(base.toString());
+      const scope = this.settings.scope;
+      const token = this.token;
+      let authorized = false;
       this.socket = socket;
-      socket.onopen = () => socket.send(JSON.stringify({
-        channel: "sync", type: "auth", token: this.token
-      }));
+      socket.onopen = () => {
+        if (this.socket !== socket || this.stopped || !this.ready() ||
+            this.settings.scope !== scope || this.token !== token) {
+          socket.close();
+          return;
+        }
+        socket.send(JSON.stringify({ channel: "sync", type: "auth", token }));
+      };
       socket.onmessage = (event) => {
+        if (this.socket !== socket || this.stopped || !this.ready()) return;
         try {
           const message = JSON.parse(event.data);
           if (message.channel === "collab") {
-            void this.live.handle(message);
+            if (authorized) void this.live.handle(message);
           } else if (message.channel === "sync") {
             if (message.type === "ready") {
+              if (message.vaultId !== this.settings.vaultId) {
+                this.authBlocked = true;
+                this.showStatus("Server returned the wrong Vault");
+                socket.close();
+                return;
+              }
+              authorized = true;
+              this.retryCount = 0;
               this.live.connected();
               this.schedule();
             }
             if (message.type === "changed") this.schedule();
             if (message.type === "auth-error") {
+              this.authBlocked = true;
+              this.live.disconnected();
               this.showStatus("Authorization failed");
               socket.close();
             }
           }
         } catch { /* Other Ignis websocket messages are not sync data. */ }
       };
-      socket.onerror = () => this.showStatus("Offline · local Vault retained");
+      socket.onerror = () => {
+        if (this.socket === socket) this.showStatus("Offline · local Vault retained");
+      };
       socket.onclose = () => {
         if (this.socket === socket) {
           this.live.disconnected();
           this.socket = null;
-          // WebView JavaScript may be suspended on iOS; on resume this
-          // timer and the periodic reconciliation both recover the socket.
-          if (!this.stopped && this.ready()) {
-            this.reconnectTimer = window.setTimeout(() =>
-              this.connectSocket(), 5000);
-          }
+          if (!this.stopped && this.ready() && !document.hidden) this.retryConnection();
         }
       };
     } catch (error) {
       this.lastError = String(error);
     }
+  }
+  private retryConnection() {
+    if (this.reconnectTimer !== null || this.stopped || !this.ready()) return;
+    const delay = Math.min(30000, 1000 * 2 ** Math.min(this.retryCount++, 5));
+    this.reconnectTimer = window.setTimeout(() => this.connectSocket(), delay);
+  }
+  private recoverConnection() {
+    if (this.stopped || !this.ready()) return;
+    // Re-establish the old Yjs rooms, then reconcile changed Vault files.
+    // Never rely on a socket which merely *looks* open after iOS sleep.
+    this.connectSocket();
+    this.schedule();
   }
 
   private openInEditor(path: string): boolean {
@@ -470,15 +509,11 @@ export default class IgnisConnector extends Plugin {
   private async replayPending() {
     for (const pending of [...this.settings.pending]) {
       const result = await this.sendOperation(pending);
-      if (pending.type === "delete") delete this.settings.baselines[pending.path];
-      else if (pending.toPath) {
-        const old = this.settings.baselines[pending.path];
-        delete this.settings.baselines[pending.path];
-        if (old) this.settings.baselines[pending.toPath] = old;
+      acknowledgePending(this.settings, result);
+      if (pending.toPath) {
         this.live.rejoinPath(pending.toPath);
       }
       this.settings.cursor = Math.max(this.settings.cursor, result.seq);
-      this.settings.pending.shift();
       await this.saveData(this.settings);
     }
   }
@@ -590,6 +625,11 @@ export default class IgnisConnector extends Plugin {
       }
       for (const [path, file] of local) {
         if (this.live.isManaged(path)) continue;
+        if (!this.settings.baselines[path] && this.settings.yjsIds[path] &&
+            !remotePaths.has(path)) {
+          conflicts.push(path + " (collaborative move has no confirmed file identity)");
+          continue;
+        }
         if (remotePaths.has(path) || this.settings.baselines[path] ||
             this.settings.pending.some((op) => op.toPath === path)) continue;
         const bytes = file.stat.size;
