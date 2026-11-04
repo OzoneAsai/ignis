@@ -8,6 +8,7 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import WebSocket from "ws";
+import * as Y from "yjs";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "ignis-sync-smoke-"));
 const token = crypto.randomBytes(32).toString("hex");
@@ -72,16 +73,22 @@ async function request(url, options = {}) {
   });
 }
 
-async function recv(ws, pred) {
-  const deadline = Date.now() + 4000;
-  while (Date.now() < deadline) {
-    const event = await Promise.race([
-      once(ws, "message").then(([data]) => JSON.parse(data.toString())),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("WS timeout")), 4000))
-    ]);
-    if (pred(event)) return event;
-  }
-  throw new Error("Expected WS event not found");
+async function recv(ws, pred, label = "WS event") {
+  return new Promise((resolve, reject) => {
+    const deadline = setTimeout(() => {
+      ws.off("message", onMessage);
+      reject(new Error("WS timeout: " + label));
+    }, 4000);
+    function onMessage(data) {
+      let event;
+      try { event = JSON.parse(data.toString()); } catch { return; }
+      if (!pred(event)) return;
+      clearTimeout(deadline);
+      ws.off("message", onMessage);
+      resolve(event);
+    }
+    ws.on("message", onMessage);
+  });
 }
 
 try {
@@ -101,6 +108,47 @@ try {
   socket.send(JSON.stringify({ channel: "sync", type: "auth", token }));
   const ready = await recv(socket, (msg) => msg.channel === "sync" && msg.type === "ready");
   assert.equal(ready.vaultSeq, 1);
+  // Both Sync and Yjs now share one document generation. A native client
+  // joining the existing collaboration channel must observe the SAME ID
+  // as the Vault manifest, not a second randomly generated generation.
+  const initWait = recv(socket,
+    (msg) => msg.channel === "collab" && msg.type === "init" &&
+      msg.path === "alpha.md", "collab init");
+  socket.send(JSON.stringify({
+    channel: "collab", type: "join", path: "alpha.md"
+  }));
+  const init = await initWait;
+  assert.equal(init.documentId, manifest.files[0].generationId);
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, Buffer.from(init.state, "base64"));
+  assert.equal(doc.getText("content").toString(), "hello");
+  const stateVector = Y.encodeStateVector(doc);
+  doc.getText("content").insert(5, " via CRDT");
+  const savedWait = recv(socket,
+    (msg) => msg.channel === "collab" && msg.type === "saved" &&
+      msg.path === "alpha.md" && msg.seq === 42, "collab saved");
+  socket.send(JSON.stringify({
+    channel: "collab", type: "update", path: "alpha.md",
+    seq: 42,
+    update: Buffer.from(Y.encodeStateAsUpdate(doc, stateVector)).toString("base64")
+  }));
+  await savedWait;
+  assert.equal(fs.readFileSync(path.join(vault, "alpha.md"), "utf8"), "hello via CRDT");
+  const collaborationSaved = await (
+    await request("/api/sync/v1/vaults/lab/manifest")
+  ).json();
+  assert.equal(collaborationSaved.files[0].generationId, init.documentId);
+  assert.equal(collaborationSaved.files[0].fileId, manifest.files[0].fileId);
+  assert.equal(collaborationSaved.vaultSeq, 2,
+    "Yjs durability ACK requires the matching Vault journal entry");
+  const crdtDelta = await (
+    await request("/api/sync/v1/vaults/lab/changes?since=1")
+  ).json();
+  assert.deepEqual(crdtDelta.changes.map((x) => x.type), ["modify"]);
+  doc.destroy();
+  socket.send(JSON.stringify({
+    channel: "collab", type: "leave", path: "alpha.md"
+  }));
   const op = {
     type: "create", path: "beta.md", content: "created",
     opId: crypto.randomUUID()
@@ -114,10 +162,10 @@ try {
   const created = await (await request("/api/sync/v1/vaults/lab/operations", {
     method: "POST", body: JSON.stringify(op)
   })).json();
-  assert.equal(created.seq, 2, "idempotent retry returns first result");
+  assert.equal(created.seq, 3, "idempotent retry returns first result");
   const notification = await notificationPromise;
-  assert.equal(notification.vaultSeq, 2);
-  const delta = await (await request("/api/sync/v1/vaults/lab/changes?since=1")).json();
+  assert.equal(notification.vaultSeq, 3);
+  const delta = await (await request("/api/sync/v1/vaults/lab/changes?since=2")).json();
   assert.equal(delta.changes.length, 1);
   const body = await (await request(
     "/api/sync/v1/vaults/lab/files/" + created.fileId)).text();
@@ -130,12 +178,45 @@ try {
   });
   assert.equal(stale.status, 409);
   assert.equal(fs.readFileSync(path.join(vault, "beta.md"), "utf8"), "created");
+  const attachment = Buffer.from([0, 255, 137, 80, 78, 71, 0, 10, 13, 26]);
+  const assetOp = {
+    type: "create", path: "media/picture.png",
+    contentBase64: attachment.toString("base64"), opId: crypto.randomUUID()
+  };
+  const assetResponse = await request("/api/sync/v1/vaults/lab/operations", {
+    method: "POST", body: JSON.stringify(assetOp)
+  });
+  assert.equal(assetResponse.status, 200);
+  const asset = await assetResponse.json();
+  assert.equal(asset.seq, 4);
+  assert.deepEqual(
+    fs.readFileSync(path.join(vault, "media", "picture.png")), attachment);
+  const downloaded = Buffer.from(await (
+    await request("/api/sync/v1/vaults/lab/files/" + asset.fileId)
+  ).arrayBuffer());
+  assert.deepEqual(downloaded, attachment);
+  const updatedAsset = Buffer.from([0, 254, 80, 78, 71, 1, 13, 10]);
+  const changedAsset = await request("/api/sync/v1/vaults/lab/operations", {
+    method: "POST",
+    body: JSON.stringify({
+      type: "modify", path: "media/picture.png",
+      fileId: asset.fileId, generationId: asset.generationId,
+      baseHash: asset.hash, contentBase64: updatedAsset.toString("base64"),
+      opId: crypto.randomUUID()
+    })
+  });
+  assert.equal(changedAsset.status, 200);
+  assert.equal((await changedAsset.json()).seq, 5);
   await stop();
   await launch();
   const reboot = await (await request("/api/sync/v1/vaults/lab/manifest")).json();
-  assert.equal(reboot.vaultSeq, 2);
+  assert.equal(reboot.vaultSeq, 5);
   assert.equal(reboot.files.find((f) => f.path === "beta.md").fileId, created.fileId);
-  console.log("Sync smoke passed: auth, journal, WSS, idempotency, conflict, reboot");
+  assert.equal(reboot.files.find((f) => f.path === "media/picture.png").fileId, asset.fileId);
+  assert.deepEqual(fs.readFileSync(path.join(vault, "media", "picture.png")), updatedAsset);
+  assert.equal(reboot.files.find((f) => f.path === "alpha.md").generationId,
+    init.documentId);
+  console.log("Sync smoke passed: shared Yjs/Sync generation, persisted CRDT journal ACK, binary attachments, auth, WSS, idempotency, conflicts, reboot");
 } catch (e) {
   console.error("Sync smoke failed:", e.message);
   console.error(output.slice(-6000));
