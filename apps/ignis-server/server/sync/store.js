@@ -623,8 +623,27 @@ class VaultSyncStore {
       // while the remote Vault does not yet have that folder. The server
       // owns projection of the operation's parent directories as well.
       const destAbsolute = await safeFile(root, dest, true);
+      const destStat = await fs.promises.lstat(destAbsolute).catch((error) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      // On default macOS volumes Case.md and case.md name the same inode.
+      // A case-only rename must preserve the file identity, while a genuine
+      // second directory entry (including a hard link) must never be replaced.
+      // Compare actual directory entries instead of approximating filesystem
+      // case folding or Unicode normalization with JavaScript string rules.
+      let selfAlias = false;
+      if (destStat && path.dirname(absolute) === path.dirname(destAbsolute) &&
+          destStat.isFile() && !destStat.isSymbolicLink()) {
+        const sourceStat = await fs.promises.lstat(absolute);
+        const exactEntry = (await fs.promises.readdir(path.dirname(destAbsolute)))
+          .includes(path.basename(destAbsolute));
+        selfAlias = !exactEntry && sourceStat.isFile() &&
+          !sourceStat.isSymbolicLink() &&
+          sourceStat.dev === destStat.dev && sourceStat.ino === destStat.ino;
+      }
       if (dest === rel || this.fileByPath(vaultId, dest) ||
-          await fs.promises.lstat(destAbsolute).catch(() => null)) {
+          (destStat && !selfAlias)) {
         throw conflict("DESTINATION_EXISTS", "Destination already exists");
       }
       if (rel.endsWith(".md") && dest.endsWith(".md")) {
