@@ -9970,10 +9970,9 @@ var NativeYjs = class {
     const text2 = doc2.getText("content");
     const undo2 = new UndoManager(text2, { captureTimeout: 500 });
     const key = [
-      "ignis-connector-yjs-v1",
+      "ignis-connector-yjs-v2",
       this.opts.origin(),
       this.opts.vaultId(),
-      room.path,
       id2
     ].join("|");
     const persistence = new IndexeddbPersistence(key, doc2);
@@ -9989,6 +9988,25 @@ var NativeYjs = class {
     const hydrateTask = async () => {
       try {
         await persistence.whenSynced;
+        if (room.wasKnown && await persistence.get("legacy-v1-imported") !== "yes") {
+          const legacyKey = [
+            "ignis-connector-yjs-v1",
+            this.opts.origin(),
+            this.opts.vaultId(),
+            room.path,
+            id2
+          ].join("|");
+          const oldDoc = new Doc();
+          const legacy = new IndexeddbPersistence(legacyKey, oldDoc);
+          try {
+            await legacy.whenSynced;
+            applyUpdate(doc2, encodeStateAsUpdate(oldDoc), REMOTE);
+            await persistence.set("legacy-v1-imported", "yes");
+          } finally {
+            await legacy.destroy();
+            oldDoc.destroy();
+          }
+        }
         if (this.disposed || room.documentId !== id2)
           return;
         room.hydrated = true;
@@ -10042,6 +10060,7 @@ var NativeYjs = class {
         if (room.doc && !room.blocked)
           applyUpdate(room.doc, update, REMOTE);
       }
+      this.tryAttach(room);
       if (room.pendingHandshake && room.doc && room.joined && !room.blocked) {
         room.pendingHandshake = false;
         this.sendUpdate(room, encodeStateAsUpdate(room.doc));
@@ -10062,6 +10081,34 @@ var NativeYjs = class {
     this.online = false;
     for (const room of this.rooms.values())
       room.joined = false;
+  }
+  // A native Vault rename changes the locator, not the document. Preserve
+  // the in-memory Y.Doc and its generation-scoped IndexedDB history.
+  // Rejoin only after the server has acknowledged moving its own Yjs state.
+  relocate(oldPath, newPath) {
+    const room = this.rooms.get(oldPath);
+    if (!room)
+      return true;
+    if (this.rooms.has(newPath) && this.rooms.get(newPath) !== room) {
+      room.blocked = true;
+      this.opts.notify(oldPath, "Yjs rename collides with another open document");
+      return false;
+    }
+    if (room.joined) {
+      this.opts.send({ channel: "collab", type: "leave", path: oldPath });
+    }
+    room.joined = false;
+    this.rooms.delete(oldPath);
+    room.path = newPath;
+    this.rooms.set(newPath, room);
+    for (const view of room.views)
+      this.paths.set(view, newPath);
+    return true;
+  }
+  rejoinPath(path) {
+    const room = this.rooms.get(path);
+    if (room)
+      this.join(room);
   }
   sendUpdate(room, update) {
     if (update.byteLength > MAX_UPDATE_BYTES) {
@@ -10120,6 +10167,16 @@ var NativeYjs = class {
           this.opts.send({ channel: "collab", type: "leave", path: room.path });
           this.opts.notify(room.path, "Native draft differs from Yjs baseline; not merged automatically");
           return;
+        }
+        if (room.wasKnown) {
+          this.tryAttach(room);
+          await new Promise((resolve) => queueMicrotask(resolve));
+          if ([...room.views].some((view) => this.bound.get(view) !== room)) {
+            room.blocked = true;
+            this.opts.send({ channel: "collab", type: "leave", path: room.path });
+            this.opts.notify(room.path, "Could not safely attach native editor to cached Yjs state");
+            return;
+          }
         }
         room.joined = true;
         if (room.composing)
@@ -10194,10 +10251,21 @@ var DEFAULT = {
   archivedScopes: []
 };
 var SECRET_PREFIX = "ignis-connector-vault-";
-var MAX_TEXT_BYTES = 4 * 1024 * 1024;
+var MAX_FILE_BYTES = 4 * 1024 * 1024;
 var textEncoder = new TextEncoder();
+function isSyncablePath(path) {
+  const parts = path.split("/");
+  return !!path && !parts.some((part) => !part || part === "." || part === ".." || [".obsidian", ".git", ".ignis-connector"].includes(part) || part.startsWith(".ignis-sync-tmp-") || part.startsWith(".ignis-collab-tmp-"));
+}
 function isMarkdown(path) {
-  return path.toLowerCase().endsWith(".md") && !path.split("/").some((part) => [".obsidian", ".git", ".ignis-connector"].includes(part));
+  return path.toLowerCase().endsWith(".md") && isSyncablePath(path);
+}
+function encodeBase64(bytes) {
+  let text2 = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) {
+    text2 += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  }
+  return btoa(text2);
 }
 function validServerUrl(input) {
   const url = new URL(input);
@@ -10305,13 +10373,20 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       callback: () => void this.archiveAndSwitch()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof import_obsidian.TFile && isMarkdown(file.path) && !this.quiet.has(file.path)) {
+      if (file instanceof import_obsidian.TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
         this.schedule();
       }
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isMarkdown(oldPath) || !isMarkdown(file.path))
+      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(oldPath) || !isSyncablePath(file.path))
         return;
+      if (!this.live.relocate(oldPath, file.path))
+        return;
+      const yjsId = this.settings.yjsIds[oldPath];
+      if (yjsId) {
+        this.settings.yjsIds[file.path] = yjsId;
+        delete this.settings.yjsIds[oldPath];
+      }
       const base = this.settings.baselines[oldPath];
       if (base)
         this.settings.pending.push({
@@ -10326,7 +10401,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       void this.saveData(this.settings).then(() => this.schedule());
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isMarkdown(file.path))
+      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(file.path))
         return;
       const base = this.settings.baselines[file.path];
       if (base)
@@ -10531,28 +10606,38 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     return this.app.workspace.getLeavesOfType("markdown").some((leaf) => leaf.view.file?.path === path);
   }
   localFiles() {
-    return new Map(this.app.vault.getFiles().filter((file) => isMarkdown(file.path)).map((file) => [file.path, file]));
+    return new Map(this.app.vault.getFiles().filter((file) => isSyncablePath(file.path)).map((file) => [file.path, file]));
   }
   async localHash(file) {
-    if (file.stat.size > MAX_TEXT_BYTES)
+    if (file.stat.size > MAX_FILE_BYTES)
       return null;
-    const content = await this.app.vault.read(file);
-    return sha256(textEncoder.encode(content));
+    return sha256(isMarkdown(file.path) ? textEncoder.encode(await this.app.vault.read(file)) : new Uint8Array(await this.app.vault.readBinary(file)));
   }
-  async remoteText(remote) {
-    if (remote.size > MAX_TEXT_BYTES)
-      throw new Error("Note exceeds mobile-safe sync limit");
+  async remoteBytes(remote) {
+    if (remote.size > MAX_FILE_BYTES)
+      throw new Error("File exceeds mobile-safe sync limit");
     const response = await (0, import_obsidian.requestUrl)({
       url: this.url("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/files/" + encodeURIComponent(remote.fileId)),
       method: "GET",
       headers: { Authorization: "Bearer " + this.token }
     });
     const bytes = new Uint8Array(response.arrayBuffer);
-    if (await sha256(bytes) !== remote.hash)
-      throw new Error("Remote content hash mismatch");
-    return new TextDecoder().decode(bytes);
+    if (bytes.length !== remote.size || await sha256(bytes) !== remote.hash) {
+      throw new Error("Remote content size/hash mismatch");
+    }
+    return response.arrayBuffer;
   }
-  async writeLocal(path, text2) {
+  async payloadFor(file) {
+    if (file.stat.size > MAX_FILE_BYTES)
+      throw new Error("Local file exceeds mobile-safe sync limit");
+    if (isMarkdown(file.path)) {
+      return { content: await this.app.vault.read(file) };
+    }
+    return { contentBase64: encodeBase64(
+      new Uint8Array(await this.app.vault.readBinary(file))
+    ) };
+  }
+  async writeLocal(path, data) {
     this.quiet.add(path);
     try {
       let parent = "";
@@ -10566,11 +10651,17 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         }
       }
       const file = this.app.vault.getAbstractFileByPath(path);
-      if (file instanceof import_obsidian.TFile)
-        await this.app.vault.modify(file, text2);
-      else if (file === null)
-        await this.app.vault.create(path, text2);
-      else
+      if (file instanceof import_obsidian.TFile) {
+        if (typeof data === "string")
+          await this.app.vault.modify(file, data);
+        else
+          await this.app.vault.modifyBinary(file, data);
+      } else if (file === null) {
+        if (typeof data === "string")
+          await this.app.vault.create(path, data);
+        else
+          await this.app.vault.createBinary(path, data);
+      } else
         throw new Error("Path occupied by a folder: " + path);
     } finally {
       window.setTimeout(() => this.quiet.delete(path), 1e3);
@@ -10594,6 +10685,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         delete this.settings.baselines[pending.path];
         if (old)
           this.settings.baselines[pending.toPath] = old;
+        this.live.rejoinPath(pending.toPath);
       }
       this.settings.cursor = Math.max(this.settings.cursor, result.seq);
       this.settings.pending.shift();
@@ -10617,9 +10709,13 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       const remotePaths = /* @__PURE__ */ new Set();
       const conflicts = [];
       for (const remote of manifest.files) {
-        if (!isMarkdown(remote.path))
+        if (!isSyncablePath(remote.path))
           continue;
         remotePaths.add(remote.path);
+        if (remote.size > MAX_FILE_BYTES) {
+          conflicts.push(remote.path + " (attachment exceeds preview size limit)");
+          continue;
+        }
         if (this.live.isManaged(remote.path))
           continue;
         const oldEntry = Object.entries(this.settings.baselines).find(
@@ -10642,6 +10738,12 @@ var IgnisConnector = class extends import_obsidian.Plugin {
             local.set(remote.path, previousLocal);
             this.settings.baselines[remote.path] = oldBase;
             delete this.settings.baselines[oldPath];
+            const yjsId = this.settings.yjsIds[oldPath];
+            if (yjsId) {
+              this.settings.yjsIds[remote.path] = yjsId;
+              delete this.settings.yjsIds[oldPath];
+            }
+            this.live.relocate(oldPath, remote.path);
           } finally {
             window.setTimeout(() => {
               this.quiet.delete(oldPath);
@@ -10661,9 +10763,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
             conflicts.push(remote.path + " (local deletion unresolved)");
             continue;
           }
-          if (remote.size > MAX_TEXT_BYTES)
-            continue;
-          await this.writeLocal(remote.path, await this.remoteText(remote));
+          const data = await this.remoteBytes(remote);
+          await this.writeLocal(remote.path, isMarkdown(remote.path) ? new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         } else if (!base) {
           if (localDigest === remote.hash)
@@ -10681,11 +10782,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
             conflicts.push(remote.path + " (open editor, pending Yjs integration)");
             continue;
           }
-          const content = await this.app.vault.read(existing);
           const result = await this.sendOperation({
             type: "modify",
             path: remote.path,
-            content,
+            ...await this.payloadFor(existing),
             opId: crypto.randomUUID(),
             fileId: remote.fileId,
             generationId: remote.generationId,
@@ -10697,7 +10797,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
             conflicts.push(remote.path + " (open editor)");
             continue;
           }
-          await this.writeLocal(remote.path, await this.remoteText(remote));
+          const data = await this.remoteBytes(remote);
+          await this.writeLocal(remote.path, isMarkdown(remote.path) ? new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         }
         await this.saveData(this.settings);
@@ -10708,13 +10809,16 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         if (remotePaths.has(path) || this.settings.baselines[path] || this.settings.pending.some((op) => op.toPath === path))
           continue;
         const bytes = file.stat.size;
-        if (bytes > MAX_TEXT_BYTES || this.openInEditor(path))
+        if (bytes > MAX_FILE_BYTES) {
+          conflicts.push(path + " (attachment exceeds preview size limit)");
           continue;
-        const content = await this.app.vault.read(file);
+        }
+        if (this.openInEditor(path))
+          continue;
         const result = await this.sendOperation({
           type: "create",
           path,
-          content,
+          ...await this.payloadFor(file),
           opId: crypto.randomUUID()
         });
         this.saveBase(path, result);
