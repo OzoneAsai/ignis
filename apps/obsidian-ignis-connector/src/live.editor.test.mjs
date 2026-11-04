@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import * as Y from "yjs";
+import { IndexeddbPersistence } from "y-indexeddb";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
@@ -55,6 +56,57 @@ async function mount() {
 }
 
 describe("real CodeMirror 6 native binding", () => {
+  it("rehydrates a renamed offline Yjs history by generation before merging remote text", async () => {
+    const origin = "https://example.test/offline-" + crypto.randomUUID();
+    const server = new Y.Doc();
+    server.getText("content").insert(0, "Initial");
+    const offline = new Y.Doc();
+    Y.applyUpdate(offline, Y.encodeStateAsUpdate(server));
+    offline.getText("content").insert(7, " offline");
+    const storage = new IndexeddbPersistence([
+      "ignis-connector-yjs-v2", origin, "lab", ID
+    ].join("|"), offline);
+    await storage.whenSynced;
+    await tick();
+    await storage.destroy();
+    offline.destroy();
+
+    const sent = [], notices = [];
+    const manager = new NativeYjs({
+      vaultId: () => "lab", origin: () => origin,
+      pathForView: () => "renamed.md",
+      knownId: () => ID,
+      rememberId: async () => {},
+      send: (message) => sent.push(message),
+      notify: (path, status) => notices.push({ path, status })
+    });
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const editor = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: "Initial offline", extensions: manager.extension()
+      })
+    });
+    cleanup.push(async () => {
+      editor.destroy();
+      await manager.dispose();
+      server.destroy();
+    });
+    manager.connected();
+    server.getText("content").insert(0, "remote ");
+    await manager.handle({
+      channel: "collab", type: "init", path: "renamed.md", documentId: ID,
+      state: encodeYjs(Y.encodeStateAsUpdate(server))
+    });
+    await tick();
+    expect(editor.state.doc.toString()).toBe("remote Initial offline");
+    expect(manager.rooms.get("renamed.md").blocked).toBe(false);
+    const outbound = sent.filter((m) => m.type === "update").at(-1);
+    Y.applyUpdate(server, decodeYjs(outbound.update));
+    expect(server.getText("content").toString()).toBe("remote Initial offline");
+  });
+
   it("binds only after exact initial match; native edits become Yjs updates", async () => {
     const { manager, editor, sent, server } = await mount();
     const room = manager.rooms.get("test.md");
