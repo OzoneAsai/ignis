@@ -10088,7 +10088,7 @@ var NativeYjs = class {
       room.joined = false;
       this.opts.notify(
         room.path,
-        "Remote edits exceeded IME buffer; local draft preserved, reopen note to reconcile"
+        "Remote edits exceeded IME buffer; local draft preserved, restart Connector to reconcile"
       );
       return;
     }
