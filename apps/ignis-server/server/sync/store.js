@@ -8,7 +8,7 @@ const { resolveVaultPath } = require("@ignis/server-core");
 
 const MAX_TEXT_BYTES = 4 * 1024 * 1024;
 const MAX_BINARY_BYTES = 4 * 1024 * 1024;
-const SKIPPED_DIRS = new Set([".obsidian", ".git", ".ignis-connector"]);
+const SKIPPED_DIRS = new Set([".obsidian", ".git", ".ignis-connector", ".trash"]);
 
 function permittedPath(rel) {
   if (typeof rel !== "string" || !rel || rel.length > 2048 ||
@@ -17,8 +17,12 @@ function permittedPath(rel) {
     return false;
   }
   const parts = rel.split("/");
-  return !parts.some((part) => SKIPPED_DIRS.has(part) ||
-    part.startsWith(".ignis-sync-tmp-") || part.startsWith(".ignis-collab-tmp-"));
+  return !parts.some((part) => {
+    const lower = part.toLowerCase();
+    return SKIPPED_DIRS.has(lower) ||
+      lower.startsWith(".ignis-sync-tmp-") ||
+      lower.startsWith(".ignis-collab-tmp-");
+  });
 }
 
 function hash(buffer) {
@@ -81,14 +85,34 @@ function conflict(code, message) {
 }
 
 async function inspectFile(absolute) {
-  const stat = await fs.promises.lstat(absolute).catch((e) => {
-    if (e.code === "ENOENT") return null;
+  const handle = await fs.promises.open(
+    absolute, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+  ).catch((e) => {
+    if (e.code === "ENOENT" || e.code === "ELOOP") return null;
     throw e;
   });
-  if (!stat || !stat.isFile() || stat.isSymbolicLink()) return null;
-  const digest = crypto.createHash("sha256");
-  for await (const block of fs.createReadStream(absolute)) digest.update(block);
-  return { hash: digest.digest("hex"), size: stat.size };
+  if (!handle) return null;
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) return null;
+    const digest = crypto.createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (!bytesRead) break;
+      digest.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (BigInt(position) !== before.size || after.size !== before.size ||
+        after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs) {
+      throw conflict("FILE_CHANGED_DURING_HASH", "File changed while reading");
+    }
+    return { hash: digest.digest("hex"), size: position };
+  } finally {
+    await handle.close();
+  }
 }
 
 // The API never resolves a remote path through a symlinked parent.
@@ -280,6 +304,18 @@ class VaultSyncStore {
     return { vaultId, vaultSeq: this.head(vaultId), changes: this.db.prepare(
       "SELECT seq, file_id AS fileId, generation_id AS generationId, type, path, to_path AS toPath, hash, size, op_id AS opId FROM changes WHERE vault_id=? AND seq>? ORDER BY seq LIMIT ?"
     ).all(vaultId, since, limit) };
+  }
+  operationReceipt(vaultId, opId) {
+    this.root(vaultId);
+    if (typeof opId !== "string" || !/^[a-zA-Z0-9_-]{8,128}$/.test(opId)) {
+      const e = new Error("Invalid operation ID");
+      e.status = 400;
+      throw e;
+    }
+    const record = this.db.prepare(
+      "SELECT result FROM operations WHERE vault_id=? AND op_id=?"
+    ).get(vaultId, opId);
+    return record ? JSON.parse(record.result) : null;
   }
   _record(vaultId, type, file, toPath = null, opId = null, requestHash = null) {
     const event = withTransaction(this.db, () => {
@@ -553,20 +589,26 @@ class VaultSyncStore {
       if (input.baseHash !== file.hash) {
         throw conflict("BASE_MISMATCH", "File was edited on another device");
       }
+      // Scanning at the start of an operation is not enough: a conventional
+      // editor can save between the scan and the filesystem mutation. Check
+      // the observed file immediately before changing or removing it.
+      await this.writeCoalescer.flushPending(absolute);
+      const current = await inspectFile(absolute);
+      if (!current || current.hash !== file.hash || current.size !== file.size) {
+        throw conflict("BASE_MISMATCH", "File changed after the sync precondition");
+      }
       if (input.type === "modify") {
         const bytes = payload;
         if (this.collaboration.isCollaborative(vaultId, rel)) {
           throw conflict("COLLABORATIVE_WRITE_CONFLICT", "Use Yjs for collaborative Markdown");
         }
         if (hash(bytes) !== file.hash) {
-          await this.writeCoalescer.flushPending(absolute);
           await durableWrite(absolute, bytes);
         }
         return this._record(vaultId, "modify", { ...file,
           hash: hash(bytes), size: bytes.length }, null, input.opId, requestHash);
       }
       if (input.type === "delete") {
-        await this.writeCoalescer.flushPending(absolute);
         if (rel.toLowerCase().endsWith(".md")) {
           await this.collaboration.deleteNote(vaultId, rel,
             () => fs.promises.unlink(absolute));
@@ -577,12 +619,14 @@ class VaultSyncStore {
         return this._record(vaultId, "delete", file, null, input.opId, requestHash);
       }
       const dest = input.toPath;
-      const destAbsolute = await safeFile(root, dest);
+      // A native Vault rename may create its destination folder locally
+      // while the remote Vault does not yet have that folder. The server
+      // owns projection of the operation's parent directories as well.
+      const destAbsolute = await safeFile(root, dest, true);
       if (dest === rel || this.fileByPath(vaultId, dest) ||
           await fs.promises.lstat(destAbsolute).catch(() => null)) {
         throw conflict("DESTINATION_EXISTS", "Destination already exists");
       }
-      await this.writeCoalescer.flushPending(absolute);
       if (rel.endsWith(".md") && dest.endsWith(".md")) {
         await this.collaboration.renameNote(vaultId, rel, dest,
           () => fs.promises.rename(absolute, destAbsolute),
