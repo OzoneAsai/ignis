@@ -156,15 +156,87 @@ class VaultSyncStore {
       "CREATE INDEX IF NOT EXISTS files_by_vault ON files(vault_id, deleted);",
       "CREATE TABLE IF NOT EXISTS changes (vault_id TEXT NOT NULL, seq INTEGER NOT NULL, file_id TEXT NOT NULL, generation_id TEXT NOT NULL, type TEXT NOT NULL, path TEXT NOT NULL, to_path TEXT, hash TEXT, size INTEGER, op_id TEXT, PRIMARY KEY(vault_id, seq));",
       "CREATE TABLE IF NOT EXISTS operations (vault_id TEXT NOT NULL, op_id TEXT NOT NULL, request_hash TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(vault_id, op_id));",
+      "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, revoked_at INTEGER);",
+      "CREATE INDEX IF NOT EXISTS devices_by_vault ON devices(vault_id, revoked_at);",
     ].join("\n"));
     this.getVaultPath = getVaultPath;
     this.collaboration = collaboration;
     this.writeCoalescer = writeCoalescer;
     this.locks = new Map();
     this.listeners = new Set();
+    this.revocationListeners = new Set();
   }
 
   close() { this.db.close(); }
+
+  // Enrollment is performed by the server owner using IGNIS_SYNC_TOKEN.
+  // Clients only receive a scoped device token, never the bootstrap secret.
+  // Persist a hash rather than reusable bearer credentials in the SQLite DB.
+  enrollDevice(vaultId, label) {
+    this.root(vaultId);
+    if (typeof label !== "string" || label.trim().length < 1 ||
+        label.length > 100 || /\p{Cc}/u.test(label)) {
+      const e = new Error("Device label must be 1-100 printable characters");
+      e.status = 400;
+      throw e;
+    }
+    const deviceId = crypto.randomUUID();
+    const token = "ignis_dev_" + crypto.randomBytes(32).toString("base64url");
+    const tokenHash = hash(Buffer.from(token, "utf8"));
+    const createdAt = Date.now();
+    this.db.prepare(
+      "INSERT INTO devices(device_id, vault_id, label, token_hash, created_at, revoked_at) VALUES(?,?,?,?,?,NULL)"
+    ).run(deviceId, vaultId, label.trim(), tokenHash, createdAt);
+    return { deviceId, vaultId, label: label.trim(), createdAt, token };
+  }
+
+  listDevices(vaultId) {
+    this.root(vaultId);
+    return this.db.prepare(
+      "SELECT device_id AS deviceId, vault_id AS vaultId, label, created_at AS createdAt, revoked_at AS revokedAt FROM devices WHERE vault_id=? ORDER BY created_at, device_id"
+    ).all(vaultId);
+  }
+
+  // Revealing whether a token was ever valid would aid guessing; callers
+  // treat a revoked token and an unknown token identically.
+  authenticateDevice(token, vaultId) {
+    if (typeof token !== "string" ||
+        !/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(token) ||
+        typeof vaultId !== "string") return null;
+    const record = this.db.prepare(
+      "SELECT device_id AS deviceId, vault_id AS vaultId, label FROM devices WHERE token_hash=? AND vault_id=? AND revoked_at IS NULL"
+    ).get(hash(Buffer.from(token, "utf8")), vaultId);
+    return record || null;
+  }
+
+  deviceActive(deviceId, vaultId) {
+    if (typeof deviceId !== "string" || typeof vaultId !== "string") return false;
+    return !!this.db.prepare(
+      "SELECT 1 FROM devices WHERE device_id=? AND vault_id=? AND revoked_at IS NULL"
+    ).get(deviceId, vaultId);
+  }
+
+  revokeDevice(deviceId) {
+    if (typeof deviceId !== "string" ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(deviceId)) {
+      const e = new Error("Invalid device ID");
+      e.status = 400;
+      throw e;
+    }
+    const result = this.db.prepare(
+      "UPDATE devices SET revoked_at=COALESCE(revoked_at, ?) WHERE device_id=?"
+    ).run(Date.now(), deviceId);
+    if (result.changes) {
+      for (const listener of this.revocationListeners) {
+        try { listener(deviceId); } catch (e) { console.warn("[sync] revoke:", e.message); }
+      }
+    }
+    return result.changes > 0;
+  }
+  onRevoke(fn) {
+    this.revocationListeners.add(fn);
+    return () => this.revocationListeners.delete(fn);
+  }
   onChange(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   notify(event) {
     for (const fn of this.listeners) {

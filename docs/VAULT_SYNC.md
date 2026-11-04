@@ -12,8 +12,8 @@ deletion propagation and empty-folder synchronization are not implemented.
 
 | Component | Responsibility |
 | --- | --- |
-| server/sync/store.js | One SQLite WAL/FULL journal, file identities, sequences, conditional operations |
-| server/sync/http.js | Bearer-guarded REST API and authenticated sync channel on the existing WebSocket |
+| server/sync/store.js | One SQLite WAL/FULL journal, file identities, sequences, conditional operations, per-device credentials and revocation |
+| server/sync/http.js | Device-authenticated REST API, administrator-only enrollment and authenticated sync channel on the existing WebSocket |
 | server/sync/discovery.js | Optional HTTPS Global Discovery v3 announcement with client certificate |
 | apps/obsidian-ignis-connector | One desktop/iOS/Android plugin using Obsidian Vault APIs, CodeMirror 6, Yjs and HTTPS/WSS |
 
@@ -37,15 +37,52 @@ Run the plugin build:
 
 Copy the resulting main.js and manifest.json into the local Vault plugin
 folder (.obsidian/plugins/ignis-connector), then enable the community plugin.
-Configure its trusted HTTPS server origin, Vault ID, and access token.
-If supported, the token is stored with Obsidian SecretStorage rather than in
-the plugin settings JSON. Loopback HTTP is allowed only for local development.
+Configure its trusted HTTPS server origin and Vault ID. The server owner
+must now **enroll each device separately**; the original IGNIS_SYNC_TOKEN is
+only an administrator bootstrap secret, NOT a native Obsidian sync token.
 
-**Network security limitation:** The access token only protects the new
-Sync API and sync channel. Existing Ignis file APIs, collaboration WebSocket
+From the trusted server host, with IGNIS_SYNC_TOKEN in the shell environment,
+enroll one device for the selected Vault:
+
+    curl --fail-with-body -X POST \
+      -H "Authorization: Bearer $IGNIS_SYNC_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data '{"label":"iPhone 17"}' \
+      'http://127.0.0.1:3192/api/sync/v1/admin/vaults/<vault-id>/devices'
+
+The response contains a newly generated deviceId and an
+**ignis_dev_... token shown once**. Copy this device token into the
+Connector settings on that device. The plugin verifies the credential
+against GET /api/sync/v1/vaults/<vault-id>/session at the manually approved
+HTTPS origin *before* saving it. If supported, Obsidian SecretStorage holds
+the credential; it is never included in the plugin's data.json. Loopback
+HTTP is only for trusted local development.
+
+To list or revoke devices, again from the trusted server host:
+
+    curl -H "Authorization: Bearer $IGNIS_SYNC_TOKEN" \
+      'http://127.0.0.1:3192/api/sync/v1/admin/vaults/<vault-id>/devices'
+
+    curl -X DELETE -H "Authorization: Bearer $IGNIS_SYNC_TOKEN" \
+      'http://127.0.0.1:3192/api/sync/v1/admin/devices/<device-id>'
+
+Revocation is immediate for the new Sync API. Existing authenticated Sync
+WebSocket sessions are closed with code 4003, and a revoked client will not
+automatically reconnect with the rejected credential. Another device
+enrolled to the same Vault remains authorized. Device tokens are random
+256-bit secrets, stored **only as SHA-256 hashes** in the server SQLite DB;
+the admin device-list endpoint never returns them. These are intentionally
+simple, explicit admin-approved enrollments; unattended QR pairing and
+device approval screens are separate UX work.
+
+**Network security limitation:** The device token only protects the new
+Sync API and sync channel. Existing Ignis file APIs, the separate browser-facing collaboration WebSocket handlers
 and file-resource endpoints are still unauthenticated. A network-facing
 deployment must protect the *entire* Ignis origin using a trusted network
-or an authenticated HTTPS reverse proxy. Do not publish a bare instance.
+or an authenticated HTTPS reverse proxy. Device revocation alone is **not**
+complete server-wide access control, and must not be represented as such.
+Do not publish a bare instance. The bootstrap administrator token should
+remain on a trusted host and never be entered in an Obsidian client.
 
 ## Optional Syncthing Discovery
 
@@ -80,6 +117,13 @@ Files carry fileId, generationId, path, hash, size, revision and tombstone.
 Each Vault has a monotonic sequence, and a durable operation ID records the
 result of a retried request. Renaming through the Sync API preserves IDs;
 deleting and recreating produces new IDs.
+The same DB has a small devices table with deviceId, Vault assignment, label,
+hashed token, enrollment time and optional revocation time. Administrator
+enrollment/list/revocation is a distinct authorization boundary from
+per-device Vault synchronization. Existing Ignis deployments that used the
+old shared token inside Connector settings need to enroll each device and
+replace the credential; the administrator token no longer authorizes normal
+Sync REST or Sync WSS.
 
 The initial implementation scans the Vault at manifest/change requests and
 after debounced watcher events. Full scans are appropriate for small test
@@ -198,7 +242,9 @@ The smoke script creates an isolated temporary Vault and Ignis process,
 checks REST auth, manifest and cursor behavior, WSS notifications,
 collaborative edits and their durable journal ACK, binary create/download/
 modify, chained offline rename/delete operations, bounded downloads, duplicate
-operation retries, stale-write refusal and server restart,
+operation retries, stale-write refusal, per-device Vault scope, server
+restart, individual device revocation with immediate WSS closure and
+another device's continued access,
 then cleans up.
 No installed Ignis process is stopped or modified.
 

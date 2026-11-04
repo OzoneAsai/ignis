@@ -22,14 +22,15 @@ function createSyncRouter({ store, token }) {
   router.get("/capabilities", (_req, res) => {
     res.json({ protocol: "ignis-sync/1", transport: ["https", "wss"],
       supported: ["manifest", "changes", "conditional-text", "conditional-binary-4MiB", "file-identity"],
+      auth: "scoped-device-token",
       experimental: true });
   });
-  router.use((req, res, next) => {
+  function adminOnly(req, res, next) {
     if (!secureEqual(req.get("Authorization"), "Bearer " + token)) {
-      return res.status(401).json({ code: "UNAUTHORIZED", error: "Sync authentication required" });
+      return res.status(401).json({ code: "UNAUTHORIZED", error: "Administrator authorization required" });
     }
     next();
-  });
+  }
   function route(fn) {
     return (req, res) => Promise.resolve().then(() => fn(req, res)).catch((e) => {
       const status = e.status || (e.code === "ENOENT" ? 404 : 500);
@@ -41,6 +42,39 @@ function createSyncRouter({ store, token }) {
       if (status === 500) console.warn("[sync] route:", e);
     });
   }
+
+  // Only the server owner may enroll/revoke devices. The bootstrap token
+  // never authorizes ordinary Vault synchronization and is never handed to
+  // native Obsidian; each device has one random secret scoped to one Vault.
+  router.get("/admin/vaults/:vaultId/devices", adminOnly, route((req, res) => {
+    res.json({ devices: store.listDevices(req.params.vaultId) });
+  }));
+  router.post("/admin/vaults/:vaultId/devices", adminOnly, route((req, res) => {
+    const enrolled = store.enrollDevice(req.params.vaultId, req.body?.label);
+    res.status(201).json(enrolled);
+  }));
+  router.delete("/admin/devices/:deviceId", adminOnly, route((req, res) => {
+    if (!store.revokeDevice(req.params.deviceId)) {
+      return res.status(404).json({ code: "NOT_FOUND", error: "Device not found" });
+    }
+    res.status(204).end();
+  }));
+
+  router.use("/vaults/:vaultId", (req, res, next) => {
+    const match = /^Bearer (ignis_dev_[A-Za-z0-9_-]{43})$/.exec(
+      req.get("Authorization") || ""
+    );
+    const device = match && store.authenticateDevice(match[1], req.params.vaultId);
+    if (!device) {
+      return res.status(401).json({ code: "UNAUTHORIZED", error: "Device authorization required" });
+    }
+    req.ignisSyncDevice = device;
+    next();
+  });
+  router.get("/vaults/:vaultId/session", (req, res) => {
+    const device = req.ignisSyncDevice;
+    res.json({ deviceId: device.deviceId, vaultId: device.vaultId, label: device.label });
+  });
   router.get("/vaults/:vaultId/manifest", route(async (req, res) => {
     res.json(await store.scan(req.params.vaultId));
   }));
@@ -67,23 +101,25 @@ function createSyncRouter({ store, token }) {
   return router;
 }
 
-function registerSyncChannel(wss, store, token) {
-  const authorized = new WeakSet();
+function registerSyncChannel(wss, store) {
+  const authorized = new WeakMap();
   const peers = new Set();
   const channel = wss.channel("sync");
   channel.on("auth", (msg, ws) => {
-    if (!secureEqual(msg.token, token)) {
+    const device = store.authenticateDevice(msg.token, ws.ignisVaultId);
+    if (!device || authorized.has(ws)) {
       ws.send(JSON.stringify({ channel: "sync", type: "auth-error", code: "UNAUTHORIZED" }));
       ws.close(4003, "Sync authorization failed");
       return;
     }
-    authorized.add(ws);
+    authorized.set(ws, device.deviceId);
     peers.add(ws);
     ws.send(JSON.stringify({ channel: "sync", type: "ready",
-      vaultId: ws.ignisVaultId, vaultSeq: store.head(ws.ignisVaultId) }));
+      vaultId: ws.ignisVaultId, deviceId: device.deviceId,
+      vaultSeq: store.head(ws.ignisVaultId) }));
   });
   channel.on("resume", (msg, ws) => {
-    if (!authorized.has(ws)) {
+    if (!store.deviceActive(authorized.get(ws), ws.ignisVaultId)) {
       ws.close(4003, "Sync authentication required");
       return;
     }
@@ -100,13 +136,25 @@ function registerSyncChannel(wss, store, token) {
   const detach = store.onChange((event) => {
     for (const ws of peers) {
       if (ws.ignisVaultId === event.vaultId && ws.readyState === ws.OPEN) {
+        if (!store.deviceActive(authorized.get(ws), event.vaultId)) {
+          ws.close(4003, "Device revoked");
+          continue;
+        }
         ws.send(JSON.stringify({ channel: "sync", type: "changed",
           vaultSeq: event.seq }));
       }
     }
   });
+  const stopRevocation = store.onRevoke((deviceId) => {
+    for (const ws of peers) {
+      if (authorized.get(ws) === deviceId) ws.close(4003, "Device revoked");
+    }
+  });
   wss.on("connection", (ws) => ws.on("close", () => peers.delete(ws)));
-  wss.on("close", detach);
+  wss.on("close", () => {
+    detach();
+    stopRevocation();
+  });
 }
 
 module.exports = { secureEqual, createSyncRouter, registerSyncChannel };

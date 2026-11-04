@@ -16,6 +16,7 @@ type Settings = {
   discoveryUrl: string;
   serverDeviceId: string;
   vaultId: string;
+  deviceId: string;
   cursor: number;
   baselines: Record<string, Base>;
   pending: Pending[];
@@ -44,7 +45,7 @@ type OperationResult = {
 };
 
 const DEFAULT: Settings = {
-  serverUrl: "", discoveryUrl: "", serverDeviceId: "", vaultId: "",
+  serverUrl: "", discoveryUrl: "", serverDeviceId: "", vaultId: "", deviceId: "",
   cursor: 0, baselines: {}, pending: [], yjsIds: {},
   scope: "", archivedScopes: []
 };
@@ -242,22 +243,51 @@ export default class IgnisConnector extends Plugin {
       new Notice("Restart Ignis Connector to change the server or Vault");
       return;
     }
+    if (!/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(token)) {
+      new Notice("Use an Ignis device token, not the server administrator token");
+      return;
+    }
     const secrets = (this.app as any).secretStorage;
     if (!this.settings.scope) this.settings.scope = this.currentScope();
     if (!this.matchesScope()) {
       new Notice("Server/Vault changed: archive the old sync state before entering a new token");
       return;
     }
+    // Verify the *selected* origin and Vault before ever persisting a
+    // credential. Discovery only advertises candidate addresses.
+    const scope = this.settings.scope;
+    let session: { deviceId: string; vaultId: string; label: string };
+    try {
+      const response = await requestUrl({
+        url: this.url("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/session"),
+        method: "GET",
+        headers: { Authorization: "Bearer " + token },
+        throw: false
+      });
+      if (response.status !== 200 || response.json?.vaultId !== this.settings.vaultId ||
+          typeof response.json?.deviceId !== "string") {
+        new Notice("This device token was rejected or belongs to another Vault");
+        return;
+      }
+      session = response.json;
+    } catch {
+      new Notice("Could not verify the device token via HTTPS; it was not saved");
+      return;
+    }
+    if (this.stopped || !this.matchesScope() || this.settings.scope !== scope) return;
     if (!secrets?.setSecret || !this.settings.vaultId) {
       new Notice("Obsidian SecretStorage is required; token kept only until app exit");
     } else {
       secrets.setSecret(SECRET_PREFIX + this.settings.scope, token);
     }
     this.token = token;
+    this.settings.deviceId = session.deviceId;
+    await this.saveData(this.settings);
     this.authBlocked = false;
     this.retryCount = 0;
     this.connectSocket();
     this.schedule();
+    new Notice("Ignis device linked: " + session.label);
   }
 
   async saveSettings() {
@@ -288,7 +318,8 @@ export default class IgnisConnector extends Plugin {
   }
   private ready(): boolean {
     return !!(!this.authBlocked && !this.needsReload &&
-      this.matchesScope() && this.settings.vaultId && this.token);
+      this.matchesScope() && this.settings.vaultId &&
+      /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token));
   }
   async archiveAndSwitch() {
     const newScope = this.currentScope();
@@ -308,6 +339,7 @@ export default class IgnisConnector extends Plugin {
     this.settings.baselines = {};
     this.settings.pending = [];
     this.settings.yjsIds = {};
+    this.settings.deviceId = "";
     this.token = "";
     this.authBlocked = false;
     this.retryCount = 0;
@@ -331,17 +363,31 @@ export default class IgnisConnector extends Plugin {
   private url(path: string): string {
     return validServerUrl(this.settings.serverUrl) + "/api/sync/v1" + path;
   }
-  private async api(path: string, method = "GET", body?: unknown) {
+  private async deviceRequest(path: string, method = "GET", body?: unknown) {
     const response = await requestUrl({
       url: this.url(path),
       method,
+      throw: false,
       headers: {
         Authorization: "Bearer " + this.token,
         ...(body ? { "Content-Type": "application/json" } : {})
       },
       ...(body ? { body: JSON.stringify(body) } : {})
     });
-    return response.json;
+    if (response.status === 401) {
+      this.authBlocked = true;
+      this.live.disconnected();
+      this.socket?.close();
+      this.showStatus("Device revoked or no longer authorized");
+      throw new Error("Sync device authorization rejected");
+    }
+    if (response.status >= 400) {
+      throw new Error("Ignis Sync HTTP " + response.status);
+    }
+    return response;
+  }
+  private async api(path: string, method = "GET", body?: unknown) {
+    return (await this.deviceRequest(path, method, body)).json;
   }
   private async sendOperation(body: object): Promise<OperationResult> {
     return this.api(
@@ -393,6 +439,13 @@ export default class IgnisConnector extends Plugin {
                 socket.close();
                 return;
               }
+              if (typeof message.deviceId !== "string" ||
+                  (this.settings.deviceId && message.deviceId !== this.settings.deviceId)) {
+                this.authBlocked = true;
+                this.showStatus("Server returned the wrong device identity");
+                socket.close();
+                return;
+              }
               authorized = true;
               this.retryCount = 0;
               this.live.connected();
@@ -411,10 +464,15 @@ export default class IgnisConnector extends Plugin {
       socket.onerror = () => {
         if (this.socket === socket) this.showStatus("Offline · local Vault retained");
       };
-      socket.onclose = () => {
+      socket.onclose = (event) => {
         if (this.socket === socket) {
           this.live.disconnected();
           this.socket = null;
+          if (event.code === 4003 || event.code === 4001) {
+            this.authBlocked = true;
+            this.showStatus("Device revoked or no longer authorized");
+            return;
+          }
           if (!this.stopped && this.ready() && !document.hidden) this.retryConnection();
         }
       };
@@ -451,12 +509,10 @@ export default class IgnisConnector extends Plugin {
   }
   private async remoteBytes(remote: RemoteFile): Promise<ArrayBuffer> {
     if (remote.size > MAX_FILE_BYTES) throw new Error("File exceeds mobile-safe sync limit");
-    const response = await requestUrl({
-      url: this.url("/vaults/" + encodeURIComponent(this.settings.vaultId) +
-        "/files/" + encodeURIComponent(remote.fileId)),
-      method: "GET",
-      headers: { Authorization: "Bearer " + this.token }
-    });
+    const response = await this.deviceRequest(
+      "/vaults/" + encodeURIComponent(this.settings.vaultId) +
+      "/files/" + encodeURIComponent(remote.fileId)
+    );
     const bytes = new Uint8Array(response.arrayBuffer);
     if (bytes.length !== remote.size || await sha256(bytes) !== remote.hash) {
       throw new Error("Remote content size/hash mismatch");
@@ -709,15 +765,17 @@ class ConnectorSettings extends PluginSettingTab {
           this.plugin.settings.vaultId = value.trim();
           await this.plugin.saveSettings();
         }));
-    new Setting(containerEl).setName("Sync access token")
-      .setDesc("Stored in Obsidian SecretStorage if available; never in plugin data.json.")
-      .addText((t) => t.setPlaceholder("Paste IGNIS_SYNC_TOKEN")
+    new Setting(containerEl).setName("This device's Ignis token")
+      .setDesc("Have the server administrator enroll this device and paste its ignis_dev_ token. Never enter IGNIS_SYNC_TOKEN here.")
+      .addText((t) => t.setPlaceholder("ignis_dev_…")
         .onChange(async (value) => {
-          if (value.length >= 32) {
+          if (/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(value)) {
             await this.plugin.saveToken(value);
             t.setValue("");
           }
         }));
+    new Setting(containerEl).setName("Registered device ID")
+      .setDesc(this.plugin.settings.deviceId || "No device credential verified");
     new Setting(containerEl).setName("Syncthing Discovery URL")
       .setDesc("Optional private stdiscosrv /v2/ HTTPS endpoint")
       .addText((t) => t.setValue(this.plugin.settings.discoveryUrl)

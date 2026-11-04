@@ -262,7 +262,7 @@ collaboration.register({
     syncStore.recordCollaborationSave(vaultId, relPath, documentId, digest, byteLength) : undefined,
 });
 if (syncStore) {
-  registerSyncChannel(wss, syncStore, syncToken);
+  registerSyncChannel(wss, syncStore);
   const scanTimers = new Map();
   watcher.addGlobalListener((vaultId, event) => {
     if (!permittedPath(event.path)) return;

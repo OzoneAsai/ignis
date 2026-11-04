@@ -27,6 +27,9 @@ const base = "http://127.0.0.1:" + port;
 let child = null;
 let output = "";
 let socket = null;
+let deviceToken = null;
+let deviceId = null;
+let secondDevice = null;
 
 async function launch() {
   child = spawn(process.execPath, ["apps/ignis-server/server/index.js"], {
@@ -63,6 +66,21 @@ async function stop() {
 }
 
 async function request(url, options = {}) {
+  return requestAs(url, deviceToken, options);
+}
+
+async function requestAs(url, credential, options = {}) {
+  return fetch(base + url, {
+    ...options,
+    headers: {
+      Authorization: "Bearer " + credential,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...options.headers
+    }
+  });
+}
+
+async function admin(url, options = {}) {
   return fetch(base + url, {
     ...options,
     headers: {
@@ -95,6 +113,39 @@ try {
   await launch();
   const denied = await fetch(base + "/api/sync/v1/vaults/lab/manifest");
   assert.equal(denied.status, 401, "read API rejects missing auth");
+  const bootstrapDenied = await admin("/api/sync/v1/vaults/lab/manifest");
+  assert.equal(bootstrapDenied.status, 401,
+    "bootstrap administrator secret is not a client sync credential");
+  const forbiddenEnrollment = await request("/api/sync/v1/admin/vaults/lab/devices", {
+    method: "POST", body: JSON.stringify({ label: "not authorized" })
+  });
+  assert.equal(forbiddenEnrollment.status, 401);
+  const enrollment = await admin("/api/sync/v1/admin/vaults/lab/devices", {
+    method: "POST", body: JSON.stringify({ label: "Isolated Obsidian iOS" })
+  });
+  assert.equal(enrollment.status, 201);
+  const enrolled = await enrollment.json();
+  deviceToken = enrolled.token;
+  deviceId = enrolled.deviceId;
+  assert.match(deviceToken, /^ignis_dev_[A-Za-z0-9_-]{43}$/);
+  const deviceCannotAdmin = await request("/api/sync/v1/admin/vaults/lab/devices");
+  assert.equal(deviceCannotAdmin.status, 401);
+  const secondEnrollment = await admin("/api/sync/v1/admin/vaults/lab/devices", {
+    method: "POST", body: JSON.stringify({ label: "Isolated Obsidian Mac" })
+  });
+  assert.equal(secondEnrollment.status, 201);
+  secondDevice = await secondEnrollment.json();
+  assert.notEqual(secondDevice.token, deviceToken);
+  assert.notEqual(secondDevice.deviceId, deviceId);
+  const devices = await (await admin("/api/sync/v1/admin/vaults/lab/devices")).json();
+  assert.equal(devices.devices.length, 2);
+  assert.equal(devices.devices.find((d) => d.deviceId === deviceId).token, undefined);
+  const session = await (await request("/api/sync/v1/vaults/lab/session")).json();
+  assert.equal(session.deviceId, deviceId);
+  assert.equal(session.vaultId, "lab");
+  const wrongVault = await request("/api/sync/v1/vaults/other/manifest");
+  assert.equal(wrongVault.status, 401, "one device may not access another Vault");
+
   const initial = await request("/api/sync/v1/vaults/lab/manifest");
   assert.equal(initial.status, 200, await initial.text());
   // fetch response body can only be consumed once; retrieve it separately.
@@ -105,9 +156,10 @@ try {
 
   socket = new WebSocket("ws://127.0.0.1:" + port + "/ws?vault=lab");
   await once(socket, "open");
-  socket.send(JSON.stringify({ channel: "sync", type: "auth", token }));
+  socket.send(JSON.stringify({ channel: "sync", type: "auth", token: deviceToken }));
   const ready = await recv(socket, (msg) => msg.channel === "sync" && msg.type === "ready");
   assert.equal(ready.vaultSeq, 1);
+  assert.equal(ready.deviceId, deviceId);
   // Both Sync and Yjs now share one document generation. A native client
   // joining the existing collaboration channel must observe the SAME ID
   // as the Vault manifest, not a second randomly generated generation.
@@ -258,7 +310,50 @@ try {
   assert.deepEqual(fs.readFileSync(path.join(vault, "media", "picture.png")), updatedAsset);
   assert.equal(reboot.files.find((f) => f.path === "alpha.md").generationId,
     init.documentId);
-  console.log("Sync smoke passed: shared Yjs/Sync generation, persisted CRDT ACK, binary attachments, chained offline renames/deletion, bounded download, auth, WSS, idempotency, conflicts, reboot");
+  assert.equal((await (await request("/api/sync/v1/vaults/lab/session")).json()).deviceId,
+    deviceId, "device token survives server restart");
+
+  socket = new WebSocket("ws://127.0.0.1:" + port + "/ws?vault=lab");
+  await once(socket, "open");
+  const secondReady = recv(socket,
+    (msg) => msg.channel === "sync" && msg.type === "ready", "second device ready");
+  socket.send(JSON.stringify({ channel: "sync", type: "auth", token: deviceToken }));
+  assert.equal((await secondReady).deviceId, deviceId);
+  const disconnected = once(socket, "close");
+  const revoked = await admin("/api/sync/v1/admin/devices/" + deviceId, {
+    method: "DELETE"
+  });
+  assert.equal(revoked.status, 204);
+  const [code] = await disconnected;
+  assert.equal(code, 4003, "revoking a device closes its live Sync websocket");
+  assert.equal((await request("/api/sync/v1/vaults/lab/manifest")).status, 401);
+  assert.equal((await request("/api/sync/v1/vaults/lab/session")).status, 401);
+  const secondStillValid = await requestAs(
+    "/api/sync/v1/vaults/lab/session", secondDevice.token
+  );
+  assert.equal(secondStillValid.status, 200,
+    "revoking one device cannot invalidate a different device");
+  assert.equal((await secondStillValid.json()).deviceId, secondDevice.deviceId);
+  const afterRevoke = await (await admin(
+    "/api/sync/v1/admin/vaults/lab/devices"
+  )).json();
+  assert.equal(typeof afterRevoke.devices.find(
+    (d) => d.deviceId === deviceId
+  ).revokedAt, "number");
+  assert.equal(afterRevoke.devices.find(
+    (d) => d.deviceId === secondDevice.deviceId
+  ).revokedAt, null);
+
+  // Revocation must be durable: a process restart must never reactivate
+  // the revoked credential, nor invalidate other enrolled devices.
+  await stop();
+  await launch();
+  assert.equal((await request("/api/sync/v1/vaults/lab/session")).status, 401);
+  assert.equal((await requestAs(
+    "/api/sync/v1/vaults/lab/session", secondDevice.token
+  )).status, 200);
+
+  console.log("Sync smoke passed: shared Yjs/Sync generation, persisted CRDT ACK, scoped enrollment and persistent individual revocation, WSS disconnect, binary attachments, chained offline renames/deletion, bounded download, idempotency, conflicts, reboot");
 } catch (e) {
   console.error("Sync smoke failed:", e.message);
   console.error(output.slice(-6000));

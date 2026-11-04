@@ -262,6 +262,55 @@ describe("one durable Vault change journal", () => {
 });
 
 describe("Discovery and authorization primitives", () => {
+  it("issues unique per-device credentials, Vault scopes and immediate revocation", () => {
+    const { store, root, vault } = testStore();
+    const one = store.enrollDevice("vault", "iPhone");
+    const two = store.enrollDevice("vault", "MacBook");
+    expect(one.deviceId).not.toBe(two.deviceId);
+    expect(one.token).toMatch(/^ignis_dev_[A-Za-z0-9_-]{43}$/);
+    expect(one.token).not.toBe(two.token);
+    expect(store.authenticateDevice(one.token, "vault")).toMatchObject({
+      deviceId: one.deviceId, vaultId: "vault", label: "iPhone"
+    });
+    expect(store.authenticateDevice(one.token, "other")).toBe(null);
+    expect(store.authenticateDevice("a".repeat(8000), "vault")).toBe(null);
+    expect(store.authenticateDevice(two.token, "vault")?.deviceId).toBe(two.deviceId);
+    expect(JSON.stringify(store.listDevices("vault"))).not.toContain("ignis_dev_");
+    expect(store.listDevices("vault")).toHaveLength(2);
+    expect(store.listDevices("vault")[0].revokedAt).toBe(null);
+    let revocations = 0;
+    const detach = store.onRevoke((id) => {
+      expect(id).toBe(one.deviceId);
+      revocations++;
+    });
+    expect(store.revokeDevice(one.deviceId)).toBe(true);
+    expect(revocations).toBe(1);
+    detach();
+    expect(store.authenticateDevice(one.token, "vault")).toBe(null);
+    expect(store.deviceActive(one.deviceId, "vault")).toBe(false);
+    expect(store.authenticateDevice(two.token, "vault")?.deviceId).toBe(two.deviceId);
+    const meta = store.listDevices("vault").find((item) => item.deviceId === one.deviceId);
+    expect(typeof meta.revokedAt).toBe("number");
+    expect(meta.token).toBeUndefined();
+    expect(meta.tokenHash).toBeUndefined();
+    expect(() => store.enrollDevice("vault", "bad\nlabel"))
+      .toThrow(/label/);
+    expect(() => store.enrollDevice("missing", "Another device"))
+      .toThrow(/not found/i);
+
+    store.close();
+    active.splice(active.findIndex((item) => item.store === store), 1);
+    const reopened = new VaultSyncStore({
+      dataRoot: root, getVaultPath: (id) => id === "vault" ? vault : null,
+      collaboration: { getActive: () => null },
+      writeCoalescer: { flushPending: async () => {} }
+    });
+    active.push({ store: reopened, root });
+    expect(reopened.authenticateDevice(one.token, "vault")).toBe(null);
+    expect(reopened.authenticateDevice(two.token, "vault")?.deviceId).toBe(two.deviceId);
+    expect(reopened.listDevices("vault")).toHaveLength(2);
+  });
+
   it("matches the Syncthing checksummed canonical Device ID format", () => {
     expect(base32(Buffer.alloc(32))).toHaveLength(52);
     expect(luhn32("AAAAAAAAAAAAA")).toBe("A");
