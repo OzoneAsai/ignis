@@ -27,6 +27,7 @@ const base = "http://127.0.0.1:" + port;
 let child = null;
 let output = "";
 let socket = null;
+let peerSocket = null;
 let deviceToken = null;
 let deviceId = null;
 let secondDevice = null;
@@ -56,6 +57,8 @@ async function launch() {
 async function stop() {
   socket?.close();
   socket = null;
+  peerSocket?.close();
+  peerSocket = null;
   if (child && child.exitCode === null) {
     const done = once(child, "exit");
     child.kill("SIGTERM");
@@ -145,6 +148,14 @@ try {
   assert.equal(session.vaultId, "lab");
   const wrongVault = await request("/api/sync/v1/vaults/other/manifest");
   assert.equal(wrongVault.status, 401, "one device may not access another Vault");
+  const oversizedRequest = await request("/api/sync/v1/vaults/lab/operations", {
+    method: "POST",
+    body: JSON.stringify({ type: "create", path: "oversized.md",
+      content: "x".repeat(6 * 1024 * 1024), opId: crypto.randomUUID() })
+  });
+  assert.equal(oversizedRequest.status, 413,
+    "Sync must reject oversized JSON before the legacy 500 MiB parser");
+  assert.equal((await oversizedRequest.json()).code, "PAYLOAD_TOO_LARGE");
 
   const initial = await request("/api/sync/v1/vaults/lab/manifest");
   assert.equal(initial.status, 200, await initial.text());
@@ -215,6 +226,20 @@ try {
     method: "POST", body: JSON.stringify(op)
   })).json();
   assert.equal(created.seq, 3, "idempotent retry returns first result");
+  const recoveredReceipt = await request(
+    "/api/sync/v1/vaults/lab/operations/" + op.opId
+  );
+  assert.equal(recoveredReceipt.status, 200);
+  assert.deepEqual(await recoveredReceipt.json(), created,
+    "lost POST response can be recovered by querying the committed opId");
+  const unknownReceipt = await request(
+    "/api/sync/v1/vaults/lab/operations/" + crypto.randomUUID()
+  );
+  assert.equal(unknownReceipt.status, 404);
+  const unauthorizedReceipt = await admin(
+    "/api/sync/v1/vaults/lab/operations/" + op.opId
+  );
+  assert.equal(unauthorizedReceipt.status, 401);
   const notification = await notificationPromise;
   assert.equal(notification.vaultSeq, 3);
   const delta = await (await request("/api/sync/v1/vaults/lab/changes?since=2")).json();
@@ -310,6 +335,9 @@ try {
   assert.deepEqual(fs.readFileSync(path.join(vault, "media", "picture.png")), updatedAsset);
   assert.equal(reboot.files.find((f) => f.path === "alpha.md").generationId,
     init.documentId);
+  assert.deepEqual(await (await request(
+    "/api/sync/v1/vaults/lab/operations/" + op.opId
+  )).json(), created, "operation receipts survive a server restart");
   assert.equal((await (await request("/api/sync/v1/vaults/lab/session")).json()).deviceId,
     deviceId, "device token survives server restart");
 
@@ -319,6 +347,71 @@ try {
     (msg) => msg.channel === "sync" && msg.type === "ready", "second device ready");
   socket.send(JSON.stringify({ channel: "sync", type: "auth", token: deviceToken }));
   assert.equal((await secondReady).deviceId, deviceId);
+
+  // Two independently enrolled clients join the same CRDT generation and
+  // edit from the same snapshot. The server must merge disjoint operations,
+  // broadcast them to the other editor and durably project the merged text.
+  peerSocket = new WebSocket("ws://127.0.0.1:" + port + "/ws?vault=lab");
+  await once(peerSocket, "open");
+  const peerReady = recv(peerSocket, (msg) =>
+    msg.channel === "sync" && msg.type === "ready", "peer sync ready");
+  peerSocket.send(JSON.stringify({
+    channel: "sync", type: "auth", token: secondDevice.token
+  }));
+  assert.equal((await peerReady).deviceId, secondDevice.deviceId);
+  const localInitWait = recv(socket, (msg) =>
+    msg.channel === "collab" && msg.type === "init" && msg.path === "alpha.md");
+  const peerInitWait = recv(peerSocket, (msg) =>
+    msg.channel === "collab" && msg.type === "init" && msg.path === "alpha.md");
+  socket.send(JSON.stringify({ channel: "collab", type: "join", path: "alpha.md" }));
+  peerSocket.send(JSON.stringify({ channel: "collab", type: "join", path: "alpha.md" }));
+  const [localInit, peerInit] = await Promise.all([localInitWait, peerInitWait]);
+  assert.equal(localInit.documentId, peerInit.documentId);
+  assert.equal(localInit.documentId, init.documentId);
+  const nativeDoc = new Y.Doc();
+  const peerDoc = new Y.Doc();
+  Y.applyUpdate(nativeDoc, Buffer.from(localInit.state, "base64"));
+  Y.applyUpdate(peerDoc, Buffer.from(peerInit.state, "base64"));
+  const nativeVector = Y.encodeStateVector(nativeDoc);
+  const peerVector = Y.encodeStateVector(peerDoc);
+  nativeDoc.getText("content").insert(0, "native:");
+  peerDoc.getText("content").insert(peerDoc.getText("content").length, ":peer");
+  const nativeBroadcast = recv(peerSocket, (msg) =>
+    msg.channel === "collab" && msg.type === "update" && msg.path === "alpha.md",
+  "native CRDT broadcast");
+  const peerBroadcast = recv(socket, (msg) =>
+    msg.channel === "collab" && msg.type === "update" && msg.path === "alpha.md",
+  "peer CRDT broadcast");
+  const nativeSaved = recv(socket, (msg) =>
+    msg.channel === "collab" && msg.type === "saved" && msg.seq === 71,
+  "native CRDT saved");
+  const peerSaved = recv(peerSocket, (msg) =>
+    msg.channel === "collab" && msg.type === "saved" && msg.seq === 72,
+  "peer CRDT saved");
+  socket.send(JSON.stringify({
+    channel: "collab", type: "update", path: "alpha.md", seq: 71,
+    update: Buffer.from(Y.encodeStateAsUpdate(nativeDoc, nativeVector)).toString("base64")
+  }));
+  peerSocket.send(JSON.stringify({
+    channel: "collab", type: "update", path: "alpha.md", seq: 72,
+    update: Buffer.from(Y.encodeStateAsUpdate(peerDoc, peerVector)).toString("base64")
+  }));
+  Y.applyUpdate(nativeDoc, Buffer.from((await peerBroadcast).update, "base64"));
+  Y.applyUpdate(peerDoc, Buffer.from((await nativeBroadcast).update, "base64"));
+  await Promise.all([nativeSaved, peerSaved]);
+  assert.equal(nativeDoc.getText("content").toString(),
+    peerDoc.getText("content").toString());
+  assert.equal(nativeDoc.getText("content").toString(),
+    "native:hello via CRDT:peer");
+  assert.equal(fs.readFileSync(path.join(vault, "alpha.md"), "utf8"),
+    nativeDoc.getText("content").toString());
+  assert.equal((await (await request(
+    "/api/sync/v1/vaults/lab/manifest")).json()).vaultSeq, 10);
+  nativeDoc.destroy();
+  peerDoc.destroy();
+  peerSocket.close();
+  peerSocket = null;
+
   const disconnected = once(socket, "close");
   const revoked = await admin("/api/sync/v1/admin/devices/" + deviceId, {
     method: "DELETE"
@@ -353,7 +446,7 @@ try {
     "/api/sync/v1/vaults/lab/session", secondDevice.token
   )).status, 200);
 
-  console.log("Sync smoke passed: shared Yjs/Sync generation, persisted CRDT ACK, scoped enrollment and persistent individual revocation, WSS disconnect, binary attachments, chained offline renames/deletion, bounded download, idempotency, conflicts, reboot");
+  console.log("Sync smoke passed: two-client Yjs merge, shared Yjs/Sync generation, persisted CRDT ACK, scoped enrollment and persistent individual revocation, WSS disconnect, binary attachments, chained offline renames/deletion, bounded download, idempotency, conflicts, reboot");
 } catch (e) {
   console.error("Sync smoke failed:", e.message);
   console.error(output.slice(-6000));
