@@ -88,6 +88,13 @@ function createSyncRouter({ store, token }) {
     await store.scan(req.params.vaultId);
     res.json(store.changes(req.params.vaultId, since, limit));
   }));
+  router.get("/vaults/:vaultId/operations/:opId", route((req, res) => {
+    const receipt = store.operationReceipt(req.params.vaultId, req.params.opId);
+    if (!receipt) return res.status(404).json({
+      code: "OPERATION_NOT_FOUND", error: "Operation not recorded"
+    });
+    res.json(receipt);
+  }));
   router.get("/vaults/:vaultId/files/:fileId", route(async (req, res) => {
     const result = await store.read(req.params.vaultId, req.params.fileId);
     res.setHeader("X-Ignis-File-Hash", result.file.hash);
