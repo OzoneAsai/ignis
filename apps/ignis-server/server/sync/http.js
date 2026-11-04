@@ -21,7 +21,7 @@ function createSyncRouter({ store, token }) {
   });
   router.get("/capabilities", (_req, res) => {
     res.json({ protocol: "ignis-sync/1", transport: ["https", "wss"],
-      supported: ["manifest", "changes", "conditional-text", "file-identity"],
+      supported: ["manifest", "changes", "conditional-text", "conditional-binary-4MiB", "file-identity"],
       experimental: true });
   });
   router.use((req, res, next) => {
