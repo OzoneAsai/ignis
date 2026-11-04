@@ -182,8 +182,10 @@ export class NativeYjs {
     const doc = new Y.Doc();
     const text = doc.getText("content");
     const undo = new Y.UndoManager(text, { captureTimeout: 500 });
-    const key = ["ignis-connector-yjs-v1", this.opts.origin(),
-      this.opts.vaultId(), room.path, id].join("|");
+    // CRDT history belongs to the document generation, not to a filename.
+    // A rename must not strand unacknowledged offline edits in an old path.
+    const key = ["ignis-connector-yjs-v2", this.opts.origin(),
+      this.opts.vaultId(), id].join("|");
     const persistence = new IndexeddbPersistence(key, doc);
     room.doc = doc;
     room.text = text;
@@ -196,19 +198,34 @@ export class NativeYjs {
       }
     });
     const hydrateTask = async () => {
-    try {
-      await persistence.whenSynced;
-      if (this.disposed || room.documentId !== id) return;
-      room.hydrated = true;
-      // A newly discovered document has no local Yjs baseline yet. Do not
-      // mistake the empty pre-init Y.Doc for a conflict with native text.
-      if (room.wasKnown) this.tryAttach(room);
-    } catch {
-      room.blocked = true;
-      this.opts.notify(room.path, "Local Yjs cache unavailable; native text preserved");
-    } finally {
-      room.initializing = false;
-    }
+      try {
+        await persistence.whenSynced;
+        // Upgrade old path-based caches exactly once. An old cache's Yjs
+        // operations are idempotent and are merged, never substituted.
+        if (room.wasKnown && await persistence.get("legacy-v1-imported") !== "yes") {
+          const legacyKey = ["ignis-connector-yjs-v1", this.opts.origin(),
+            this.opts.vaultId(), room.path, id].join("|");
+          const oldDoc = new Y.Doc();
+          const legacy = new IndexeddbPersistence(legacyKey, oldDoc);
+          try {
+            await legacy.whenSynced;
+            Y.applyUpdate(doc, Y.encodeStateAsUpdate(oldDoc), REMOTE);
+            await persistence.set("legacy-v1-imported", "yes");
+          } finally {
+            await legacy.destroy();
+            oldDoc.destroy();
+          }
+        }
+        if (this.disposed || room.documentId !== id) return;
+        room.hydrated = true;
+        // New sessions have no local history until server initialization.
+        if (room.wasKnown) this.tryAttach(room);
+      } catch {
+        room.blocked = true;
+        this.opts.notify(room.path, "Local Yjs cache unavailable; native text preserved");
+      } finally {
+        room.initializing = false;
+      }
     };
     room.hydration = hydrateTask();
     await room.hydration;
@@ -251,6 +268,7 @@ export class NativeYjs {
       for (const update of room.waiting.splice(0)) {
         if (room.doc && !room.blocked) Y.applyUpdate(room.doc, update, REMOTE);
       }
+      this.tryAttach(room);
       if (room.pendingHandshake && room.doc && room.joined && !room.blocked) {
         room.pendingHandshake = false;
         this.sendUpdate(room, Y.encodeStateAsUpdate(room.doc));
@@ -271,6 +289,33 @@ export class NativeYjs {
   disconnected() {
     this.online = false;
     for (const room of this.rooms.values()) room.joined = false;
+  }
+
+  // A native Vault rename changes the locator, not the document. Preserve
+  // the in-memory Y.Doc and its generation-scoped IndexedDB history.
+  // Rejoin only after the server has acknowledged moving its own Yjs state.
+  relocate(oldPath: string, newPath: string): boolean {
+    const room = this.rooms.get(oldPath);
+    if (!room) return true;
+    if (this.rooms.has(newPath) && this.rooms.get(newPath) !== room) {
+      room.blocked = true;
+      this.opts.notify(oldPath, "Yjs rename collides with another open document");
+      return false;
+    }
+    if (room.joined) {
+      this.opts.send({ channel: "collab", type: "leave", path: oldPath });
+    }
+    room.joined = false;
+    this.rooms.delete(oldPath);
+    room.path = newPath;
+    this.rooms.set(newPath, room);
+    for (const view of room.views) this.paths.set(view, newPath);
+    return true;
+  }
+
+  rejoinPath(path: string) {
+    const room = this.rooms.get(path);
+    if (room) this.join(room);
   }
 
   private sendUpdate(room: Room, update: Uint8Array) {
@@ -325,6 +370,21 @@ export class NativeYjs {
           this.opts.send({ channel: "collab", type: "leave", path: room.path });
           this.opts.notify(room.path, "Native draft differs from Yjs baseline; not merged automatically");
           return;
+        }
+        if (room.wasKnown) {
+          // Ensure the CodeMirror Yjs extension is installed before a remote
+          // merge. Otherwise a fast WebSocket init can change the Y.Doc
+          // before our queued compartment reconfiguration reaches the view,
+          // leaving the native pane detached despite matching the pre-merge
+          // local baseline.
+          this.tryAttach(room);
+          await new Promise<void>((resolve) => queueMicrotask(resolve));
+          if ([...room.views].some((view) => this.bound.get(view) !== room)) {
+            room.blocked = true;
+            this.opts.send({ channel: "collab", type: "leave", path: room.path });
+            this.opts.notify(room.path, "Could not safely attach native editor to cached Yjs state");
+            return;
+          }
         }
         room.joined = true;
         if (room.composing) room.waiting.push(remote);
