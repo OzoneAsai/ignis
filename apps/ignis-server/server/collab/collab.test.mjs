@@ -68,7 +68,7 @@ describe("collaboration room", () => {
     return client;
   }
 
-  function waitFor(ws, type, file = "test.md") {
+  function waitFor(ws, type, file = "test.md", matches = () => true) {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         ws.off("message", listener);
@@ -78,7 +78,8 @@ describe("collaboration room", () => {
       function listener(raw) {
         const msg = JSON.parse(raw.toString());
 
-        if (msg.channel === "collab" && msg.type === type && msg.path === file) {
+        if (msg.channel === "collab" && msg.type === type &&
+            msg.path === file && matches(msg)) {
           clearTimeout(timeout);
           ws.off("message", listener);
           resolve(msg);
@@ -258,6 +259,88 @@ describe("collaboration room", () => {
     expect((await unchanged).seq).toBe(72);
   });
 
+  it("preserves an independent filesystem edit before projecting live Yjs changes", async () => {
+    const ws = await connect();
+    const doc = await join(ws);
+    const previous = Y.encodeStateVector(doc);
+    doc.getText("content").insert(0, "From Yjs ");
+    const external = "From another editor Start\n";
+    await fs.promises.writeFile(path.join(vaultPath, "test.md"), external);
+    const conflictNotice = waitFor(ws, "error");
+    const saved = waitFor(ws, "saved");
+    ws.send(JSON.stringify({
+      channel: "collab", type: "update", path: "test.md", seq: 90,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc, previous)).toString("base64"),
+    }));
+    const warning = await conflictNotice;
+    expect(warning.error).toMatch(/External disk edit preserved/);
+    expect((await saved).seq).toBe(90);
+    expect(await fs.promises.readFile(path.join(vaultPath, "test.md"), "utf8"))
+      .toBe("From Yjs Start\n");
+    const digest = crypto.createHash("sha256").update(external).digest("hex").slice(0, 16);
+    const recovered = "test (Ignis external conflict " + digest + ").md";
+    expect(await fs.promises.readFile(path.join(vaultPath, recovered), "utf8"))
+      .toBe(external);
+    // An unchanged-state retry must not duplicate or overwrite the recovery.
+    const unchanged = waitFor(ws, "saved");
+    ws.send(JSON.stringify({
+      channel: "collab", type: "update", path: "test.md", seq: 91,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64"),
+    }));
+    expect((await unchanged).seq).toBe(91);
+    const copies = (await fs.promises.readdir(vaultPath))
+      .filter((name) => name.includes("(Ignis external conflict "));
+    expect(copies).toEqual([recovered]);
+  });
+
+  it("does not resurrect an externally deleted live note or acknowledge its unsaved Yjs branch", async () => {
+    const ws = await connect();
+    const doc = await join(ws);
+    const before = Y.encodeStateVector(doc);
+    doc.getText("content").insert(0, "Unsent Yjs ");
+    await fs.promises.unlink(path.join(vaultPath, "test.md"));
+    const failure = waitFor(ws, "save-error");
+    ws.send(JSON.stringify({
+      channel: "collab", type: "update", path: "test.md", seq: 108,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc, before)).toString("base64"),
+    }));
+    const report = await failure;
+    expect(report.error).toMatch(/Yjs content saved/);
+    expect(report.seq).toBe(108);
+    expect(fs.existsSync(path.join(vaultPath, "test.md"))).toBe(false);
+    const expected = "Unsent Yjs Start\n";
+    const digest = crypto.createHash("sha256").update(expected).digest("hex").slice(0, 16);
+    const recovery = "test (Ignis Yjs recovery " + digest + ").md";
+    expect(await fs.promises.readFile(path.join(vaultPath, recovery), "utf8"))
+      .toBe(expected);
+  });
+
+  it("does not follow a symlink substituted for an active note while recovering Yjs", async () => {
+    const ws = await connect();
+    const doc = await join(ws);
+    const initial = Y.encodeStateVector(doc);
+    doc.getText("content").insert(0, "Protected ");
+    const outside = path.join(root, "outside.md");
+    await fs.promises.writeFile(outside, "Never overwrite outside\n");
+    await fs.promises.unlink(path.join(vaultPath, "test.md"));
+    await fs.promises.symlink(outside, path.join(vaultPath, "test.md"));
+    const failure = waitFor(ws, "save-error");
+    ws.send(JSON.stringify({
+      channel: "collab", type: "update", path: "test.md", seq: 109,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc, initial)).toString("base64"),
+    }));
+    const report = await failure;
+    expect(report.error).toContain("Yjs content saved");
+    expect(report.seq).toBe(109);
+    expect(await fs.promises.readFile(outside, "utf8")).toBe("Never overwrite outside\n");
+    expect((await fs.promises.lstat(path.join(vaultPath, "test.md"))).isSymbolicLink())
+      .toBe(true);
+    const recovery = (await fs.promises.readdir(vaultPath))
+      .find((name) => name.includes("(Ignis Yjs recovery "));
+    expect(await fs.promises.readFile(path.join(vaultPath, recovery), "utf8"))
+      .toBe("Protected Start\n");
+  });
+
   it("recovers a Yjs update committed before a crash without reverting to stale Markdown", async () => {
     const room = await manager.openRoom("test", "test.md");
     room.text.insert(0, "Initial saved ");
@@ -304,7 +387,10 @@ describe("collaboration room", () => {
     const aReady = waitFor(alice, "init");
     alice.send(JSON.stringify({ channel: "collab", type: "join", path: "test.md", name: "Alice" }));
     const aInfo = await aReady;
-    const aPresence = waitFor(alice, "presence");
+    // The initial one-person presence may still be in the socket queue.
+    // Wait for the actual two-person state, not merely the next frame.
+    const aPresence = waitFor(alice, "presence", "test.md",
+      (msg) => msg.people.length === 2);
     const bReady = waitFor(bob, "init");
     bob.send(JSON.stringify({ channel: "collab", type: "join", path: "test.md", name: "Bob" }));
     const bInfo = await bReady;
