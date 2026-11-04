@@ -368,15 +368,108 @@ function createCollaborationManager({
     }
   }
 
+  async function saveRecoveryCopy(room, bytes, label) {
+    const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+    const ext = path.extname(room.filePath);
+    const stem = path.basename(room.filePath, ext);
+    const candidate = path.join(path.dirname(room.filePath),
+      stem + " (Ignis " + label + " " + digest.slice(0, 16) + ")" + ext);
+    const existing = await fs.promises.readFile(candidate).catch((e) => {
+      if (e.code === "ENOENT") return null;
+      throw e;
+    });
+    if (existing && !existing.equals(bytes)) {
+      throw new Error("External conflict recovery path is occupied");
+    }
+    if (!existing) {
+      let recovery;
+      try {
+        recovery = await fs.promises.open(candidate, "wx", 0o600);
+        await recovery.writeFile(bytes);
+        await recovery.sync();
+        await recovery.close();
+        recovery = null;
+        const parent = await fs.promises.open(path.dirname(candidate), "r");
+        try { await parent.sync(); } finally { await parent.close(); }
+      } catch (e) {
+        throw new Error("Could not durably save recovery before Yjs projection", { cause: e });
+      } finally {
+        await recovery?.close().catch(() => {});
+      }
+    }
+    return path.basename(candidate);
+  }
+
+  async function recoverExternalProjection(room, desiredContent, desiredDigest) {
+    // The last acknowledged projection is the common ancestor between CRDT
+    // and filesystem editors. Neither branch may erase an independent edit.
+    let parent = getVaultPath(room.vaultId);
+    for (const segment of room.path.split("/").slice(0, -1)) {
+      parent = path.join(parent, segment);
+      const state = await fs.promises.lstat(parent);
+      if (!state.isDirectory() || state.isSymbolicLink()) {
+        throw new Error("Collaborative note's parent is no longer a regular directory");
+      }
+    }
+    // Do not follow a replaced final-path symlink or block forever opening a
+    // FIFO which another process substituted after the room was initialized.
+    const handle = await fs.promises.open(room.filePath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) |
+        (fs.constants.O_NONBLOCK || 0)).catch((e) => {
+      if (e.code === "ENOENT" || e.code === "ELOOP") return null;
+      throw e;
+    });
+    let disk = null;
+    if (handle) {
+      try {
+        const before = await handle.stat({ bigint: true });
+        if (before.isFile() && before.size <= BigInt(MAX_NOTE_BYTES)) {
+          disk = await handle.readFile();
+          const after = await handle.stat({ bigint: true });
+          if (after.size !== before.size || after.mtimeNs !== before.mtimeNs ||
+              after.ctimeNs !== before.ctimeNs || disk.length !== Number(before.size)) {
+            throw new Error("Collaborative note changed during verification");
+          }
+        }
+      } finally {
+        await handle.close();
+      }
+    }
+    if (!disk) {
+      // A deleted or replaced on-disk note cannot be silently resurrected.
+      // Retain the unsaved live Yjs branch as a visible recovery note instead.
+      const copy = await saveRecoveryCopy(
+        room, Buffer.from(desiredContent, "utf8"), "Yjs recovery"
+      );
+      const error = new Error(
+        "Canonical note was removed or replaced; Yjs content saved as " + copy
+      );
+      error.code = "EXTERNAL_NOTE_REPLACED";
+      // Only the recovery basename is intentionally disclosed to the client.
+      // Never serialize arbitrary filesystem error.message values.
+      error.clientMessage = "Canonical note replaced; Yjs content saved as " + copy;
+      throw error;
+    }
+    const diskDigest = crypto.createHash("sha256").update(disk).digest("hex");
+    if (diskDigest === room.projectedDigest || diskDigest === desiredDigest) {
+      return;
+    }
+    // A hash-named conflict sibling is discoverable by ordinary Vault sync.
+    const copy = await saveRecoveryCopy(room, disk, "external conflict");
+    return "External disk edit preserved as " + copy;
+  }
+
   async function persist(room) {
     // Only acknowledge updates included in this exact on-disk snapshot.
     const acknowledgements = room.acks.splice(0);
     const bytes = Buffer.from(Y.encodeStateAsUpdate(room.doc));
     const content = room.text.toString();
     const digest = crypto.createHash("sha256").update(content).digest("hex");
+    let recoveryNotice = null;
 
     try {
       await fs.promises.mkdir(stateDir, { recursive: true });
+      recoveryNotice = await recoverExternalProjection(room, content, digest);
       await atomicReplace(room.statePath, bytes);
       const writeCanonical = () => atomicReplace(room.filePath, content);
 
@@ -390,6 +483,7 @@ function createCollaborationManager({
       // Yjs state that survived a crash from a deliberate external file edit.
       const marker = `${room.statePath}.baseline.json`;
       await atomicReplace(marker, JSON.stringify({ digest, documentId: room.documentId }));
+      room.projectedDigest = digest;
 
       // The Sync journal and the collaborative Yjs state share the same
       // generation and durable commit boundary. No editor receives "saved"
@@ -402,10 +496,16 @@ function createCollaborationManager({
       for (const { ws, seq } of acknowledgements) {
         send(ws, "saved", { path: room.path, seq });
       }
+      if (recoveryNotice) broadcast(room, "error", { error: recoveryNotice });
     } catch (error) {
       for (const { ws, seq } of acknowledgements) {
-        send(ws, "save-error", { path: room.path, seq });
+        send(ws, "save-error", {
+          path: room.path, seq,
+          ...(error.code === "EXTERNAL_NOTE_REPLACED" ?
+            { error: error.clientMessage } : {})
+        });
       }
+      if (recoveryNotice) broadcast(room, "error", { error: recoveryNotice });
 
       throw error;
     }
@@ -528,6 +628,7 @@ function createCollaborationManager({
         filePath,
         statePath,
         documentId,
+        projectedDigest: diskDigest,
         doc,
         text,
         members: new Set(),
