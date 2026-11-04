@@ -16,7 +16,7 @@
 | Independent peer Yjs update | PASS. Local and remote edits merged and the real Obsidian editor converged |
 | Native Vault file persistence | PASS. File contents on disk matched both edits |
 | Native Cmd-Z / Shift-Cmd-Z | INCONCLUSIVE. The automated key event did not reach a focused editor; no Undo failure is claimed |
-| Native authenticated HTTPS/WSS session | NOT VERIFIED in the Obsidian application. The standalone isolated HTTP/WSS integration test passed |
+| Native authenticated HTTPS/WSS session | NOT VERIFIED in the Obsidian application. The standalone isolated localhost HTTP/WS protocol test passed |
 | Restart into downloaded Obsidian 1.15.0 | INCONCLUSIVE. The isolated relaunch did not expose a responsive renderer via its local test debug port |
 | Obsidian 1.10.6 SecretStorage | ABSENT; Connector fell back to in-memory token and requires re-entry after restart |
 
@@ -31,6 +31,6 @@ The test APFS volume is case-insensitive: CaseNote.md and casenote.md resolve to
 - 969 tests passing across 97 test files (Vitest).
 - Connector TypeScript typecheck and build passed.
 - Oxlint and server error-leak checks passed.
-- Isolated HTTP/WSS Sync smoke passed, covering concurrent peer Yjs convergence, durable ACK, operation retries, per-device credential revocation, binary attachments, and server restart.
+- Isolated localhost HTTP/WS Sync smoke passed, covering concurrent peer Yjs convergence, durable ACK, operation retries, per-device credential revocation, binary attachments, and server restart.
 
 Remaining validation: real macOS keyboard Undo/Redo and Japanese IME, real native authenticated transport, full app restart/reconnect on a stable Obsidian build, and iOS hardware testing.
