@@ -5,8 +5,10 @@ native Obsidian desktop and mobile. The ordinary Obsidian Connector supports
 closed Markdown file synchronization **and an experimental native CodeMirror 6
 Yjs live-editing binding** using the existing Ignis collaboration rooms.
 Small binary attachments (up to 4 MiB per file) use the same conditional
-operations and durable journal. Resumable large-file upload, automatic
-deletion propagation and empty-folder synchronization are not implemented.
+operations and durable journal. Verified remote deletions can optionally
+move unchanged local files into recoverable Obsidian trash; this is disabled
+by default. Resumable large-file upload and empty-folder synchronization
+are not implemented.
 
 ## Architecture
 
@@ -156,11 +158,35 @@ retained locally and reported as needing review, not silently skipped as
 fully synced. The HTTP file download independently enforces the 4 MiB bound
 before allocating a response. It reads a size-verified regular-file handle,
 not a final-path symlink, and refuses stale file content.
+The Sync API has its own 6 MiB JSON parser ceiling, applied before Ignis's
+legacy global parser, including requests with chunked transfer encoding.
+This bounds server memory consumption even when the legacy API permits
+larger request bodies.
 
 The Connector keeps local user text in the ordinary Obsidian Vault and records
-observed pending rename/delete operations in plugin data. It never infers a
-deletion simply from an absent file; first-sync collisions and concurrent
-edits require review. Open native Markdown editors are **never overwritten by
+observed pending rename/delete operations in plugin data. Create and modify
+requests are also staged with their exact immutable payload and opId **before
+network transmission**. If an HTTP response is lost, the client queries the
+server's durable operation receipt and either acknowledges the original
+request or retries exactly the same bytes. A changed local file cannot cause
+a different request to be replayed under the old opId. These staged payloads
+are bounded to 4 MiB per file but can increase plugin data size; larger
+Vaults need an IndexedDB-backed outbound queue.
+
+The Connector never infers a deletion simply from an absent file.
+It reads the contiguous server change journal, including pagination, before
+advancing its synchronization cursor. An optional setting can move a local
+file to Obsidian's recoverable .trash only when the journal contains a
+matching deletion tombstone for the same fileId and generationId, and the
+local SHA-256 still equals its last confirmed baseline. The .trash folder,
+Obsidian settings and Ignis temporary files are excluded from synchronization
+even with different capitalization. Without explicit opt-in, remote deletion
+remains a review item and the local file stays untouched.
+
+First-sync collisions and concurrent edits require review. The "Review Ignis
+sync issues" command displays persistent file-specific reasons and lets the
+user open existing local notes without inventing missing files. Open native
+Markdown editors are **never overwritten by
 the whole-file REST sync**. Instead, they join the existing Yjs collaboration
 channel, using a shared Y.Doc and CodeMirror 6 compartment that only activates
 when the native editor and the established document state match.
@@ -179,6 +205,9 @@ is recreated under the same path with a new document ID, old offline Yjs
 updates are not transmitted to it. IME composition defers incoming Yjs
 updates until the native editor has committed the composition transaction;
 the Yjs UndoManager tracks local operations, not remote author changes.
+The deferred IME update queue is capped at 4 MiB: exceeding that limit
+blocks the room and preserves the native draft rather than exhausting
+mobile WebView memory or applying a partial remote history.
 
 The current native binding has no remote-selection overlay. Existing Ignis
 browser collaboration remains unchanged and interoperates through the same
@@ -198,6 +227,9 @@ replays in the original order with stable fileId, generationId, baseHash and
 per-operation opId, even after restart. A mismatched operation receipt cannot
 consume another pending transition. Untracked collaborative moves are not
 silently uploaded as unrelated replacement files.
+All plugin settings writes are serialized in FIFO order with immutable
+snapshots. A slower earlier Obsidian saveData call therefore cannot overwrite
+a newer queued operation, even if the earlier write fails.
 
 Mobile WebViews may suspend without firing WebSocket close. On
 visibilitychange (return to visible), pageshow or an online network event,
@@ -240,9 +272,11 @@ bundle for desktop and mobile, with no Node-only networking path.
 
 The smoke script creates an isolated temporary Vault and Ignis process,
 checks REST auth, manifest and cursor behavior, WSS notifications,
-collaborative edits and their durable journal ACK, binary create/download/
+two concurrent Yjs clients and their convergent edits, collaborative edits
+and their durable journal ACK, binary create/download/
 modify, chained offline rename/delete operations, bounded downloads, duplicate
-operation retries, stale-write refusal, per-device Vault scope, server
+operation retries, durable lost-response receipt lookup, stale-write refusal,
+per-device Vault scope, server
 restart, individual device revocation with immediate WSS closure and
 another device's continued access,
 then cleans up.
@@ -254,8 +288,9 @@ No installed Ignis process is stopped or modified.
    especially Japanese IME, native background suspension and Undo in
    multiple editor panes. Automated CM6/IndexedDB tests are not a substitute.
    Harden active-room cross-device renames and path transitions.
-2. Replace the shared preview token with per-device pairing and revocation.
-3. Incremental journal capture, recovery UI, and out-of-band rename
+2. Add user-friendly device approval and pairing UI, plus complete
+   authentication for existing browser file APIs and collaboration channels.
+3. Incremental journal capture, richer conflict-resolution UI, and out-of-band rename
    recognition for files without collaborative identity.
 4. Resumable content-addressed binary attachments exceeding 4 MiB, with
    streaming IO and tighter iOS memory budgets.
