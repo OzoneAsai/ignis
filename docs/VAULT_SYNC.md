@@ -4,8 +4,9 @@ The existing Ignis HTTP server now supports a single HTTPS/WSS sync path for
 native Obsidian desktop and mobile. The ordinary Obsidian Connector supports
 closed Markdown file synchronization **and an experimental native CodeMirror 6
 Yjs live-editing binding** using the existing Ignis collaboration rooms.
-Binary files, automatic deletion propagation and complete folder operations
-are not implemented.
+Small binary attachments (up to 4 MiB per file) use the same conditional
+operations and durable journal. Resumable large-file upload, automatic
+deletion propagation and empty-folder synchronization are not implemented.
 
 ## Architecture
 
@@ -83,8 +84,15 @@ deleting and recreating produces new IDs.
 The initial implementation scans the Vault at manifest/change requests and
 after debounced watcher events. Full scans are appropriate for small test
 Vaults; incremental indexing is still needed before large-Vault production.
-External filesystem renames can currently appear as delete/create. Existing
-browser Yjs rooms still use paths, so this migration remains incomplete.
+The Sync generationId and the Yjs documentId now refer to **one generation**.
+Brand-new Yjs rooms inherit the indexed Vault generation; established Yjs
+histories take precedence over old file-only metadata during migration.
+A durable Yjs save also advances the same Vault change journal *before* the
+server acknowledges the editor. A rename with a unique persisted Yjs history
+is recognized as a rename in a later filesystem scan, preserving fileId and
+generationId. Files without stable historical evidence may still appear as
+delete/create after an out-of-band move. Live Yjs rooms are still located by
+path, so concurrent folder-move and live-editor safety needs further work.
 
 The server checks the supplied generation and previous content hash before
 accepting changes. Collaborative notes with existing Yjs histories reject
@@ -92,6 +100,16 @@ whole-file updates. Writes use synced temporary files and atomic replacement,
 followed by SQLite commit before an ACK. A crash between file replacement
 and journal commit appears as an unacknowledged external modification during
 recovery, not as a falsely acknowledged operation.
+
+Small images, PDFs and other non-Markdown attachments use the same create
+and modify operation receipts with the binary payload in a canonical
+contentBase64 field. The server rejects a binary payload for .md files and
+enforces a 4 MiB decoded limit. Its create operation can safely establish
+missing parent folders while refusing symlinked parents. This is a
+deliberately bounded, memory-resident *preview* of binary synchronization,
+not the eventual streamed content-addressed blob protocol. Large files are
+retained locally and reported as needing review, not silently skipped as
+fully synced.
 
 The Connector keeps local user text in the ordinary Obsidian Vault and records
 observed pending rename/delete operations in plugin data. It never infers a
@@ -101,8 +119,11 @@ the whole-file REST sync**. Instead, they join the existing Yjs collaboration
 channel, using a shared Y.Doc and CodeMirror 6 compartment that only activates
 when the native editor and the established document state match.
 
-Local Yjs state is also stored in IndexedDB, scoped to the origin, Vault,
-path and the server collaboration document ID. The client sends its full Yjs
+Local Yjs state is also stored in IndexedDB, scoped to the origin, Vault and
+immutable document generation, **not the mutable path**. Earlier path-based
+v1 caches are merged once into the generation-scoped v2 cache when a known
+note is opened. This preserves offline CRDT edits across ordinary renames.
+The client sends its full Yjs
 state on reconnect; the server acknowledges only after persisting its merged
 CRDT state and Markdown projection. Native Obsidian save events continue to
 persist the local Vault file. IndexedDB may be evicted on iOS, so a changed
@@ -115,9 +136,11 @@ the Yjs UndoManager tracks local operations, not remote author changes.
 
 The current native binding has no remote-selection overlay. Existing Ignis
 browser collaboration remains unchanged and interoperates through the same
-Yjs room wire format. Note: the Sync file registry's fileId/generationId and
-the older path-indexed Yjs documentId are **not yet unified**. Rename/delete
-of an actively collaborative note still follows existing server constraints.
+Yjs room wire format. Sync and Yjs now share generation identity; fileId
+remains the stable entity ID across moves. An actively joined collaborative
+note cannot be renamed/deleted by the old server APIs until the room is
+released. The Connector keeps unsent rename operations pending until it
+receives a server ACK, then rejoins the new room path.
 
 The configured HTTPS origin and Vault ID form a persistent client state
 scope. Access tokens are stored under this scope in Obsidian SecretStorage.
@@ -127,7 +150,8 @@ is not silently thrown away. Tokens from the earlier unscoped preview
 must be entered again.
 
 Hidden Obsidian settings and plugin state are excluded, and iOS background
-execution is not promised. Current file sync is Markdown-only.
+execution is not promised. The Connector is built from a single JavaScript
+bundle for desktop and mobile, with no Node-only networking path.
 
 ## Validation
 
@@ -138,8 +162,10 @@ execution is not promised. Current file sync is Markdown-only.
     node scripts/sync-smoke.mjs
 
 The smoke script creates an isolated temporary Vault and Ignis process,
-checks REST auth, manifest and cursor behavior, WSS notifications, duplicate
-operation retries, stale-write refusal and server restart, then cleans up.
+checks REST auth, manifest and cursor behavior, WSS notifications,
+collaborative edits and their durable journal ACK, binary create/download/
+modify, duplicate operation retries, stale-write refusal and server restart,
+then cleans up.
 No installed Ignis process is stopped or modified.
 
 ## Next milestones
@@ -147,8 +173,10 @@ No installed Ignis process is stopped or modified.
 1. Verify the native CodeMirror 6 / Yjs binding on **real iOS hardware**,
    especially Japanese IME, native background suspension and Undo in
    multiple editor panes. Automated CM6/IndexedDB tests are not a substitute.
-   Link stable fileId and Yjs room generation for safe cross-device moves.
+   Harden active-room cross-device renames and path transitions.
 2. Replace the shared preview token with per-device pairing and revocation.
-3. Incremental journal capture, external rename reconciliation, recovery UI.
-4. Content-addressed resumable binary attachments and bounded iOS memory use.
+3. Incremental journal capture, recovery UI, and out-of-band rename
+   recognition for files without collaborative identity.
+4. Resumable content-addressed binary attachments exceeding 4 MiB, with
+   streaming IO and tighter iOS memory budgets.
 5. Real iOS lifecycle, initial migration, Unicode/case and crash-injection tests.
