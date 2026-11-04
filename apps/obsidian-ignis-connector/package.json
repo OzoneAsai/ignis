@@ -4,6 +4,17 @@
   "private": true,
   "description": "Experimental mobile-compatible native Obsidian client for the Ignis Vault Sync server",
   "scripts": {
-    "build": "node esbuild.config.mjs"
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "y-codemirror.next": "^0.3.6"
+  },
+  "devDependencies": {
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.13",
+    "jsdom": "^27.4.0",
+    "obsidian": "^1.14.4",
+    "typescript": "^5.9.3"
   }
 }
