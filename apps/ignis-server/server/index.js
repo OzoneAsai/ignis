@@ -256,6 +256,10 @@ collaboration.register({
   getVaultPath: config.getVaultPath,
   dataRoot: config.dataRoot,
   writeCoalescer,
+  resolveDocumentId: syncStore ? (vaultId, relPath, historicId) =>
+    syncStore.ensureDocumentId(vaultId, relPath, historicId) : undefined,
+  onPersist: syncStore ? (vaultId, relPath, documentId, digest, byteLength) =>
+    syncStore.recordCollaborationSave(vaultId, relPath, documentId, digest, byteLength) : undefined,
 });
 if (syncStore) {
   registerSyncChannel(wss, syncStore, syncToken);
