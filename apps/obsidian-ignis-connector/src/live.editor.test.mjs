@@ -25,10 +25,11 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
 async function mount() {
   const sent = [], notifications = [], ids = {};
+  let currentPath = "test.md";
   const manager = new NativeYjs({
     vaultId: () => "lab",
     origin: () => "https://example.test/" + crypto.randomUUID(),
-    pathForView: () => "test.md",
+    pathForView: () => currentPath,
     knownId: (path) => ids[path] || null,
     rememberId: async (path, id) => { ids[path] = id; },
     send: (message) => sent.push(message),
@@ -52,10 +53,41 @@ async function mount() {
     state: encodeYjs(Y.encodeStateAsUpdate(server))
   });
   await tick();
-  return { manager, editor, sent, notifications, server };
+  return {
+    manager, editor, sent, notifications, server,
+    renamePath(to) {
+      const from = currentPath;
+      currentPath = to;
+      manager.relocate(from, to);
+      editor.dispatch({});
+    }
+  };
 }
 
 describe("real CodeMirror 6 native binding", () => {
+  it("keeps the same bound CM6 Y.Doc through a native file rename", async () => {
+    const { manager, editor, sent, server, renamePath } = await mount();
+    editor.dispatch({ changes: { from: 7, insert: " offline" } });
+    const local = sent.filter((m) => m.type === "update").at(-1);
+    Y.applyUpdate(server, decodeYjs(local.update));
+    const doc = manager.rooms.get("test.md").doc;
+    renamePath("renamed.md");
+    expect(manager.rooms.has("test.md")).toBe(false);
+    expect(manager.rooms.get("renamed.md").doc).toBe(doc);
+    expect(editor.state.facet(ySyncFacet).ytext.doc).toBe(doc);
+    manager.rejoinPath("renamed.md");
+    expect(sent.some((m) => m.type === "join" && m.path === "renamed.md"))
+      .toBe(true);
+    await manager.handle({
+      channel: "collab", type: "init", path: "renamed.md", documentId: ID,
+      state: encodeYjs(Y.encodeStateAsUpdate(server))
+    });
+    editor.dispatch({ changes: { from: editor.state.doc.length, insert: " again" } });
+    expect(editor.state.doc.toString()).toBe("Initial offline again");
+    expect(sent.filter((m) => m.type === "update").at(-1).path).toBe("renamed.md");
+    server.destroy();
+  });
+
   it("rehydrates a renamed offline Yjs history by generation before merging remote text", async () => {
     const origin = "https://example.test/offline-" + crypto.randomUUID();
     const server = new Y.Doc();
