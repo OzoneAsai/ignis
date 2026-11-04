@@ -39,6 +39,16 @@ afterEach(() => {
 });
 
 describe("one durable Vault change journal", () => {
+  it("returns a durable operation receipt after a lost HTTP acknowledgement", async () => {
+    const { store } = testStore();
+    const op = { type: "create", path: "lost-ack.md",
+      content: "survives", opId: "lost-ack-0001" };
+    expect(store.operationReceipt("vault", op.opId)).toBe(null);
+    const result = await store.apply("vault", op);
+    expect(store.operationReceipt("vault", op.opId)).toEqual(result);
+    expect(store.operationReceipt("vault", "never-sent-0001")).toBe(null);
+    expect(() => store.operationReceipt("vault", "../bad")).toThrow();
+  });
   it("refuses a huge server download before allocating the response in memory", async () => {
     const { store, vault } = testStore();
     fs.writeFileSync(path.join(vault, "huge.bin"), Buffer.alloc(4 * 1024 * 1024 + 1));
@@ -204,6 +214,59 @@ describe("one durable Vault change journal", () => {
     expect(reopened.head("vault")).toBe(2);
   });
 
+  it("renames into a new nested folder while preserving file ID and generation", async () => {
+    const { store, vault } = testStore();
+    fs.writeFileSync(path.join(vault, "note.md"), "contents");
+    const original = (await store.scan("vault")).files[0];
+    const event = await store.apply("vault", {
+      type: "rename", path: "note.md", toPath: "Archive/2026/note.md",
+      opId: "rename-nested-0001", fileId: original.fileId,
+      generationId: original.generationId, baseHash: original.hash
+    });
+    expect(event.fileId).toBe(original.fileId);
+    expect(event.generationId).toBe(original.generationId);
+    expect(event.toPath).toBe("Archive/2026/note.md");
+    expect(fs.readFileSync(path.join(vault, "Archive/2026/note.md"), "utf8"))
+      .toBe("contents");
+    expect(store.manifest("vault").files).toMatchObject([{
+      path: "Archive/2026/note.md", fileId: original.fileId,
+      generationId: original.generationId
+    }]);
+    expect(await store.apply("vault", {
+      type: "rename", path: "note.md", toPath: "Archive/2026/note.md",
+      opId: "rename-nested-0001", fileId: original.fileId,
+      generationId: original.generationId, baseHash: original.hash
+    })).toEqual(event);
+  });
+
+  it("refuses modify, delete and rename when another writer saves after the Vault scan", async () => {
+    for (const type of ["modify", "delete", "rename"]) {
+      const { store, vault } = testStore();
+      const absolute = path.join(vault, "racing.md");
+      fs.writeFileSync(absolute, "original");
+      const [file] = (await store.scan("vault")).files;
+      let flushes = 0;
+      store.writeCoalescer.flushPending = async (target) => {
+        if (target === absolute && ++flushes === 2) {
+          fs.writeFileSync(absolute, "a newer edit");
+        }
+      };
+      await expect(store.apply("vault", {
+        type, path: "racing.md", fileId: file.fileId,
+        generationId: file.generationId, baseHash: file.hash,
+        opId: "race-" + type + "-0001",
+        ...(type === "modify" ? { content: "stale replacement" } : {}),
+        ...(type === "rename" ? { toPath: "Archive/racing.md" } : {})
+      })).rejects.toMatchObject({ code: "BASE_MISMATCH" });
+      expect(fs.readFileSync(absolute, "utf8")).toBe("a newer edit");
+      expect(fs.existsSync(path.join(vault, "Archive/racing.md"))).toBe(false);
+      const scanned = await store.scan("vault");
+      expect(scanned.files[0].fileId).toBe(file.fileId);
+      expect(scanned.files[0].hash).not.toBe(file.hash);
+      expect(store.operationReceipt("vault", "race-" + type + "-0001")).toBe(null);
+    }
+  });
+
   it("rejects stale writes and deduplicates opId without losing data", async () => {
     const { store, vault } = testStore();
     const op = { type: "create", path: "x.md", content: "", opId: "create-0001" };
@@ -251,6 +314,10 @@ describe("one durable Vault change journal", () => {
     fs.writeFileSync(path.join(vault, ".obsidian", "workspace.json"), "secret");
     expect((await store.scan("vault")).files).toEqual([]);
     expect(permittedPath(".obsidian/plugins/x")).toBe(false);
+    expect(permittedPath(".trash/deleted-note.md")).toBe(false);
+    expect(permittedPath(".Trash/deleted-note.md")).toBe(false);
+    expect(permittedPath(".OBSIDIAN/plugins/settings.json")).toBe(false);
+    expect(permittedPath(".IGNIS-SYNC-TMP-evil")).toBe(false);
     fs.mkdirSync(path.join(root, "outside"));
     fs.symlinkSync(path.join(root, "outside"), path.join(vault, "link"));
     await expect(store.apply("vault", {
