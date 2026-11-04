@@ -39,6 +39,30 @@ afterEach(() => {
 });
 
 describe("one durable Vault change journal", () => {
+  it("preserves file identity during a case-only rename on case-insensitive macOS volumes", async () => {
+    const { store, vault } = testStore();
+    const source = path.join(vault, "CaseNote.md");
+    const destination = path.join(vault, "casenote.md");
+    fs.writeFileSync(source, "Mac file identity");
+    const sourceStat = fs.statSync(source);
+    const destinationStat = fs.statSync(destination, { throwIfNoEntry: false });
+    if (!destinationStat || sourceStat.ino !== destinationStat.ino ||
+        sourceStat.dev !== destinationStat.dev) return;
+    const [original] = (await store.scan("vault")).files;
+    const result = await store.apply("vault", {
+      type: "rename", path: "CaseNote.md", toPath: "casenote.md",
+      fileId: original.fileId, generationId: original.generationId,
+      baseHash: original.hash, opId: "mac-case-rename-001"
+    });
+    expect(result.fileId).toBe(original.fileId);
+    expect(result.generationId).toBe(original.generationId);
+    expect((await store.scan("vault")).files).toMatchObject([{
+      fileId: original.fileId, generationId: original.generationId,
+      path: "casenote.md"
+    }]);
+    expect(fs.readdirSync(vault)).toContain("casenote.md");
+    expect(fs.readdirSync(vault)).not.toContain("CaseNote.md");
+  });
   it("returns a durable operation receipt after a lost HTTP acknowledgement", async () => {
     const { store } = testStore();
     const op = { type: "create", path: "lost-ack.md",
