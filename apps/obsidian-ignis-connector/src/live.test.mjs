@@ -6,16 +6,20 @@ import { NativeYjs, encodeYjs, decodeYjs } from "./live.ts";
 
 function makeView(path, value) {
   let content = value;
+  let currentPath = path;
   const view = {
     dom: { isConnected: false },
     composing: false,
     state: {
-      field: () => ({ file: { path } }),
+      field: () => ({ file: { path: currentPath } }),
       doc: { toString: () => content }
     },
     dispatch: () => {}
   };
-  return { view, set(value) { content = value; } };
+  return {
+    view, set(value) { content = value; },
+    setPath(next) { currentPath = next; }
+  };
 }
 
 function serverInit(path, id, text) {
@@ -155,6 +159,33 @@ describe("Native Obsidian offline Yjs bridge", () => {
     s.manager.setComposing(s.view.view, false);
     expect(room.text.toString()).toBe("日本語Initial");
     remote.destroy();
+  });
+  it("carries an offline CRDT generation across a native file rename", async () => {
+    const s = harness();
+    s.manager.connected();
+    const initialServerState = serverInit("test.md", ID, "Initial");
+    await s.manager.handle(initialServerState);
+    const room = s.manager.rooms.get("test.md");
+    s.manager.disconnected();
+    room.text.insert(room.text.length, " draft");
+    s.view.set("Initial draft");
+    s.view.setPath("moved.md");
+    expect(s.manager.relocate("test.md", "moved.md")).toBe(true);
+    expect(s.manager.rooms.get("moved.md")).toBe(room);
+    expect(s.manager.rooms.has("test.md")).toBe(false);
+    expect(room.text.toString()).toBe("Initial draft");
+    const oldUpdateCount = s.sent.filter((m) => m.type === "update").length;
+    s.manager.connected();
+    // A rename relocates the *same* Yjs history, not a separately initialized
+    // Y.Doc with an unrelated client ID.
+    await s.manager.handle({ ...initialServerState, path: "moved.md" });
+    expect(room.joined).toBe(true);
+    expect(room.blocked).toBe(false);
+    expect(s.sent.filter((m) => m.type === "update")).toHaveLength(oldUpdateCount + 1);
+    const merged = new Y.Doc();
+    Y.applyUpdate(merged, decodeYjs(s.sent.at(-1).update));
+    expect(merged.getText("content").toString()).toBe("Initial draft");
+    merged.destroy();
   });
   it("sends an initial full-state ACK only after composition is committed", async () => {
     const s = harness();
