@@ -11,6 +11,7 @@ const MAX_UPDATE_BYTES = 1024 * 1024;
 const MAX_NOTE_BYTES = 4 * 1024 * 1024;
 const SAVE_DELAY_MS = 120;
 const MAX_CURSOR_BYTES = 512;
+const DOCUMENT_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const CURSOR_COLORS = [
   "#ee6b72", "#59baf2", "#e3ad54", "#ac8cf2",
   "#5ecc9b", "#f288c9", "#6dcacc", "#ef9862",
@@ -131,7 +132,10 @@ async function atomicReplace(target, content) {
   }
 }
 
-function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalescer }) {
+function createCollaborationManager({
+  wss, getVaultPath, dataRoot, writeCoalescer,
+  resolveDocumentId, onPersist
+}) {
   const rooms = new Map();
   const loading = new Map();
   const mutations = new Set();
@@ -153,6 +157,20 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
     // Without a tombstone, its ordinary queued whole-file autosave could
     // overwrite the replacement before generation IDs can be compared.
     return `${statePathFor(vaultId, relPath)}.protected`;
+  }
+
+  function peekDocumentId(vaultId, relPath) {
+    const normalized = normalizeNotePath(relPath);
+    if (!normalized) return null;
+    const current = rooms.get(idFor(vaultId, normalized));
+    if (current) return current.documentId;
+    // A tombstone or lone marker is not a valid Yjs history.
+    const state = statePathFor(vaultId, normalized);
+    if (!fs.existsSync(state)) return null;
+    try {
+      const marker = JSON.parse(fs.readFileSync(state + ".baseline.json", "utf8"));
+      return DOCUMENT_ID_PATTERN.test(marker?.documentId) ? marker.documentId : null;
+    } catch { return null; }
   }
 
   function operationConflict() {
@@ -373,6 +391,14 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
       const marker = `${room.statePath}.baseline.json`;
       await atomicReplace(marker, JSON.stringify({ digest, documentId: room.documentId }));
 
+      // The Sync journal and the collaborative Yjs state share the same
+      // generation and durable commit boundary. No editor receives "saved"
+      // until both the canonical file and its journal position are durable.
+      await onPersist?.(
+        room.vaultId, room.path, room.documentId,
+        digest, Buffer.byteLength(content, "utf8")
+      );
+
       for (const { ws, seq } of acknowledgements) {
         send(ws, "saved", { path: room.path, seq });
       }
@@ -459,10 +485,12 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
       });
       // A marker without its matching Yjs state is NOT proof that a newly
       // recreated file still belongs to the preceding document generation.
-      const documentId = saved && typeof marker?.documentId === "string" &&
-        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(marker.documentId)
+      const historicDocumentId = saved && DOCUMENT_ID_PATTERN.test(marker?.documentId)
         ? marker.documentId
-        : crypto.randomUUID();
+        : null;
+      const documentId = await resolveDocumentId?.(
+        vaultId, relPath, historicDocumentId
+      ) || historicDocumentId || crypto.randomUUID();
       let needsBaseline = !saved || documentId !== marker?.documentId;
 
       if (saved) {
@@ -729,6 +757,7 @@ function createCollaborationManager({ wss, getVaultPath, dataRoot, writeCoalesce
   });
 
   return {
+    peekDocumentId,
     renameNote,
     deleteNote,
     assertSafeSubtree,
@@ -768,6 +797,10 @@ function register(opts) {
 
 function getActive(vaultId, notePath) {
   return manager?.getActive(vaultId, notePath) || null;
+}
+
+function peekDocumentId(vaultId, notePath) {
+  return manager?.peekDocumentId(vaultId, notePath) || null;
 }
 
 function isCollaborative(vaultId, notePath) {
@@ -810,6 +843,7 @@ module.exports = {
   createCollaborationManager,
   register,
   getActive,
+  peekDocumentId,
   isCollaborative,
   flushAll,
   renameNote,
