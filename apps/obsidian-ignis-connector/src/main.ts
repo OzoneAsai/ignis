@@ -1,6 +1,7 @@
 import {
-  Plugin, PluginSettingTab, Setting, Notice, TFile, requestUrl
+  Plugin, PluginSettingTab, Setting, Notice, TFile, editorInfoField, requestUrl
 } from "obsidian";
+import { NativeYjs } from "./live";
 
 // The same Web APIs and Obsidian Vault APIs run on macOS, Windows, Linux,
 // Android and iOS. Never import Node/Electron into this plugin bundle.
@@ -27,6 +28,15 @@ type Settings = {
   cursor: number;
   baselines: Record<string, Base>;
   pending: Pending[];
+  yjsIds: Record<string, string>;
+  scope: string;
+  archivedScopes: Array<{
+    scope: string;
+    cursor: number;
+    baselines: Record<string, Base>;
+    pending: Pending[];
+    yjsIds: Record<string, string>;
+  }>;
 };
 type RemoteFile = Base & { path: string; size: number };
 type Manifest = { vaultId: string; vaultSeq: number; files: RemoteFile[] };
@@ -43,7 +53,8 @@ type OperationResult = {
 
 const DEFAULT: Settings = {
   serverUrl: "", discoveryUrl: "", serverDeviceId: "", vaultId: "",
-  cursor: 0, baselines: {}, pending: []
+  cursor: 0, baselines: {}, pending: [], yjsIds: {},
+  scope: "", archivedScopes: []
 };
 const SECRET_PREFIX = "ignis-connector-vault-";
 const MAX_TEXT_BYTES = 4 * 1024 * 1024;
@@ -90,7 +101,7 @@ async function discover(discoveryUrl: string, serverDeviceId: string): Promise<s
 }
 
 export default class IgnisConnector extends Plugin {
-  settings!: Settings;
+  declare settings: Settings;
   private token = "";
   private socket: WebSocket | null = null;
   private syncing = false;
@@ -99,14 +110,45 @@ export default class IgnisConnector extends Plugin {
   private status!: HTMLElement;
   private timer: number | null = null;
   private lastError = "";
+  private live!: NativeYjs;
+  private reconnectTimer: number | null = null;
+  private stopped = false;
+  private needsReload = false;
 
   async onload() {
     const saved = (await this.loadData()) as Partial<Settings> | null;
     this.settings = {
       ...DEFAULT, ...saved,
       baselines: saved?.baselines || {},
-      pending: saved?.pending || []
+      pending: saved?.pending || [],
+      yjsIds: saved?.yjsIds || {},
+      archivedScopes: saved?.archivedScopes || []
     };
+    if (!this.settings.scope && this.settings.serverUrl && this.settings.vaultId) {
+      try { this.settings.scope = this.currentScope(); } catch { /* unconfigured */ }
+    }
+    // Obsidian's editor is CodeMirror 6 on desktop and mobile. The Yjs
+    // extension is inert until the per-file identity and native text agree.
+    this.live = new NativeYjs({
+      vaultId: () => this.settings.vaultId,
+      origin: () => this.settings.serverUrl,
+      pathForView: (view) => view.state.field(editorInfoField, false)?.file?.path || null,
+      knownId: (path) => this.settings.yjsIds[path] || null,
+      rememberId: async (path, id) => {
+        this.settings.yjsIds[path] = id;
+        await this.saveData(this.settings);
+      },
+      send: (message) => {
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.socket.send(JSON.stringify(message));
+        }
+      },
+      notify: (path, status) => {
+        this.lastError = path + ": " + status;
+        this.showStatus(status);
+      }
+    });
+    this.registerEditorExtension(this.live.extension());
     this.status = this.addStatusBarItem();
     this.showStatus("Not connected");
     this.addSettingTab(new ConnectorSettings(this.app, this));
@@ -124,6 +166,11 @@ export default class IgnisConnector extends Plugin {
       id: "show-sync-issues",
       name: "Show last Ignis sync issue",
       callback: () => new Notice(this.lastError || "No sync issue recorded")
+    });
+    this.addCommand({
+      id: "archive-and-switch-server",
+      name: "Archive old connector state and switch server or Vault",
+      callback: () => void this.archiveAndSwitch()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof TFile && isMarkdown(file.path) && !this.quiet.has(file.path)) {
@@ -162,21 +209,34 @@ export default class IgnisConnector extends Plugin {
   }
 
   onunload() {
+    this.stopped = true;
+    this.live.disconnected();
+    void this.live.dispose();
     this.socket?.close();
     if (this.timer !== null) window.clearTimeout(this.timer);
+    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
   }
 
   private getSavedSecret(): string {
     const secrets = (this.app as any).secretStorage;
-    if (!secrets || !this.settings.vaultId) return "";
-    return secrets.getSecret(SECRET_PREFIX + this.settings.vaultId) || "";
+    if (!secrets || !this.settings.vaultId || !this.matchesScope()) return "";
+    return secrets.getSecret(SECRET_PREFIX + this.settings.scope) || "";
   }
   async saveToken(token: string) {
+    if (this.needsReload) {
+      new Notice("Restart Ignis Connector to change the server or Vault");
+      return;
+    }
     const secrets = (this.app as any).secretStorage;
+    if (!this.settings.scope) this.settings.scope = this.currentScope();
+    if (!this.matchesScope()) {
+      new Notice("Server/Vault changed: archive the old sync state before entering a new token");
+      return;
+    }
     if (!secrets?.setSecret || !this.settings.vaultId) {
       new Notice("Obsidian SecretStorage is required; token kept only until app exit");
     } else {
-      secrets.setSecret(SECRET_PREFIX + this.settings.vaultId, token);
+      secrets.setSecret(SECRET_PREFIX + this.settings.scope, token);
     }
     this.token = token;
     this.connectSocket();
@@ -185,15 +245,51 @@ export default class IgnisConnector extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
-    this.token = this.getSavedSecret() || this.token;
+    this.token = this.getSavedSecret();
+    this.live.disconnected();
     this.socket?.close();
+    if (!this.matchesScope()) {
+      this.showStatus("Server/Vault changed · archive old state before switching");
+      return;
+    }
     if (this.ready()) this.connectSocket();
     this.schedule();
   }
-  private ready(): boolean {
-    try { validServerUrl(this.settings.serverUrl); }
+  private currentScope(): string {
+    return validServerUrl(this.settings.serverUrl) + "|" + this.settings.vaultId;
+  }
+  private matchesScope(): boolean {
+    try { return this.settings.scope === this.currentScope(); }
     catch { return false; }
-    return !!(this.settings.vaultId && this.token);
+  }
+  private ready(): boolean {
+    return !!(!this.needsReload && this.matchesScope() && this.settings.vaultId && this.token);
+  }
+  async archiveAndSwitch() {
+    const newScope = this.currentScope();
+    if (newScope === this.settings.scope) {
+      new Notice("The current server and Vault are already selected");
+      return;
+    }
+    this.settings.archivedScopes.push({
+      scope: this.settings.scope,
+      cursor: this.settings.cursor,
+      baselines: this.settings.baselines,
+      pending: this.settings.pending,
+      yjsIds: this.settings.yjsIds
+    });
+    this.settings.scope = newScope;
+    this.settings.cursor = 0;
+    this.settings.baselines = {};
+    this.settings.pending = [];
+    this.settings.yjsIds = {};
+    this.token = "";
+    this.needsReload = true;
+    this.live.disconnected();
+    this.socket?.close();
+    await this.saveData(this.settings);
+    this.showStatus("Archived old state · restart plugin before connecting");
+    new Notice("Old pending work was archived, not deleted. Disable and re-enable Ignis Connector before entering a token.");
   }
   private showStatus(status: string) {
     if (this.status) this.status.setText("Ignis: " + status);
@@ -228,6 +324,11 @@ export default class IgnisConnector extends Plugin {
   }
 
   private connectSocket() {
+    if (this.stopped) return;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.socket?.close();
     if (!this.ready()) return;
     try {
@@ -243,17 +344,33 @@ export default class IgnisConnector extends Plugin {
       socket.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
-          if (message.channel !== "sync") return;
-          if (message.type === "ready" || message.type === "changed") this.schedule();
-          if (message.type === "auth-error") {
-            this.showStatus("Authorization failed");
-            socket.close();
+          if (message.channel === "collab") {
+            void this.live.handle(message);
+          } else if (message.channel === "sync") {
+            if (message.type === "ready") {
+              this.live.connected();
+              this.schedule();
+            }
+            if (message.type === "changed") this.schedule();
+            if (message.type === "auth-error") {
+              this.showStatus("Authorization failed");
+              socket.close();
+            }
           }
         } catch { /* Other Ignis websocket messages are not sync data. */ }
       };
       socket.onerror = () => this.showStatus("Offline · local Vault retained");
       socket.onclose = () => {
-        if (this.socket === socket) this.socket = null;
+        if (this.socket === socket) {
+          this.live.disconnected();
+          this.socket = null;
+          // WebView JavaScript may be suspended on iOS; on resume this
+          // timer and the periodic reconciliation both recover the socket.
+          if (!this.stopped && this.ready()) {
+            this.reconnectTimer = window.setTimeout(() =>
+              this.connectSocket(), 5000);
+          }
+        }
       };
     } catch (error) {
       this.lastError = String(error);
@@ -344,6 +461,9 @@ export default class IgnisConnector extends Plugin {
       for (const remote of manifest.files) {
         if (!isMarkdown(remote.path)) continue;
         remotePaths.add(remote.path);
+        // Live Yjs handles in-memory panes. A file-level REST write cannot
+        // carry a native editor's uncommitted state safely.
+        if (this.live.isManaged(remote.path)) continue;
         const oldEntry = Object.entries(this.settings.baselines).find(
           ([name, state]) => name !== remote.path && state.fileId === remote.fileId
         );
@@ -419,6 +539,7 @@ export default class IgnisConnector extends Plugin {
         await this.saveData(this.settings);
       }
       for (const [path, file] of local) {
+        if (this.live.isManaged(path)) continue;
         if (remotePaths.has(path) || this.settings.baselines[path] ||
             this.settings.pending.some((op) => op.toPath === path)) continue;
         const bytes = file.stat.size;
