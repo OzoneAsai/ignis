@@ -57,15 +57,28 @@ const DEFAULT: Settings = {
   scope: "", archivedScopes: []
 };
 const SECRET_PREFIX = "ignis-connector-vault-";
-const MAX_TEXT_BYTES = 4 * 1024 * 1024;
+const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const textEncoder = new TextEncoder();
 
+function isSyncablePath(path: string): boolean {
+  const parts = path.split("/");
+  return !!path && !parts.some((part) =>
+    !part || part === "." || part === ".." ||
+    [".obsidian", ".git", ".ignis-connector"].includes(part) ||
+    part.startsWith(".ignis-sync-tmp-") ||
+    part.startsWith(".ignis-collab-tmp-"));
+}
 function isMarkdown(path: string): boolean {
-  return path.toLowerCase().endsWith(".md") &&
-    !path.split("/").some((part) =>
-      [".obsidian", ".git", ".ignis-connector"].includes(part));
+  return path.toLowerCase().endsWith(".md") && isSyncablePath(path);
 }
 
+function encodeBase64(bytes: Uint8Array): string {
+  let text = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) {
+    text += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  }
+  return btoa(text);
+}
 function validServerUrl(input: string): string {
   const url = new URL(input);
   if ((url.protocol !== "https:" &&
@@ -173,13 +186,19 @@ export default class IgnisConnector extends Plugin {
       callback: () => void this.archiveAndSwitch()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof TFile && isMarkdown(file.path) && !this.quiet.has(file.path)) {
+      if (file instanceof TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
         this.schedule();
       }
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (!(file instanceof TFile) || this.quiet.has(file.path) ||
-          !isMarkdown(oldPath) || !isMarkdown(file.path)) return;
+          !isSyncablePath(oldPath) || !isSyncablePath(file.path)) return;
+      if (!this.live.relocate(oldPath, file.path)) return;
+      const yjsId = this.settings.yjsIds[oldPath];
+      if (yjsId) {
+        this.settings.yjsIds[file.path] = yjsId;
+        delete this.settings.yjsIds[oldPath];
+      }
       const base = this.settings.baselines[oldPath];
       if (base) this.settings.pending.push({
         opId: crypto.randomUUID(), type: "rename", path: oldPath,
@@ -190,7 +209,7 @@ export default class IgnisConnector extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (!(file instanceof TFile) || this.quiet.has(file.path) ||
-          !isMarkdown(file.path)) return;
+          !isSyncablePath(file.path)) return;
       const base = this.settings.baselines[file.path];
       if (base) this.settings.pending.push({
         opId: crypto.randomUUID(), type: "delete", path: file.path,
@@ -383,15 +402,16 @@ export default class IgnisConnector extends Plugin {
   }
   private localFiles(): Map<string, TFile> {
     return new Map(this.app.vault.getFiles()
-      .filter((file) => isMarkdown(file.path)).map((file) => [file.path, file]));
+      .filter((file) => isSyncablePath(file.path)).map((file) => [file.path, file]));
   }
   private async localHash(file: TFile): Promise<string | null> {
-    if (file.stat.size > MAX_TEXT_BYTES) return null;
-    const content = await this.app.vault.read(file);
-    return sha256(textEncoder.encode(content));
+    if (file.stat.size > MAX_FILE_BYTES) return null;
+    return sha256(isMarkdown(file.path) ?
+      textEncoder.encode(await this.app.vault.read(file)) :
+      new Uint8Array(await this.app.vault.readBinary(file)));
   }
-  private async remoteText(remote: RemoteFile): Promise<string> {
-    if (remote.size > MAX_TEXT_BYTES) throw new Error("Note exceeds mobile-safe sync limit");
+  private async remoteBytes(remote: RemoteFile): Promise<ArrayBuffer> {
+    if (remote.size > MAX_FILE_BYTES) throw new Error("File exceeds mobile-safe sync limit");
     const response = await requestUrl({
       url: this.url("/vaults/" + encodeURIComponent(this.settings.vaultId) +
         "/files/" + encodeURIComponent(remote.fileId)),
@@ -399,10 +419,21 @@ export default class IgnisConnector extends Plugin {
       headers: { Authorization: "Bearer " + this.token }
     });
     const bytes = new Uint8Array(response.arrayBuffer);
-    if (await sha256(bytes) !== remote.hash) throw new Error("Remote content hash mismatch");
-    return new TextDecoder().decode(bytes);
+    if (bytes.length !== remote.size || await sha256(bytes) !== remote.hash) {
+      throw new Error("Remote content size/hash mismatch");
+    }
+    return response.arrayBuffer;
   }
-  private async writeLocal(path: string, text: string) {
+  private async payloadFor(file: TFile): Promise<{ content: string } | { contentBase64: string }> {
+    if (file.stat.size > MAX_FILE_BYTES) throw new Error("Local file exceeds mobile-safe sync limit");
+    if (isMarkdown(file.path)) {
+      return { content: await this.app.vault.read(file) };
+    }
+    return { contentBase64: encodeBase64(
+      new Uint8Array(await this.app.vault.readBinary(file))
+    ) };
+  }
+  private async writeLocal(path: string, data: string | ArrayBuffer) {
     this.quiet.add(path);
     try {
       let parent = "";
@@ -415,8 +446,13 @@ export default class IgnisConnector extends Plugin {
         }
       }
       const file = this.app.vault.getAbstractFileByPath(path);
-      if (file instanceof TFile) await this.app.vault.modify(file, text);
-      else if (file === null) await this.app.vault.create(path, text);
+      if (file instanceof TFile) {
+        if (typeof data === "string") await this.app.vault.modify(file, data);
+        else await this.app.vault.modifyBinary(file, data);
+      } else if (file === null) {
+        if (typeof data === "string") await this.app.vault.create(path, data);
+        else await this.app.vault.createBinary(path, data);
+      }
       else throw new Error("Path occupied by a folder: " + path);
     } finally {
       // Vault events may be delivered on the next tick.
@@ -439,6 +475,7 @@ export default class IgnisConnector extends Plugin {
         const old = this.settings.baselines[pending.path];
         delete this.settings.baselines[pending.path];
         if (old) this.settings.baselines[pending.toPath] = old;
+        this.live.rejoinPath(pending.toPath);
       }
       this.settings.cursor = Math.max(this.settings.cursor, result.seq);
       this.settings.pending.shift();
@@ -459,8 +496,12 @@ export default class IgnisConnector extends Plugin {
       const remotePaths = new Set<string>();
       const conflicts: string[] = [];
       for (const remote of manifest.files) {
-        if (!isMarkdown(remote.path)) continue;
+        if (!isSyncablePath(remote.path)) continue;
         remotePaths.add(remote.path);
+        if (remote.size > MAX_FILE_BYTES) {
+          conflicts.push(remote.path + " (attachment exceeds preview size limit)");
+          continue;
+        }
         // Live Yjs handles in-memory panes. A file-level REST write cannot
         // carry a native editor's uncommitted state safely.
         if (this.live.isManaged(remote.path)) continue;
@@ -485,6 +526,12 @@ export default class IgnisConnector extends Plugin {
             local.set(remote.path, previousLocal);
             this.settings.baselines[remote.path] = oldBase;
             delete this.settings.baselines[oldPath];
+            const yjsId = this.settings.yjsIds[oldPath];
+            if (yjsId) {
+              this.settings.yjsIds[remote.path] = yjsId;
+              delete this.settings.yjsIds[oldPath];
+            }
+            this.live.relocate(oldPath, remote.path);
           } finally {
             window.setTimeout(() => {
               this.quiet.delete(oldPath);
@@ -502,8 +549,9 @@ export default class IgnisConnector extends Plugin {
         }
         if (!existing) {
           if (base) { conflicts.push(remote.path + " (local deletion unresolved)"); continue; }
-          if (remote.size > MAX_TEXT_BYTES) continue;
-          await this.writeLocal(remote.path, await this.remoteText(remote));
+          const data = await this.remoteBytes(remote);
+          await this.writeLocal(remote.path, isMarkdown(remote.path) ?
+            new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         } else if (!base) {
           if (localDigest === remote.hash) this.saveBase(remote.path, remote);
@@ -521,9 +569,9 @@ export default class IgnisConnector extends Plugin {
             conflicts.push(remote.path + " (open editor, pending Yjs integration)");
             continue;
           }
-          const content = await this.app.vault.read(existing);
           const result = await this.sendOperation({
-            type: "modify", path: remote.path, content,
+            type: "modify", path: remote.path,
+            ...await this.payloadFor(existing),
             opId: crypto.randomUUID(), fileId: remote.fileId,
             generationId: remote.generationId, baseHash: base.hash
           });
@@ -533,7 +581,9 @@ export default class IgnisConnector extends Plugin {
             conflicts.push(remote.path + " (open editor)");
             continue;
           }
-          await this.writeLocal(remote.path, await this.remoteText(remote));
+          const data = await this.remoteBytes(remote);
+          await this.writeLocal(remote.path, isMarkdown(remote.path) ?
+            new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         }
         await this.saveData(this.settings);
@@ -543,10 +593,14 @@ export default class IgnisConnector extends Plugin {
         if (remotePaths.has(path) || this.settings.baselines[path] ||
             this.settings.pending.some((op) => op.toPath === path)) continue;
         const bytes = file.stat.size;
-        if (bytes > MAX_TEXT_BYTES || this.openInEditor(path)) continue;
-        const content = await this.app.vault.read(file);
+        if (bytes > MAX_FILE_BYTES) {
+          conflicts.push(path + " (attachment exceeds preview size limit)");
+          continue;
+        }
+        if (this.openInEditor(path)) continue;
         const result = await this.sendOperation({
-          type: "create", path, content, opId: crypto.randomUUID()
+          type: "create", path,
+          ...await this.payloadFor(file), opId: crypto.randomUUID()
         });
         this.saveBase(path, result);
         await this.saveData(this.settings);
