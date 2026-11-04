@@ -10,6 +10,7 @@ import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 const REMOTE = Symbol("ignis-remote");
 const MAX_UPDATE_BYTES = 1024 * 1024;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_COMPOSITION_BUFFER_BYTES = 4 * 1024 * 1024;
 const ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
 type WireMessage = {
@@ -39,6 +40,7 @@ type Room = {
   composing: boolean;
   pendingHandshake: boolean;
   waiting: Uint8Array[];
+  waitingBytes: number;
   sentSeq: number;
   savedSeq: number;
   retryCount: number;
@@ -68,7 +70,8 @@ function newRoom(path: string, documentId: string | null): Room {
     path, documentId, wasKnown: !!documentId, doc: null, text: null, undo: null,
     persistence: null, hydrated: false, hydration: null, views: new Set(),
     initializing: false, joined: false, blocked: false,
-    composing: false, pendingHandshake: false, waiting: [], sentSeq: 0, savedSeq: 0,
+    composing: false, pendingHandshake: false, waiting: [], waitingBytes: 0,
+    sentSeq: 0, savedSeq: 0,
     retryCount: 0, retryTimer: null,
     snapshot: null
   };
@@ -124,8 +127,11 @@ export class NativeYjs {
     try {
       const path = this.opts.pathForView(view);
       return typeof path === "string" && path.toLowerCase().endsWith(".md") &&
+        !path.includes("\\") && !path.includes("\0") &&
+        !path.startsWith("/") &&
         !path.split("/").some((part) =>
-          [".obsidian", ".git", ".ignis-connector"].includes(part))
+          [".obsidian", ".git", ".ignis-connector", ".trash"].includes(
+            part.toLowerCase()))
         ? path : null;
     } catch { return null; }
   }
@@ -271,12 +277,31 @@ export class NativeYjs {
       for (const update of room.waiting.splice(0)) {
         if (room.doc && !room.blocked) Y.applyUpdate(room.doc, update, REMOTE);
       }
+      room.waitingBytes = 0;
       this.tryAttach(room);
       if (room.pendingHandshake && room.doc && room.joined && !room.blocked) {
         room.pendingHandshake = false;
         this.sendUpdate(room, Y.encodeStateAsUpdate(room.doc));
       }
     }
+  }
+  private deferRemote(room: Room, update: Uint8Array) {
+    if (room.waitingBytes + update.byteLength > MAX_COMPOSITION_BUFFER_BYTES) {
+      // A suspended iOS composition can accumulate unbounded remote frames.
+      // Never exhaust the WebView heap or apply a partial remote history.
+      room.waiting = [];
+      room.waitingBytes = 0;
+      room.blocked = true;
+      if (room.joined) this.opts.send({
+        channel: "collab", type: "leave", path: room.path
+      });
+      room.joined = false;
+      this.opts.notify(room.path,
+        "Remote edits exceeded IME buffer; local draft preserved, reopen note to reconcile");
+      return;
+    }
+    room.waiting.push(update);
+    room.waitingBytes += update.byteLength;
   }
 
   private join(room: Room) {
@@ -420,8 +445,9 @@ export class NativeYjs {
           }
         }
         room.joined = true;
-        if (room.composing) room.waiting.push(remote);
+        if (room.composing) this.deferRemote(room, remote);
         else Y.applyUpdate(room.doc, remote, REMOTE);
+        if (room.blocked) return;
         await this.opts.rememberId(room.path, message.documentId);
         room.wasKnown = true;
         this.tryAttach(room);
@@ -440,7 +466,7 @@ export class NativeYjs {
     if (message.type === "update" && room.doc && room.joined && !room.blocked) {
       try {
         const bytes = decode(message.update);
-        if (room.composing) room.waiting.push(bytes);
+        if (room.composing) this.deferRemote(room, bytes);
         else Y.applyUpdate(room.doc, bytes, REMOTE);
       } catch {
         this.opts.notify(room.path, "Invalid remote Yjs update");
