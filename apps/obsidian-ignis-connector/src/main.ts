@@ -175,6 +175,8 @@ export default class IgnisConnector extends Plugin {
         this.settings.yjsIds[path] = id;
         await this.persistSettings();
       },
+      displayName: () => "Obsidian " +
+        (this.settings.deviceId ? this.settings.deviceId.slice(0, 6) : "Native"),
       send: (message) => {
         if (this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify(message));
