@@ -12,8 +12,15 @@ version that supports **GitHub Release assets** (v1.1.0 or later). In BRAT:
 2. Enter the repository **`OzoneAsai/ignis`**.
 3. Select the available Ignis Connector prerelease and enable
    **Ignis Connector** in Obsidian's Community plugins settings.
-4. Configure the Ignis server's trusted HTTPS origin and Vault ID. Enroll a
-   device on that server and enter its **device token**, not an admin token.
+4. Open Ignis Connector settings. Enter the full **HTTPS server address** (including
+   its port), the exact **Vault ID**, and an enrolled **ignis_dev_ device token**.
+5. Tap **Connect and verify**. Nothing is sent while you type; rejected credentials
+   stay in the masked input so you can correct the Vault ID or server address.
+6. After verification succeeds, tap **Sync** or let the Connector synchronize.
+
+The URL, Vault ID, and token are checked **together**. A 404 from the Sync API
+is reported separately from an unauthorized device. Tailscale protects the
+network route but does not substitute for per-Vault authorization in this beta.
 
 The matching `main.js` and `manifest.json` are served from
 [GitHub Releases](https://github.com/OzoneAsai/ignis/releases), so BRAT does
