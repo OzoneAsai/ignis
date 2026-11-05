@@ -3340,6 +3340,24 @@ var readStateVector = (decoder) => {
   return ss;
 };
 var decodeStateVector = (decodedState) => readStateVector(new DSDecoderV1(createDecoder(decodedState)));
+var writeStateVector = (encoder, sv) => {
+  writeVarUint(encoder.restEncoder, sv.size);
+  from(sv.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
+    writeVarUint(encoder.restEncoder, client);
+    writeVarUint(encoder.restEncoder, clock);
+  });
+  return encoder;
+};
+var writeDocumentStateVector = (encoder, doc2) => writeStateVector(encoder, getStateVector(doc2.store));
+var encodeStateVectorV2 = (doc2, encoder = new DSEncoderV2()) => {
+  if (doc2 instanceof Map) {
+    writeStateVector(encoder, doc2);
+  } else {
+    writeDocumentStateVector(encoder, doc2);
+  }
+  return encoder.toUint8Array();
+};
+var encodeStateVector = (doc2) => encodeStateVectorV2(doc2, new DSEncoderV1());
 var EventHandler = class {
   constructor() {
     this.l = [];
@@ -3368,6 +3386,11 @@ var ID = class {
 };
 var compareIDs = (a, b) => a === b || a !== null && b !== null && a.client === b.client && a.clock === b.clock;
 var createID = (client, clock) => new ID(client, clock);
+var writeID = (encoder, id2) => {
+  writeVarUint(encoder, id2.client);
+  writeVarUint(encoder, id2.clock);
+};
+var readID = (decoder) => createID(readVarUint(decoder), readVarUint(decoder));
 var findRootTypeKey = (type) => {
   for (const [key, value] of type.doc.share.entries()) {
     if (value === type) {
@@ -3462,6 +3485,47 @@ var createRelativePositionFromTypeIndex = (type, index, assoc = 0) => {
   }
   return createRelativePosition(type, null, assoc);
 };
+var writeRelativePosition = (encoder, rpos) => {
+  const { type, tname, item, assoc } = rpos;
+  if (item !== null) {
+    writeVarUint(encoder, 0);
+    writeID(encoder, item);
+  } else if (tname !== null) {
+    writeUint8(encoder, 1);
+    writeVarString(encoder, tname);
+  } else if (type !== null) {
+    writeUint8(encoder, 2);
+    writeID(encoder, type);
+  } else {
+    throw unexpectedCase();
+  }
+  writeVarInt(encoder, assoc);
+  return encoder;
+};
+var encodeRelativePosition = (rpos) => {
+  const encoder = createEncoder();
+  writeRelativePosition(encoder, rpos);
+  return toUint8Array(encoder);
+};
+var readRelativePosition = (decoder) => {
+  let type = null;
+  let tname = null;
+  let itemID = null;
+  switch (readVarUint(decoder)) {
+    case 0:
+      itemID = readID(decoder);
+      break;
+    case 1:
+      tname = readVarString(decoder);
+      break;
+    case 2: {
+      type = readID(decoder);
+    }
+  }
+  const assoc = hasContent(decoder) ? readVarInt(decoder) : 0;
+  return new RelativePosition(type, tname, itemID, assoc);
+};
+var decodeRelativePosition = (uint8Array) => readRelativePosition(createDecoder(uint8Array));
 var getItemWithOffset = (store, id2) => {
   const item = getItem(store, id2);
   const diff = id2.clock - item.id.clock;
@@ -9817,6 +9881,257 @@ var yCollab = (ytext, awareness, { undoManager = new UndoManager(ytext) } = {}) 
   return plugins;
 };
 
+// src/presence.ts
+var MAX_CURSOR_BYTES = 512;
+var MAX_PEERS = 32;
+function encodeBytes(bytes) {
+  let raw = "";
+  for (const byte of bytes)
+    raw += String.fromCharCode(byte);
+  return btoa(raw);
+}
+function decodeBytes(value) {
+  if (typeof value !== "string" || value.length > 688 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value))
+    return null;
+  try {
+    const raw = atob(value);
+    if (!raw.length || raw.length > MAX_CURSOR_BYTES)
+      return null;
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+function encodeSelection(text2, anchor, head) {
+  const at = (index) => encodeBytes(encodeRelativePosition(
+    createRelativePositionFromTypeIndex(
+      text2,
+      Math.max(0, Math.min(text2.length, index))
+    )
+  ));
+  const result = { anchor: at(anchor), head: at(head) };
+  if (result.anchor.length > 688 || result.head.length > 688)
+    return null;
+  return result;
+}
+function resolveSelection(text2, peer) {
+  const start = decodeBytes(peer.anchor);
+  const end = decodeBytes(peer.head);
+  if (!start || !end || !text2.doc)
+    return null;
+  try {
+    const anchor = createAbsolutePositionFromRelativePosition(
+      decodeRelativePosition(start),
+      text2.doc
+    );
+    const head = createAbsolutePositionFromRelativePosition(
+      decodeRelativePosition(end),
+      text2.doc
+    );
+    if (!anchor || !head || anchor.type !== text2 || head.type !== text2)
+      return null;
+    return { anchor: anchor.index, head: head.index };
+  } catch {
+    return null;
+  }
+}
+function sanitizePeers(input, selfId) {
+  if (!Array.isArray(input))
+    return [];
+  const unique = /* @__PURE__ */ new Set();
+  const peers = [];
+  for (const item of input.slice(0, MAX_PEERS * 4)) {
+    if (!item || typeof item !== "object" || typeof item.id !== "string" || item.id.length > 128 || !item.id || item.id === selfId || unique.has(item.id))
+      continue;
+    unique.add(item.id);
+    peers.push({
+      id: item.id,
+      name: typeof item.name === "string" ? item.name.slice(0, 40) : "Peer",
+      color: typeof item.color === "string" && /^#[a-fA-F0-9]{6}$/.test(item.color) ? item.color : "#59baf2",
+      anchor: typeof item.anchor === "string" ? item.anchor : null,
+      head: typeof item.head === "string" ? item.head : null
+    });
+    if (peers.length === MAX_PEERS)
+      break;
+  }
+  return peers;
+}
+var CursorOverlay = class {
+  constructor(view) {
+    this.view = view;
+    this.root = document.createElement("div");
+    this.root.className = "ignis-native-cursors";
+    this.root.setAttribute("aria-hidden", "true");
+    Object.assign(this.root.style, {
+      position: "absolute",
+      inset: "0",
+      overflow: "hidden",
+      pointerEvents: "none",
+      zIndex: "8"
+    });
+    this.originalPosition = view.dom.style.position;
+    if (getComputedStyle(view.dom).position === "static") {
+      view.dom.style.position = "relative";
+    }
+    view.dom.appendChild(this.root);
+    view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
+    window.addEventListener("resize", this.scroll);
+  }
+  root;
+  nodes = /* @__PURE__ */ new Map();
+  peers = [];
+  text = null;
+  raf = 0;
+  originalPosition;
+  scroll = () => this.schedule();
+  set(text2, peers) {
+    this.text = text2;
+    this.peers = peers;
+    if (!text2 || peers.length === 0) {
+      this.clear();
+    } else {
+      this.schedule();
+    }
+  }
+  discard(id2) {
+    const record = this.nodes.get(id2);
+    if (!record)
+      return;
+    record.caret.remove();
+    for (const mark of record.marks)
+      mark.remove();
+    this.nodes.delete(id2);
+  }
+  clear() {
+    if (this.raf)
+      cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    for (const id2 of [...this.nodes.keys()])
+      this.discard(id2);
+  }
+  schedule() {
+    if (!this.raf && this.root.isConnected) {
+      this.raf = requestAnimationFrame(() => this.paint());
+    }
+  }
+  paint() {
+    this.raf = 0;
+    if (!this.text)
+      return;
+    const bounds = this.view.dom.getBoundingClientRect();
+    const visible = /* @__PURE__ */ new Set();
+    for (const peer of this.peers) {
+      const selection = resolveSelection(this.text, peer);
+      if (!selection)
+        continue;
+      visible.add(peer.id);
+      let record = this.nodes.get(peer.id);
+      if (!record) {
+        const caret = document.createElement("div");
+        caret.className = "ignis-native-remote-caret";
+        caret.dataset.ignisPeer = peer.id;
+        Object.assign(caret.style, {
+          position: "absolute",
+          width: "2px",
+          pointerEvents: "none",
+          backgroundColor: peer.color
+        });
+        const label = document.createElement("span");
+        label.className = "ignis-native-remote-label";
+        Object.assign(label.style, {
+          position: "absolute",
+          left: "0",
+          bottom: "100%",
+          color: "#fff",
+          backgroundColor: peer.color,
+          fontSize: "11px",
+          fontWeight: "600",
+          borderRadius: "3px",
+          padding: "2px 5px",
+          whiteSpace: "nowrap",
+          maxWidth: "180px",
+          overflow: "hidden",
+          textOverflow: "ellipsis"
+        });
+        caret.appendChild(label);
+        this.root.appendChild(caret);
+        record = { caret, label, marks: [] };
+        this.nodes.set(peer.id, record);
+      }
+      record.label.textContent = peer.name;
+      record.label.style.backgroundColor = peer.color;
+      record.caret.style.backgroundColor = peer.color;
+      const at = Math.min(this.view.state.doc.length, selection.head);
+      const coords = this.view.coordsAtPos(at);
+      const onScreen = !!coords && coords.bottom >= bounds.top && coords.top <= bounds.bottom && coords.right >= bounds.left && coords.left <= bounds.right;
+      record.caret.style.display = onScreen ? "" : "none";
+      if (coords && onScreen) {
+        record.caret.style.left = coords.left - bounds.left + "px";
+        record.caret.style.top = coords.top - bounds.top + "px";
+        record.caret.style.height = Math.max(1, coords.bottom - coords.top) + "px";
+      }
+      const from2 = Math.max(0, Math.min(selection.anchor, selection.head));
+      const to = Math.min(
+        this.view.state.doc.length,
+        Math.max(selection.anchor, selection.head)
+      );
+      const marks = [];
+      const viewport = this.view.viewport;
+      let index = Math.max(from2, viewport.from);
+      const end = Math.min(to, viewport.to);
+      while (index < end && marks.length < 120) {
+        const line = this.view.state.doc.lineAt(index);
+        const stop = Math.min(end, line.to);
+        const a = this.view.coordsAtPos(index);
+        const b = this.view.coordsAtPos(stop);
+        if (a && b) {
+          marks.push({
+            left: a.left - bounds.left,
+            top: a.top - bounds.top,
+            width: Math.max(2, b.left - a.left),
+            height: Math.max(1, b.bottom - a.top)
+          });
+        }
+        index = Math.max(index + 1, stop + 1);
+      }
+      for (let i = 0; i < marks.length; i++) {
+        let mark = record.marks[i];
+        if (!mark) {
+          mark = document.createElement("span");
+          mark.className = "ignis-native-remote-selection";
+          Object.assign(mark.style, {
+            position: "absolute",
+            pointerEvents: "none",
+            opacity: "0.22"
+          });
+          this.root.appendChild(mark);
+          record.marks.push(mark);
+        }
+        Object.assign(mark.style, {
+          backgroundColor: peer.color,
+          left: marks[i].left + "px",
+          top: marks[i].top + "px",
+          width: marks[i].width + "px",
+          height: marks[i].height + "px"
+        });
+      }
+      while (record.marks.length > marks.length)
+        record.marks.pop().remove();
+    }
+    for (const id2 of [...this.nodes.keys()]) {
+      if (!visible.has(id2))
+        this.discard(id2);
+    }
+  }
+  destroy() {
+    this.clear();
+    this.view.scrollDOM.removeEventListener("scroll", this.scroll);
+    window.removeEventListener("resize", this.scroll);
+    this.root.remove();
+    this.view.dom.style.position = this.originalPosition;
+  }
+};
+
 // src/live.ts
 var REMOTE = Symbol("ignis-remote");
 var MAX_UPDATE_BYTES = 1024 * 1024;
@@ -9863,7 +10178,11 @@ function newRoom(path, documentId) {
     savedSeq: 0,
     retryCount: 0,
     retryTimer: null,
-    snapshot: null
+    snapshot: null,
+    selfId: null,
+    peers: /* @__PURE__ */ new Map(),
+    cursorTimer: null,
+    lastCursor: null
   };
 }
 var NativeYjs = class {
@@ -9873,6 +10192,7 @@ var NativeYjs = class {
   rooms = /* @__PURE__ */ new Map();
   paths = /* @__PURE__ */ new Map();
   bound = /* @__PURE__ */ new Map();
+  overlays = /* @__PURE__ */ new Map();
   compartment = new import_state.Compartment();
   online = false;
   disposed = false;
@@ -9887,6 +10207,9 @@ var NativeYjs = class {
         }
         update(update) {
           manager.observe(update.view);
+          if (update.selectionSet || update.docChanged || update.focusChanged) {
+            manager.selectionChanged(update.view);
+          }
         }
         destroy() {
           manager.forget(this.view);
@@ -9927,14 +10250,18 @@ var NativeYjs = class {
       old?.views.delete(view);
       this.paths.delete(view);
       this.bound.delete(view);
+      this.overlays.get(view)?.destroy();
+      this.overlays.delete(view);
       queueMicrotask(() => {
         if (view.dom.isConnected && !this.disposed) {
           view.dispatch({ effects: this.compartment.reconfigure([]) });
         }
       });
       if (old && old.views.size === 0 && old.joined) {
+        this.sendCursorAway(old);
         this.opts.send({ channel: "collab", type: "leave", path: old.path });
         old.joined = false;
+        this.clearPeers(old);
       }
     }
     if (!path)
@@ -9949,6 +10276,7 @@ var NativeYjs = class {
         void this.hydrate(room, id2);
     }
     room.views.add(view);
+    this.refreshPeers(room);
     this.tryAttach(room);
     if (this.online)
       this.join(room);
@@ -9959,13 +10287,17 @@ var NativeYjs = class {
       return;
     this.paths.delete(view);
     this.bound.delete(view);
+    this.overlays.get(view)?.destroy();
+    this.overlays.delete(view);
     const room = this.rooms.get(path);
     if (!room)
       return;
     room.views.delete(view);
     if (room.views.size === 0 && room.joined) {
+      this.sendCursorAway(room);
       this.opts.send({ channel: "collab", type: "leave", path });
       room.joined = false;
+      this.clearPeers(room);
     }
   }
   async hydrate(room, id2) {
@@ -9990,6 +10322,8 @@ var NativeYjs = class {
       if (origin !== REMOTE && origin !== persistence && room.joined && !room.blocked && this.online) {
         this.sendUpdate(room, update);
       }
+      if (room.peers.size)
+        this.refreshPeers(room);
     });
     const hydrateTask = async () => {
       try {
@@ -10052,6 +10386,8 @@ var NativeYjs = class {
           return;
         }
         view.dispatch({ effects: this.compartment.reconfigure(extension) });
+        this.refreshPeers(room);
+        this.selectionChanged(view);
       });
     }
   }
@@ -10098,7 +10434,83 @@ var NativeYjs = class {
   join(room) {
     if (!this.online || room.blocked || !room.views.size)
       return;
-    this.opts.send({ channel: "collab", type: "join", path: room.path });
+    this.opts.send({
+      channel: "collab",
+      type: "join",
+      path: room.path,
+      name: this.opts.displayName?.() || "Native Obsidian"
+    });
+  }
+  clearPeers(room) {
+    room.peers.clear();
+    room.selfId = null;
+    room.lastCursor = null;
+    if (room.cursorTimer !== null)
+      clearTimeout(room.cursorTimer);
+    room.cursorTimer = null;
+    this.refreshPeers(room);
+  }
+  sendCursorAway(room) {
+    if (room.cursorTimer !== null)
+      clearTimeout(room.cursorTimer);
+    room.cursorTimer = null;
+    if (room.lastCursor !== null && room.joined && this.online) {
+      this.opts.send({ channel: "collab", type: "cursor-away", path: room.path });
+    }
+    room.lastCursor = null;
+  }
+  selectionChanged(view) {
+    const room = this.bound.get(view);
+    if (!room)
+      return;
+    if (room.peers.size)
+      this.refreshPeers(room);
+    if (!view.hasFocus) {
+      if (![...room.views].some((v) => v.hasFocus))
+        this.sendCursorAway(room);
+      return;
+    }
+    if (!room.joined || !this.online || room.blocked || room.composing)
+      return;
+    if (room.cursorTimer !== null)
+      clearTimeout(room.cursorTimer);
+    room.cursorTimer = setTimeout(() => {
+      room.cursorTimer = null;
+      const focused = [...room.views].find((v) => v.hasFocus && this.bound.get(v) === room);
+      if (!focused || !room.text || !room.joined || room.composing || room.blocked || !this.online)
+        return;
+      const selection = focused.state.selection.main;
+      const encoded = encodeSelection(room.text, selection.anchor, selection.head);
+      if (!encoded)
+        return;
+      const signature = encoded.anchor + ":" + encoded.head;
+      if (room.lastCursor === signature)
+        return;
+      room.lastCursor = signature;
+      this.opts.send({
+        channel: "collab",
+        type: "cursor",
+        path: room.path,
+        ...encoded
+      });
+    }, 65);
+  }
+  refreshPeers(room) {
+    for (const view of room.views) {
+      if (typeof document === "undefined" || !view.dom || !("nodeType" in view.dom) || view.dom.nodeType !== 1)
+        continue;
+      let overlay = this.overlays.get(view);
+      if (!overlay) {
+        overlay = new CursorOverlay(view);
+        this.overlays.set(view, overlay);
+      }
+      overlay.set(room.text, [...room.peers.values()]);
+    }
+  }
+  receivePeople(room, people, selfId) {
+    room.selfId = selfId;
+    room.peers = new Map(sanitizePeers(people, selfId).map((peer) => [peer.id, peer]));
+    this.refreshPeers(room);
   }
   connected() {
     this.online = true;
@@ -10109,6 +10521,7 @@ var NativeYjs = class {
     this.online = false;
     for (const room of this.rooms.values()) {
       room.joined = false;
+      this.clearPeers(room);
       if (room.retryTimer !== null) {
         clearTimeout(room.retryTimer);
         room.retryTimer = null;
@@ -10128,9 +10541,11 @@ var NativeYjs = class {
       return false;
     }
     if (room.joined) {
+      this.sendCursorAway(room);
       this.opts.send({ channel: "collab", type: "leave", path: oldPath });
     }
     room.joined = false;
+    this.clearPeers(room);
     this.rooms.delete(oldPath);
     room.path = newPath;
     this.rooms.set(newPath, room);
@@ -10186,6 +10601,22 @@ var NativeYjs = class {
     const room = this.rooms.get(message.path);
     if (!room)
       return;
+    if (message.type === "presence") {
+      if (room.joined)
+        this.receivePeople(room, message.people, room.selfId);
+      return;
+    }
+    if (message.type === "cursor") {
+      if (!room.joined || !message.id || message.id === room.selfId)
+        return;
+      const peer = room.peers.get(message.id);
+      if (!peer)
+        return;
+      peer.anchor = typeof message.anchor === "string" ? message.anchor : null;
+      peer.head = typeof message.head === "string" ? message.head : null;
+      this.refreshPeers(room);
+      return;
+    }
     if (message.type === "init") {
       if (!message.documentId || !ID_PATTERN.test(message.documentId)) {
         this.opts.notify(room.path, "Invalid server Yjs identity");
@@ -10215,7 +10646,20 @@ var NativeYjs = class {
         const candidate = new Doc();
         applyUpdate(candidate, remote);
         const serverText = candidate.getText("content").toString();
+        const localVector = decodeStateVector(encodeStateVector(room.doc));
+        const remoteVector = decodeStateVector(encodeStateVector(candidate));
+        const unrelated = room.wasKnown && localVector.size > 0 && remoteVector.size > 0 && ![...localVector.keys()].some((clientId) => remoteVector.has(clientId));
         candidate.destroy();
+        if (unrelated) {
+          room.blocked = true;
+          room.joined = false;
+          this.opts.send({ channel: "collab", type: "leave", path: room.path });
+          this.opts.notify(
+            room.path,
+            "Yjs lineage mismatch; server history was recreated; native draft preserved"
+          );
+          return;
+        }
         const preJoin = room.text.toString();
         const expected = room.wasKnown ? preJoin : serverText;
         if ([...room.views].some((view) => view.state.doc.toString() !== expected)) {
@@ -10235,6 +10679,11 @@ var NativeYjs = class {
           }
         }
         room.joined = true;
+        this.receivePeople(
+          room,
+          message.people,
+          typeof message.self?.id === "string" ? message.self.id : null
+        );
         if (room.composing)
           this.deferRemote(room, remote);
         else
@@ -10244,6 +10693,8 @@ var NativeYjs = class {
         await this.opts.rememberId(room.path, message.documentId);
         room.wasKnown = true;
         this.tryAttach(room);
+        for (const view of room.views)
+          this.selectionChanged(view);
         if (!room.composing)
           this.sendUpdate(room, encodeStateAsUpdate(room.doc));
         else {
@@ -10293,6 +10744,9 @@ var NativeYjs = class {
     this.disconnected();
     this.paths.clear();
     this.bound.clear();
+    for (const overlay of this.overlays.values())
+      overlay.destroy();
+    this.overlays.clear();
     for (const room of this.rooms.values()) {
       if (room.retryTimer !== null)
         clearTimeout(room.retryTimer);
@@ -10560,6 +11014,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         this.settings.yjsIds[path] = id2;
         await this.persistSettings();
       },
+      displayName: () => "Obsidian " + (this.settings.deviceId ? this.settings.deviceId.slice(0, 6) : "Native"),
       send: (message) => {
         if (this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify(message));
