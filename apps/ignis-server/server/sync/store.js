@@ -214,6 +214,35 @@ class VaultSyncStore {
     return { deviceId, vaultId, label: label.trim(), createdAt, token };
   }
 
+  // Tailscale Serve already authenticated the user at the network edge.
+  // Reuse one revocable server-side principal per user + Vault, with no
+  // reusable bearer secret ever sent to Obsidian/iOS. The HMAC namespace is
+  // disjoint from device-token hashes; a revoked principal stays revoked.
+  ensureTailnetDevice(login, vaultId, adminSecret) {
+    this.root(vaultId);
+    const key = crypto.createHmac("sha256", adminSecret)
+      .update("ignis-tailnet-v1\0" + vaultId + "\0" + login).digest("hex");
+    let row = this.db.prepare(
+      "SELECT device_id AS deviceId, vault_id AS vaultId, label, revoked_at AS revokedAt FROM devices WHERE token_hash=?"
+    ).get(key);
+    if (!row) {
+      try {
+        const deviceId = crypto.randomUUID();
+        this.db.prepare(
+          "INSERT INTO devices(device_id,vault_id,label,token_hash,created_at,revoked_at) VALUES(?,?,?,?,?,NULL)"
+        ).run(deviceId, vaultId, "Tailnet " + login, key, Date.now());
+      } catch (e) {
+        // Concurrent HTTP and WSS handshakes can race at first connection.
+        if (e.code !== "SQLITE_CONSTRAINT_UNIQUE") throw e;
+      }
+      row = this.db.prepare(
+        "SELECT device_id AS deviceId, vault_id AS vaultId, label, revoked_at AS revokedAt FROM devices WHERE token_hash=?"
+      ).get(key);
+    }
+    if (!row || row.revokedAt != null || row.vaultId !== vaultId) return null;
+    return { deviceId: row.deviceId, vaultId: row.vaultId, label: row.label };
+  }
+
   listDevices(vaultId) {
     this.root(vaultId);
     return this.db.prepare(

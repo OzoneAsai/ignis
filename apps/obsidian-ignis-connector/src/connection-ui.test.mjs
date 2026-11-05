@@ -99,6 +99,7 @@ function setup() {
       vaultId: "",
       deviceId: ""
     },
+    takeIncomingLink: () => "",
     connectionSummary: () => ({ ready: false, vaultId: "", deviceId: "" }),
     connectToServer: vi.fn(),
     saveSettings: vi.fn(),
@@ -115,10 +116,50 @@ function setup() {
     input.value = value;
     input.dispatchEvent(new Event("input", { bubbles: true }));
   };
-  return { plugin, inputs, connect, sync, feedback, type };
+  return { plugin, inputs, connect, sync, feedback, type, containerEl: ui.containerEl };
 }
 
 describe("native Obsidian one-button onboarding UI", () => {
+  it("accepts a single pasted invite without requiring token or Vault typing", async () => {
+    const { plugin, inputs, type, connect, sync } = setup();
+    type(inputs[0], "https://mac.example:8451/join/IOSLab");
+    expect(inputs[1].value).toBe("IOSLab");
+    plugin.connectToServer.mockResolvedValueOnce({
+      ok: true, message: "Connected through Tailscale to IOSLab."
+    });
+    connect.click();
+    await flush();
+    expect(plugin.connectToServer).toHaveBeenCalledWith({
+      serverUrl: "https://mac.example:8451/join/IOSLab",
+      vaultId: "IOSLab", token: ""
+    });
+    expect(sync.disabled).toBe(false);
+  });
+  it("offers a Vault chooser rather than requiring users to copy internal IDs", async () => {
+    const { plugin, inputs, type, connect, feedback, containerEl } = setup();
+    type(inputs[0], "https://mac.example:8451");
+    plugin.connectToServer.mockResolvedValueOnce({
+      ok: false, message: "Choose the Vault you want to connect to.",
+      availableVaults: ["Personal", "Team"]
+    });
+    connect.click();
+    await flush();
+    expect(feedback.textContent).toMatch(/Choose the Vault/);
+    const picker = containerEl.querySelector(".ignis-vault-picker select");
+    expect(picker).not.toBeNull();
+    expect(picker.options).toHaveLength(2);
+    picker.value = "Team";
+    picker.dispatchEvent(new Event("change", { bubbles: true }));
+    plugin.connectToServer.mockResolvedValueOnce({
+      ok: true, message: "Connected through Tailscale to Team."
+    });
+    connect.click();
+    await flush();
+    expect(plugin.connectToServer).toHaveBeenLastCalledWith({
+      serverUrl: "https://mac.example:8451",
+      vaultId: "Team", token: ""
+    });
+  });
   it("does not send anything or blank a pasted token before Connect is tapped", async () => {
     const { plugin, inputs, type, connect } = setup();
     expect(inputs.length).toBeGreaterThanOrEqual(3);

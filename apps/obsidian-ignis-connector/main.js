@@ -11079,6 +11079,33 @@ async function readChangesThrough(start, through, fetchPage) {
 // src/connection-setup.ts
 var TOKEN = /^ignis_dev_[A-Za-z0-9_-]{43}$/;
 var VAULT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+function parseJoinLink(raw) {
+  const input = raw.trim();
+  let url;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error("Paste a complete Ignis HTTPS connection link.");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) || url.username || url.password || url.search || url.hash) {
+    throw new Error("Use an HTTPS Ignis link without credentials or extra parameters.");
+  }
+  const matches = /^\/join\/([A-Za-z0-9._%-]+)\/?$/.exec(url.pathname);
+  if (url.pathname !== "/" && !matches) {
+    throw new Error("Paste the server address or an Ignis /join/VaultID link.");
+  }
+  let vaultId = "";
+  if (matches) {
+    try {
+      vaultId = decodeURIComponent(matches[1]);
+    } catch {
+      throw new Error("Invalid Vault ID in connection link.");
+    }
+    if (!VAULT_ID.test(vaultId))
+      throw new Error("Invalid Vault ID in connection link.");
+  }
+  return { origin: url.origin, vaultId };
+}
 function normalizeOrigin(raw) {
   const input = raw.trim();
   if (!input)
@@ -11094,18 +11121,19 @@ function normalizeOrigin(raw) {
   }
   return url.origin;
 }
-function validateConnection(draft, existingToken = "") {
-  const origin = normalizeOrigin(draft.serverUrl);
-  const vaultId = draft.vaultId.trim();
+function validateConnection(draft, existingToken = "", allowTailnet = false) {
+  const link = parseJoinLink(draft.serverUrl);
+  const origin = link.origin;
+  const vaultId = link.vaultId || draft.vaultId.trim();
   if (!vaultId)
     throw new Error("Enter the Vault ID provided by your server.");
   if (!VAULT_ID.test(vaultId)) {
     throw new Error("The Vault ID can contain letters, numbers, dots, hyphens and underscores.");
   }
   const token = draft.token.trim() || existingToken;
-  if (!token)
+  if (!token && !allowTailnet)
     throw new Error("Paste your device token to connect.");
-  if (!TOKEN.test(token)) {
+  if (token && !TOKEN.test(token)) {
     throw new Error("This is not an Ignis device token. It must start with ignis_dev_.");
   }
   return { origin, vaultId, token, scope: origin + "|" + vaultId };
@@ -11133,6 +11161,7 @@ function sessionError(status, body, expectedVaultId) {
 // src/main.ts
 var DEFAULT = {
   serverUrl: "",
+  authMode: "device",
   discoveryUrl: "",
   serverDeviceId: "",
   vaultId: "",
@@ -11197,6 +11226,7 @@ async function discover(discoveryUrl, serverDeviceId) {
   });
 }
 var IgnisConnector = class extends import_obsidian.Plugin {
+  incomingLink = "";
   token = "";
   socket = null;
   syncing = false;
@@ -11263,6 +11293,18 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.status = this.addStatusBarItem();
     this.showStatus("Not connected");
     this.addSettingTab(new ConnectorSettings(this.app, this));
+    this.registerObsidianProtocolHandler("ignis-connector", (params2) => {
+      if (typeof params2.link !== "string")
+        return;
+      try {
+        parseJoinLink(params2.link);
+        this.incomingLink = params2.link;
+        this.app.setting?.open();
+        this.app.setting?.openTabById?.(this.manifest.id);
+      } catch {
+        new import_obsidian.Notice("Invalid Ignis connection link");
+      }
+    });
     this.addCommand({
       id: "sync-now",
       name: "Sync with Ignis now",
@@ -11325,6 +11367,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       this.schedule();
     }
   }
+  takeIncomingLink() {
+    const link = this.incomingLink;
+    this.incomingLink = "";
+    return link;
+  }
   onunload() {
     this.stopped = true;
     this.live.disconnected();
@@ -11345,12 +11392,29 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     const attempt = ++this.connectionAttempt;
     let target;
     try {
-      const origin = normalizeOrigin(draft.serverUrl);
-      const scope = origin + "|" + draft.vaultId.trim();
-      target = validateConnection(
-        draft,
-        scope === this.settings.scope ? this.token || this.getSavedSecret() : ""
-      );
+      const link = parseJoinLink(draft.serverUrl);
+      let vault = link.vaultId || draft.vaultId.trim();
+      if (!vault) {
+        const suggestion = await (0, import_obsidian.requestUrl)({
+          url: link.origin + "/api/sync/v1/link",
+          method: "GET",
+          throw: false
+        });
+        const vaults = suggestion?.status === 200 && Array.isArray(suggestion.json?.vaults) ? suggestion.json.vaults : [];
+        if (vaults.length !== 1) {
+          return {
+            ok: false,
+            message: vaults.length > 1 ? "Choose the Vault you want to connect to." : "No Vault could be detected. Check Tailscale or specify the Vault in Advanced settings.",
+            availableVaults: vaults.length > 1 ? vaults : void 0
+          };
+        }
+        vault = vaults[0];
+      }
+      target = validateConnection({
+        serverUrl: link.origin,
+        vaultId: vault,
+        token: draft.token
+      }, "", true);
     } catch (error) {
       return { ok: false, message: error.message };
     }
@@ -11362,17 +11426,29 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       };
     }
     let session;
+    let selectedToken = target.token;
     try {
-      const response = await (0, import_obsidian.requestUrl)({
-        url: target.origin + "/api/sync/v1/vaults/" + encodeURIComponent(target.vaultId) + "/session",
+      const endpoint = target.origin + "/api/sync/v1/vaults/" + encodeURIComponent(target.vaultId) + "/session";
+      const verify = (token) => (0, import_obsidian.requestUrl)({
+        url: endpoint,
         method: "GET",
-        headers: { Authorization: "Bearer " + target.token },
-        throw: false
+        throw: false,
+        headers: token ? { Authorization: "Bearer " + token } : {}
       });
+      let response = await verify(selectedToken);
+      const fallback = target.scope === this.settings.scope ? this.token || this.getSavedSecret() : "";
+      if (response.status === 401 && !selectedToken && /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(fallback)) {
+        selectedToken = fallback;
+        response = await verify(selectedToken);
+      }
       const error = sessionError(response.status, response.json, target.vaultId);
-      if (error)
-        return { ok: false, message: error };
+      if (error) {
+        return { ok: false, message: response.status === 401 && !selectedToken ? "Tailscale identity was not recognized for this Vault. Check Tailscale, or use a device token under Advanced settings." : error };
+      }
       session = response.json;
+      if (!selectedToken && session.auth !== "tailnet") {
+        return { ok: false, message: "Server did not confirm Tailscale authentication." };
+      }
     } catch {
       return {
         ok: false,
@@ -11404,17 +11480,18 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       this.settings.yjsIds = {};
     }
     this.settings.serverUrl = target.origin;
+    this.settings.authMode = selectedToken ? "device" : "tailnet";
     this.settings.vaultId = target.vaultId;
     this.settings.scope = target.scope;
     this.settings.deviceId = session.deviceId;
-    this.token = target.token;
+    this.token = selectedToken;
     if (switching)
       await this.live.resetForConnection();
     const secrets = this.app.secretStorage;
-    let memoryOnly = !secrets?.setSecret;
-    if (secrets?.setSecret) {
+    let memoryOnly = !!selectedToken && !secrets?.setSecret;
+    if (selectedToken && secrets?.setSecret) {
       try {
-        await secrets.setSecret(SECRET_PREFIX + target.scope, target.token);
+        await secrets.setSecret(SECRET_PREFIX + target.scope, selectedToken);
       } catch {
         memoryOnly = true;
       }
@@ -11425,10 +11502,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.retryCount = 0;
     this.connectSocket();
     this.schedule();
-    this.showStatus("Verified \xB7 " + target.vaultId);
+    this.showStatus("Connected \xB7 " + target.vaultId);
     return {
       ok: true,
-      message: "Connected to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (memoryOnly ? ". Device token is held only until Obsidian closes." : "."),
+      message: (selectedToken ? "Connected" : "Connected through Tailscale") + " to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (memoryOnly ? ". Device token is held only until Obsidian closes." : "."),
       memoryOnly
     };
   }
@@ -11453,7 +11530,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     }
   }
   ready() {
-    return !!(!this.authBlocked && !this.needsReload && this.matchesScope() && this.settings.vaultId && /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token));
+    return !!(!this.authBlocked && !this.needsReload && this.matchesScope() && this.settings.vaultId && (this.settings.authMode === "tailnet" && !!this.settings.deviceId || /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token)));
   }
   showStatus(status) {
     if (this.status)
@@ -11476,7 +11553,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       method,
       throw: false,
       headers: {
-        Authorization: "Bearer " + this.token,
+        ...this.settings.authMode !== "tailnet" ? { Authorization: "Bearer " + this.token } : {},
         ...body ? { "Content-Type": "application/json" } : {}
       },
       ...body ? { body: JSON.stringify(body) } : {}
@@ -11531,7 +11608,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
           socket.close();
           return;
         }
-        socket.send(JSON.stringify({ channel: "sync", type: "auth", token }));
+        socket.send(JSON.stringify({
+          channel: "sync",
+          type: "auth",
+          ...this.settings.authMode !== "tailnet" ? { token } : {}
+        }));
       };
       socket.onmessage = (event) => {
         if (this.socket !== socket || this.stopped || !this.ready())
@@ -11983,36 +12064,55 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h3", { text: "Connect to Ignis" });
     containerEl.createEl("p", {
-      text: "Fill in all three fields, then tap Connect. Nothing is sent or saved while you type."
+      text: "Paste one connection link. If Tailscale is connected, no token or Vault ID entry is needed."
     });
+    const incoming = this.plugin.takeIncomingLink();
     const draft = {
-      serverUrl: this.plugin.settings.serverUrl,
+      serverUrl: incoming || (this.plugin.settings.serverUrl && this.plugin.settings.vaultId ? this.plugin.settings.serverUrl + "/join/" + encodeURIComponent(this.plugin.settings.vaultId) : this.plugin.settings.serverUrl),
       vaultId: this.plugin.settings.vaultId,
       token: ""
     };
+    if (incoming) {
+      try {
+        draft.vaultId = parseJoinLink(incoming).vaultId;
+      } catch {
+      }
+    }
     const state = this.plugin.connectionSummary();
     const feedback = containerEl.createDiv({ cls: "ignis-connection-feedback" });
     feedback.setAttr("role", "status");
     feedback.setAttr("aria-live", "polite");
-    feedback.setText(state.ready ? "Connected to " + state.vaultId + " \xB7 Device " + state.deviceId.slice(0, 8) : "Not connected. Your Vault ID and device token must match.");
+    feedback.setText(state.ready ? "Connected to " + state.vaultId + (this.plugin.settings.authMode === "tailnet" ? " \xB7 Tailscale" : " \xB7 Device token") : "Not connected. Paste your Ignis invite link to start.");
+    const availableVaults = containerEl.createDiv({ cls: "ignis-vault-picker" });
+    availableVaults.setAttr("aria-live", "polite");
     let serverInput;
     let vaultInput;
     let tokenInput;
     let syncButton;
-    new import_obsidian.Setting(containerEl).setName("1. Server address").setDesc("Full HTTPS address, including the port (for example :8451).").addText((t) => {
-      t.setPlaceholder("https://your-mac.example.ts.net:8451").setValue(draft.serverUrl).onChange((value) => {
+    new import_obsidian.Setting(containerEl).setName("Connection link").setDesc("A complete HTTPS /join/VaultID link, or just your Tailnet server URL.").addText((t) => {
+      t.setPlaceholder("https://your-mac.example.ts.net:8451/join/IOSLab").setValue(draft.serverUrl).onChange((value) => {
         draft.serverUrl = value;
+        try {
+          const parsed = parseJoinLink(value);
+          if (parsed.vaultId) {
+            draft.vaultId = parsed.vaultId;
+            vaultInput.value = parsed.vaultId;
+          }
+        } catch {
+        }
       });
       t.inputEl.type = "url";
       serverInput = t.inputEl;
     });
-    new import_obsidian.Setting(containerEl).setName("2. Vault ID").setDesc("Enter the exact ID from your Mac server. Capitalization matters.").addText((t) => {
+    const advancedConnection = containerEl.createEl("details");
+    advancedConnection.createEl("summary", { text: "Advanced: Vault ID or device-token connection" });
+    new import_obsidian.Setting(advancedConnection).setName("Vault ID (optional)").setDesc("Needed only when your server doesn't support automatic Vault discovery.").addText((t) => {
       t.setPlaceholder("IOSLab").setValue(draft.vaultId).onChange((value) => {
         draft.vaultId = value;
       });
       vaultInput = t.inputEl;
     });
-    new import_obsidian.Setting(containerEl).setName("3. Device token").setDesc("Paste your ignis_dev_ token. It stays here if verification fails.").addText((t) => {
+    new import_obsidian.Setting(advancedConnection).setName("Device token (optional)").setDesc("Fallback for a server without Tailscale identity authentication.").addText((t) => {
       t.setPlaceholder("ignis_dev_\u2026").onChange((value) => {
         draft.token = value;
       });
@@ -12021,18 +12121,37 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
       tokenInput = t.inputEl;
     });
     containerEl.createEl("p", {
-      text: "Tailscale provides private network access; the device token separately authorizes this Vault.",
+      text: "Nothing is transmitted until you tap Connect. A Tailscale login can grant access to your Vault without a device token.",
       cls: "setting-item-description"
     });
-    new import_obsidian.Setting(containerEl).setName("Verify connection").setDesc("Checks the URL, Vault and device together. No automatic authentication on paste.").addButton((button) => button.setButtonText("Connect and verify").setCta().onClick(async () => {
+    new import_obsidian.Setting(containerEl).setName("Verify connection").setDesc("Checks your link and permissions, then remembers only the verified connection.").addButton((button) => button.setButtonText("Connect and verify").setCta().onClick(async () => {
       serverInput.disabled = true;
       vaultInput.disabled = true;
       tokenInput.disabled = true;
       button.setDisabled(true).setButtonText("Checking connection\u2026");
-      feedback.setText("Checking server and Vault\u2026");
+      feedback.setText("Checking your Tailscale identity and Vault access\u2026");
       try {
         const result = await this.plugin.connectToServer({ ...draft });
         feedback.setText(result.message);
+        availableVaults.empty();
+        if (result.availableVaults?.length) {
+          availableVaults.createEl("p", {
+            text: "Your Tailscale account can access these Vaults:"
+          });
+          const picker = availableVaults.createEl("select");
+          picker.setAttr("aria-label", "Choose an Ignis Vault");
+          for (const name of result.availableVaults) {
+            const option = picker.createEl("option", { text: name });
+            option.setAttr("value", name);
+          }
+          picker.value = result.availableVaults[0];
+          draft.vaultId = picker.value;
+          vaultInput.value = picker.value;
+          picker.addEventListener("change", () => {
+            draft.vaultId = picker.value;
+            vaultInput.value = picker.value;
+          });
+        }
         if (result.ok) {
           draft.token = "";
           tokenInput.value = "";
@@ -12055,6 +12174,17 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
       syncButton = b;
       b.setButtonText("Sync").setDisabled(!state.ready).onClick(() => void this.plugin.syncNow());
     });
+    if (state.ready && this.plugin.settings.serverUrl && state.vaultId) {
+      const link = this.plugin.settings.serverUrl + "/join/" + encodeURIComponent(state.vaultId);
+      new import_obsidian.Setting(containerEl).setName("Connection link").setDesc("Share the link, not a device token. The recipient still needs Vault access.").addButton((b) => b.setButtonText("Copy link").onClick(async () => {
+        try {
+          await navigator.clipboard.writeText(link);
+          feedback.setText("Connection link copied. It contains no credentials.");
+        } catch {
+          feedback.setText("Copy the link manually: " + link);
+        }
+      }));
+    }
     new import_obsidian.Setting(containerEl).setName("Move verified remote deletions to local trash").setDesc("Off by default. Only a server tombstone for the same file ID and unchanged local content can move a file into Obsidian's recoverable .trash.").addToggle((toggle) => toggle.setValue(this.plugin.settings.applyRemoteDeletes).onChange(async (value) => {
       this.plugin.settings.applyRemoteDeletes = value;
       await this.plugin.saveSettings();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeOrigin, sessionError, validateConnection } from "./connection-setup.ts";
+import { normalizeOrigin, parseJoinLink, sessionError, validateConnection } from "./connection-setup.ts";
 
 const token = "ignis_dev_" + "x".repeat(43);
 const draft = {
@@ -8,6 +8,28 @@ const draft = {
   token
 };
 describe("one explicit connection transaction", () => {
+  it("accepts one secret-free HTTPS invite and never sends credentials from its URL", () => {
+    const link = "https://mac.example:8452/join/IOSLab";
+    expect(parseJoinLink(link)).toEqual({
+      origin: "https://mac.example:8452", vaultId: "IOSLab"
+    });
+    expect(validateConnection({
+      serverUrl: link, vaultId: "", token: ""
+    }, "", true)).toEqual({
+      origin: "https://mac.example:8452", vaultId: "IOSLab", token: "",
+      scope: "https://mac.example:8452|IOSLab"
+    });
+    for(const bad of [
+      "https://mac.example:8452/join/../PrivateVault",
+      "https://mac.example:8452/join/IOSLab?token=anything",
+      "https://user:password@mac.example/join/IOSLab",
+      "https://mac.example/join/%2fprivate",
+      "http://mac.example/join/IOSLab",
+      "https://mac.example/api/sync/v1"
+    ]) {
+      expect(() => parseJoinLink(bad)).toThrow();
+    }
+  });
   it("normalizes the URL without stripping the HTTPS port", () => {
     expect(normalizeOrigin(draft.serverUrl))
       .toBe("https://manamacbook-air.manakin-acoustic.ts.net:8451");

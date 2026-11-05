@@ -24,7 +24,7 @@ function heartbeatSweep(clients) {
 }
 
 function setupWebSocket(server, opts = {}) {
-  const { getVaultPath, originAllowlist, filterFileEvent } = opts;
+  const { getVaultPath, originAllowlist, filterFileEvent, authorizeConnection } = opts;
 
   if (typeof getVaultPath !== "function") {
     throw new Error("setupWebSocket: opts.getVaultPath is required");
@@ -149,6 +149,20 @@ function setupWebSocket(server, opts = {}) {
     if (!vaultId || !getVaultPath(vaultId)) {
       ws.close(4001, "Invalid or missing vault ID");
       return;
+    }
+
+    // A gateway may explicitly mark an entire connection as Tailnet-only.
+    // Reject it BEFORE registering file watchers, broadcasts or CRDT handlers.
+    if (typeof authorizeConnection === "function") {
+      const principal = authorizeConnection(req, vaultId);
+      if (principal === false) {
+        ws.close(4003, "Tailnet identity not authorized");
+        return;
+      }
+      if (principal && typeof principal === "object") {
+        ws.ignisTailnetLogin = principal.login;
+        ws.ignisTailnetDevice = principal.deviceId;
+      }
     }
 
     const vaultPath = getVaultPath(vaultId);

@@ -746,6 +746,13 @@ function createCollaborationManager({
   }
 
   channel.on("join", async (msg, ws) => {
+    // The Tailnet user is known at the HTTPS edge, but the Sync session
+    // must complete its revocable Vault authorization first. Otherwise a
+    // client could send collab.join before sync.auth to bypass revocation.
+    if (ws.ignisTailnetLogin && !ws.ignisSyncAuthorized) {
+      send(ws, "error", { path: msg.path, error: "Vault authorization required" });
+      return;
+    }
     try {
       const room = await openRoom(ws.ignisVaultId, msg.path);
 
