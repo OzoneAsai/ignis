@@ -642,6 +642,35 @@ export class NativeYjs {
     return !!room?.views.size;
   }
 
+  async resetForConnection(): Promise<void> {
+    // A different Vault is a different document namespace. Detach all
+    // CodeMirror bindings and Yjs storage before changing its connection
+    // identity, but keep the registered CM6 extension alive.
+    this.disconnected();
+    const views = [...new Set(
+      [...this.rooms.values()].flatMap((room) => [...room.views])
+    )];
+    for (const view of views) {
+      if (view.dom.isConnected) {
+        view.dispatch({ effects: this.compartment.reconfigure([]) });
+      }
+    }
+    this.paths.clear();
+    this.bound.clear();
+    for (const overlay of this.overlays.values()) overlay.destroy();
+    this.overlays.clear();
+    for (const room of this.rooms.values()) {
+      if (room.retryTimer !== null) clearTimeout(room.retryTimer);
+      await room.persistence?.destroy().catch(() => {});
+      room.undo?.destroy();
+      room.doc?.destroy();
+    }
+    this.rooms.clear();
+    for (const view of views) {
+      if (view.dom.isConnected) this.observe(view);
+    }
+  }
+
   async dispose() {
     this.disposed = true;
     this.disconnected();
