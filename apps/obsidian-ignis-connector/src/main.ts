@@ -10,6 +10,10 @@ import {
   stageWrite, acknowledgeWrite, type StagedWrite
 } from "./writes";
 import { classifyAbsence, readChangesThrough } from "./reconcile";
+import {
+  normalizeOrigin, validateConnection, sessionError,
+  type ConnectionDraft
+} from "./connection-setup";
 
 // The same Web APIs and Obsidian Vault APIs run on macOS, Windows, Linux,
 // Android and iOS. Never import Node/Electron into this plugin bundle.
@@ -87,13 +91,7 @@ function encodeBase64(bytes: Uint8Array): string {
   return btoa(text);
 }
 function validServerUrl(input: string): string {
-  const url = new URL(input);
-  if ((url.protocol !== "https:" &&
-    !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) ||
-    url.username || url.password || url.search || url.hash || url.pathname !== "/") {
-    throw new Error("Use an HTTPS server origin without a path, query or credentials");
-  }
-  return url.origin;
+  return normalizeOrigin(input);
 }
 
 async function sha256(content: Uint8Array): Promise<string> {
@@ -137,6 +135,7 @@ export default class IgnisConnector extends Plugin {
   private authBlocked = false;
   private retryCount = 0;
   private persistTail: Promise<void> = Promise.resolve();
+  private connectionAttempt = 0;
 
   private persistSettings(): Promise<void> {
     // Obsidian Plugin.saveData is asynchronous. Two overlapping Vault events
@@ -208,11 +207,6 @@ export default class IgnisConnector extends Plugin {
         this.app, this.settings.syncIssues, this.lastError
       ).open()
     });
-    this.addCommand({
-      id: "archive-and-switch-server",
-      name: "Archive old connector state and switch server or Vault",
-      callback: () => void this.archiveAndSwitch()
-    });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
         this.schedule();
@@ -271,76 +265,115 @@ export default class IgnisConnector extends Plugin {
     if (!secrets || !this.settings.vaultId || !this.matchesScope()) return "";
     return secrets.getSecret(SECRET_PREFIX + this.settings.scope) || "";
   }
-  async saveToken(token: string) {
-    if (this.needsReload) {
-      new Notice("Restart Ignis Connector to change the server or Vault");
-      return;
+  async connectToServer(draft: ConnectionDraft): Promise<{
+    ok: boolean; message: string; memoryOnly?: boolean
+  }> {
+    // Draft data is not persisted or used for any transport until one click.
+    const attempt = ++this.connectionAttempt;
+    let target: ReturnType<typeof validateConnection>;
+    try {
+      const origin = normalizeOrigin(draft.serverUrl);
+      const scope = origin + "|" + draft.vaultId.trim();
+      target = validateConnection(draft,
+        scope === this.settings.scope ? this.token || this.getSavedSecret() : "");
+    } catch (error) {
+      return { ok: false, message: (error as Error).message };
     }
-    if (!/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(token)) {
-      new Notice("Use an Ignis device token, not the server administrator token");
-      return;
+    const switching = !!this.settings.scope && this.settings.scope !== target.scope;
+    if (switching && (this.settings.pending.length || this.settings.pendingWrites.length)) {
+      return {
+        ok: false,
+        message: "Unsent local operations exist for the old Vault. Finish syncing those changes before switching servers."
+      };
     }
-    const secrets = (this.app as any).secretStorage;
-    if (!this.settings.scope) this.settings.scope = this.currentScope();
-    if (!this.matchesScope()) {
-      new Notice("Server/Vault changed: archive the old sync state before entering a new token");
-      return;
-    }
-    // Verify the *selected* origin and Vault before ever persisting a
-    // credential. Discovery only advertises candidate addresses.
-    const scope = this.settings.scope;
-    let session: { deviceId: string; vaultId: string; label: string };
+
+    let session: { deviceId: string; vaultId: string; label?: string };
     try {
       const response = await requestUrl({
-        url: this.url("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/session"),
+        url: target.origin + "/api/sync/v1/vaults/" +
+          encodeURIComponent(target.vaultId) + "/session",
         method: "GET",
-        headers: { Authorization: "Bearer " + token },
+        headers: { Authorization: "Bearer " + target.token },
         throw: false
       });
-      if (response.status !== 200 || response.json?.vaultId !== this.settings.vaultId ||
-          typeof response.json?.deviceId !== "string") {
-        new Notice("This device token was rejected or belongs to another Vault");
-        return;
-      }
+      const error = sessionError(response.status, response.json, target.vaultId);
+      if (error) return { ok: false, message: error };
       session = response.json;
     } catch {
-      new Notice("Could not verify the device token via HTTPS; it was not saved");
-      return;
+      return {
+        ok: false,
+        message: "Cannot reach the Ignis server. Check the HTTPS address, Tailscale connection and whether the Mac server is running."
+      };
     }
-    if (this.stopped || !this.matchesScope() || this.settings.scope !== scope) return;
-    if (!secrets?.setSecret || !this.settings.vaultId) {
-      new Notice("Obsidian SecretStorage is required; token kept only until app exit");
-    } else {
-      secrets.setSecret(SECRET_PREFIX + this.settings.scope, token);
+    if (this.stopped || attempt !== this.connectionAttempt) {
+      return { ok: false, message: "The connection check was interrupted. Try again." };
     }
-    this.token = token;
+
+    const oldSocket = this.socket;
+    this.socket = null;
+    oldSocket?.close();
+    this.live.disconnected();
+    if (switching) {
+      // An old Vault's CRDT document identity must never be carried into a
+      // newly verified server. Keep its tracked history for later inspection.
+      this.settings.archivedScopes.push({
+        scope: this.settings.scope,
+        cursor: this.settings.cursor,
+        baselines: this.settings.baselines,
+        pending: this.settings.pending,
+        pendingWrites: this.settings.pendingWrites,
+        syncIssues: this.settings.syncIssues,
+        yjsIds: this.settings.yjsIds
+      });
+      this.settings.cursor = 0;
+      this.settings.baselines = {};
+      this.settings.pending = [];
+      this.settings.pendingWrites = [];
+      this.settings.syncIssues = [];
+      this.settings.yjsIds = {};
+    }
+    this.settings.serverUrl = target.origin;
+    this.settings.vaultId = target.vaultId;
+    this.settings.scope = target.scope;
     this.settings.deviceId = session.deviceId;
+    this.token = target.token;
+    if (switching) await this.live.resetForConnection();
+    const secrets = (this.app as any).secretStorage;
+    let memoryOnly = !secrets?.setSecret;
+    if (secrets?.setSecret) {
+      try {
+        await secrets.setSecret(SECRET_PREFIX + target.scope, target.token);
+      } catch {
+        memoryOnly = true;
+      }
+    }
     await this.persistSettings();
     this.authBlocked = false;
+    this.needsReload = false;
     this.retryCount = 0;
     this.connectSocket();
     this.schedule();
-    new Notice("Ignis device linked: " + session.label);
+    this.showStatus("Verified · " + target.vaultId);
+    return {
+      ok: true,
+      message: "Connected to " + target.vaultId + " as " +
+        (session.label || session.deviceId.slice(0, 8)) +
+        (memoryOnly ? ". Device token is held only until Obsidian closes." : "."),
+      memoryOnly
+    };
   }
 
   async saveSettings() {
     await this.persistSettings();
-    // SecretStorage is not guaranteed on every supported mobile build.
-    // A token held only in memory must survive an unrelated settings edit,
-    // but it must never carry over to a different server/Vault identity.
-    const sameScope = this.matchesScope();
-    const storedToken = this.getSavedSecret();
-    this.token = sameScope ? (storedToken || this.token) : "";
-    this.live.disconnected();
-    const previous = this.socket;
-    this.socket = null;
-    previous?.close();
-    if (!this.matchesScope()) {
-      this.showStatus("Server/Vault changed · archive old state before switching");
-      return;
-    }
-    if (this.ready()) this.connectSocket();
-    this.schedule();
+    // Advanced settings and deletion preferences do not alter the trusted
+    // connection. Saving them must not interrupt native Yjs editing.
+  }
+  connectionSummary(): { ready: boolean; vaultId: string; deviceId: string } {
+    return {
+      ready: this.ready(),
+      vaultId: this.settings.vaultId,
+      deviceId: this.settings.deviceId
+    };
   }
   private currentScope(): string {
     return validServerUrl(this.settings.serverUrl) + "|" + this.settings.vaultId;
@@ -353,39 +386,6 @@ export default class IgnisConnector extends Plugin {
     return !!(!this.authBlocked && !this.needsReload &&
       this.matchesScope() && this.settings.vaultId &&
       /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token));
-  }
-  async archiveAndSwitch() {
-    const newScope = this.currentScope();
-    if (newScope === this.settings.scope) {
-      new Notice("The current server and Vault are already selected");
-      return;
-    }
-    this.settings.archivedScopes.push({
-      scope: this.settings.scope,
-      cursor: this.settings.cursor,
-      baselines: this.settings.baselines,
-      pending: this.settings.pending,
-      pendingWrites: this.settings.pendingWrites,
-      syncIssues: this.settings.syncIssues,
-      yjsIds: this.settings.yjsIds
-    });
-    this.settings.scope = newScope;
-    this.settings.cursor = 0;
-    this.settings.baselines = {};
-    this.settings.pending = [];
-    this.settings.pendingWrites = [];
-    this.settings.syncIssues = [];
-    this.settings.yjsIds = {};
-    this.settings.deviceId = "";
-    this.token = "";
-    this.authBlocked = false;
-    this.retryCount = 0;
-    this.needsReload = true;
-    this.live.disconnected();
-    this.socket?.close();
-    await this.persistSettings();
-    this.showStatus("Archived old state · restart plugin before connecting");
-    new Notice("Old pending work was archived, not deleted. Disable and re-enable Ignis Connector before entering a token.");
   }
   private showStatus(status: string) {
     if (this.status) this.status.setText("Ignis: " + status);
@@ -904,60 +904,128 @@ class SyncIssuesModal extends Modal {
   }
 }
 
-class ConnectorSettings extends PluginSettingTab {
+export class ConnectorSettings extends PluginSettingTab {
   constructor(app: any, private readonly plugin: IgnisConnector) {
     super(app, plugin);
   }
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName("Ignis HTTPS origin")
-      .setDesc("Manually trusted origin. Discovery cannot silently replace it.")
-      .addText((t) => t.setPlaceholder("https://ignis.example.org")
-        .setValue(this.plugin.settings.serverUrl)
-        .onChange(async (value) => {
-          this.plugin.settings.serverUrl = value.trim();
-          await this.plugin.saveSettings();
-        }));
-    new Setting(containerEl).setName("Vault ID")
-      .addText((t) => t.setValue(this.plugin.settings.vaultId)
-        .onChange(async (value) => {
-          this.plugin.settings.vaultId = value.trim();
-          await this.plugin.saveSettings();
-        }));
-    new Setting(containerEl).setName("This device's Ignis token")
-      .setDesc("Have the server administrator enroll this device and paste its ignis_dev_ token. Never enter IGNIS_SYNC_TOKEN here.")
-      .addText((t) => t.setPlaceholder("ignis_dev_…")
-        .onChange(async (value) => {
-          if (/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(value)) {
-            await this.plugin.saveToken(value);
-            t.setValue("");
+    containerEl.createEl("h3", { text: "Connect to Ignis" });
+    containerEl.createEl("p", {
+      text: "Fill in all three fields, then tap Connect. Nothing is sent or saved while you type."
+    });
+    const draft: ConnectionDraft = {
+      serverUrl: this.plugin.settings.serverUrl,
+      vaultId: this.plugin.settings.vaultId,
+      token: ""
+    };
+    const state = this.plugin.connectionSummary();
+    const feedback = containerEl.createDiv({ cls: "ignis-connection-feedback" });
+    feedback.setAttr("role", "status");
+    feedback.setAttr("aria-live", "polite");
+    feedback.setText(state.ready ?
+      "Connected to " + state.vaultId + " · Device " + state.deviceId.slice(0, 8) :
+      "Not connected. Your Vault ID and device token must match.");
+
+    let serverInput: HTMLInputElement;
+    let vaultInput: HTMLInputElement;
+    let tokenInput: HTMLInputElement;
+    let syncButton: { setDisabled(disabled: boolean): unknown } | undefined;
+    new Setting(containerEl).setName("1. Server address")
+      .setDesc("Full HTTPS address, including the port (for example :8451).")
+      .addText((t) => {
+        t.setPlaceholder("https://your-mac.example.ts.net:8451")
+          .setValue(draft.serverUrl)
+          .onChange((value) => { draft.serverUrl = value; });
+        t.inputEl.type = "url";
+        serverInput = t.inputEl;
+      });
+    new Setting(containerEl).setName("2. Vault ID")
+      .setDesc("Enter the exact ID from your Mac server. Capitalization matters.")
+      .addText((t) => {
+        t.setPlaceholder("IOSLab")
+          .setValue(draft.vaultId)
+          .onChange((value) => { draft.vaultId = value; });
+        vaultInput = t.inputEl;
+      });
+    new Setting(containerEl).setName("3. Device token")
+      .setDesc("Paste your ignis_dev_ token. It stays here if verification fails.")
+      .addText((t) => {
+        t.setPlaceholder("ignis_dev_…")
+          .onChange((value) => { draft.token = value; });
+        t.inputEl.type = "password";
+        t.inputEl.autocomplete = "off";
+        tokenInput = t.inputEl;
+      });
+    containerEl.createEl("p", {
+      text: "Tailscale provides private network access; the device token separately authorizes this Vault.",
+      cls: "setting-item-description"
+    });
+    new Setting(containerEl)
+      .setName("Verify connection")
+      .setDesc("Checks the URL, Vault and device together. No automatic authentication on paste.")
+      .addButton((button) => button.setButtonText("Connect and verify")
+        .setCta()
+        .onClick(async () => {
+          serverInput.disabled = true;
+          vaultInput.disabled = true;
+          tokenInput.disabled = true;
+          button.setDisabled(true).setButtonText("Checking connection…");
+          feedback.setText("Checking server and Vault…");
+          try {
+            const result = await this.plugin.connectToServer({ ...draft });
+            feedback.setText(result.message);
+            if (result.ok) {
+              // Clear only after the server has verified the token.
+              draft.token = "";
+              tokenInput.value = "";
+              button.setButtonText("Connected");
+              syncButton?.setDisabled(false);
+            } else {
+              button.setButtonText("Retry connection");
+            }
+          } catch {
+            feedback.setText("Could not save this connection. Your fields are unchanged; try again.");
+            button.setButtonText("Retry connection");
+          } finally {
+            serverInput.disabled = false;
+            vaultInput.disabled = false;
+            tokenInput.disabled = false;
+            button.setDisabled(false);
           }
         }));
-    new Setting(containerEl).setName("Registered device ID")
-      .setDesc(this.plugin.settings.deviceId || "No device credential verified");
-    new Setting(containerEl).setName("Syncthing Discovery URL")
-      .setDesc("Optional private stdiscosrv /v2/ HTTPS endpoint")
-      .addText((t) => t.setValue(this.plugin.settings.discoveryUrl)
-        .onChange(async (value) => {
-          this.plugin.settings.discoveryUrl = value.trim();
-          await this.plugin.saveSettings();
-        }));
-    new Setting(containerEl).setName("Ignis Syncthing Device ID")
-      .addText((t) => t.setValue(this.plugin.settings.serverDeviceId)
-        .onChange(async (value) => {
-          this.plugin.settings.serverDeviceId = value.trim();
-          await this.plugin.saveSettings();
-        }));
     new Setting(containerEl).setName("Sync now")
-      .setDesc("Experimental preview. Conflicting local content is never overwritten.")
-      .addButton((b) => b.setButtonText("Sync").onClick(() => void this.plugin.syncNow()));
+      .setDesc("Available after the server confirms this device. Conflicting local content is retained.")
+      .addButton((b) => {
+        syncButton = b;
+        b.setButtonText("Sync").setDisabled(!state.ready)
+          .onClick(() => void this.plugin.syncNow());
+      });
     new Setting(containerEl).setName("Move verified remote deletions to local trash")
       .setDesc("Off by default. Only a server tombstone for the same file ID and unchanged local content can move a file into Obsidian's recoverable .trash.")
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.applyRemoteDeletes)
         .onChange(async (value) => {
           this.plugin.settings.applyRemoteDeletes = value;
+          await this.plugin.saveSettings();
+        }));
+    const advanced = containerEl.createEl("details");
+    advanced.createEl("summary", { text: "Advanced: Syncthing Discovery" });
+    advanced.createEl("p", {
+      text: "Optional address lookup. Discovery never overrides the verified HTTPS server."
+    });
+    new Setting(advanced).setName("Discovery URL")
+      .setDesc("Optional private stdiscosrv /v2/ HTTPS endpoint")
+      .addText((t) => t.setValue(this.plugin.settings.discoveryUrl)
+        .onChange(async (value) => {
+          this.plugin.settings.discoveryUrl = value.trim();
+          await this.plugin.saveSettings();
+        }));
+    new Setting(advanced).setName("Syncthing Device ID")
+      .addText((t) => t.setValue(this.plugin.settings.serverDeviceId)
+        .onChange(async (value) => {
+          this.plugin.settings.serverDeviceId = value.trim();
           await this.plugin.saveSettings();
         }));
   }

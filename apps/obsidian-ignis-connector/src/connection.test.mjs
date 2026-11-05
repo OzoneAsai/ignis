@@ -159,7 +159,7 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     expect(sockets()).toHaveLength(1);
   });
 
-  it("keeps a memory-only token on settings edits but never across server changes", async () => {
+  it("does not restart a live editor when advanced preferences change", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const plugin = connector();
     plugin.app = {};
@@ -169,14 +169,8 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     plugin.settings.discoveryUrl = "https://disco.example/v2/";
     await plugin.saveSettings();
     expect(plugin.token).toBe(originalToken);
-    expect(sockets()).toHaveLength(2);
-
-    plugin.settings.serverUrl = "https://other.example/";
-    await plugin.saveSettings();
-    expect(plugin.token).toBe("");
-    expect(plugin.socket).toBe(null);
-    expect(plugin.ready()).toBe(false);
-    expect(sockets()).toHaveLength(2);
+    expect(sockets()).toHaveLength(1);
+    expect(plugin.socket).toBe(sockets()[0]);
   });
 
   it("verifies a Vault-scoped token over HTTPS before storing any secret", async () => {
@@ -192,7 +186,11 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
         vaultId: "lab", label: "iPhone"
       }
     });
-    await plugin.saveToken(good);
+    const result = await plugin.connectToServer({
+      serverUrl: "https://ignis.example/",
+      vaultId: "lab", token: good
+    });
+    expect(result.ok).toBe(true);
     expect(mockRequest).toHaveBeenCalledWith(expect.objectContaining({
       url: "https://ignis.example/api/sync/v1/vaults/lab/session",
       headers: { Authorization: "Bearer " + good }
@@ -211,16 +209,80 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     const plugin = connector();
     plugin.app = { secretStorage: { setSecret: vi.fn() } };
     plugin.saveData = vi.fn(async () => {});
-    await plugin.saveToken("an-administrator-secret-that-must-never-be-saved");
+    const invalid = await plugin.connectToServer({
+      serverUrl: "https://ignis.example", vaultId: "lab",
+      token: "an-administrator-secret-that-must-never-be-saved"
+    });
+    expect(invalid.ok).toBe(false);
     expect(mockRequest).not.toHaveBeenCalled();
     const token = "ignis_dev_" + "d".repeat(43);
     mockRequest.mockResolvedValueOnce({
       status: 200, json: { deviceId: "device", vaultId: "other", label: "Wrong" }
     });
-    await plugin.saveToken(token);
+    const mismatch = await plugin.connectToServer({
+      serverUrl: "https://ignis.example", vaultId: "lab", token
+    });
+    expect(mismatch).toMatchObject({ ok: false });
     expect(plugin.app.secretStorage.setSecret).not.toHaveBeenCalled();
     expect(plugin.token).toBe("ignis_dev_" + "a".repeat(43));
     expect(sockets()).toHaveLength(0);
+  });
+
+  it("does not send credentials when Vault ID is empty, nor clear the old session", async () => {
+    const plugin = connector();
+    plugin.app = { secretStorage: { setSecret: vi.fn() } };
+    plugin.saveData = vi.fn(async () => {});
+    const existing = plugin.token;
+    const result = await plugin.connectToServer({
+      serverUrl: "https://ignis.example", vaultId: "",
+      token: "ignis_dev_" + "b".repeat(43)
+    });
+    expect(result).toMatchObject({ ok: false });
+    expect(result.message).toMatch(/Vault ID/);
+    expect(mockRequest).not.toHaveBeenCalled();
+    expect(plugin.token).toBe(existing);
+    expect(plugin.settings.vaultId).toBe("lab");
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a 404 gateway route from an unauthorized device", async () => {
+    const plugin = connector();
+    plugin.app = {};
+    plugin.saveData = vi.fn(async () => {});
+    mockRequest.mockResolvedValueOnce({ status: 404, json: { code: "NOT_FOUND" } });
+    const result = await plugin.connectToServer({
+      serverUrl: "https://ignis.example", vaultId: "lab",
+      token: "ignis_dev_" + "b".repeat(43)
+    });
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/API not found/);
+    expect(plugin.settings.deviceId).toBe("device-a");
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
+  it("verifies the new server before resetting any old Yjs Vault", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const plugin = connector();
+    plugin.app = { secretStorage: { setSecret: vi.fn(), getSecret: vi.fn() } };
+    plugin.saveData = vi.fn(async () => {});
+    plugin.settings.pendingWrites = [];
+    plugin.settings.syncIssues = [];
+    plugin.settings.archivedScopes = [];
+    plugin.live.resetForConnection = vi.fn(async () => {});
+    mockRequest.mockResolvedValueOnce({
+      status: 200,
+      json: { deviceId: "new-device", vaultId: "IOSLab", label: "Phone" }
+    });
+    const result = await plugin.connectToServer({
+      serverUrl: "https://mac.example:8451", vaultId: "IOSLab",
+      token: "ignis_dev_" + "c".repeat(43)
+    });
+    expect(result.ok).toBe(true);
+    expect(plugin.live.resetForConnection).toHaveBeenCalledOnce();
+    expect(plugin.settings.archivedScopes).toHaveLength(1);
+    expect(plugin.settings.scope).toBe("https://mac.example:8451|IOSLab");
+    expect(plugin.settings.vaultId).toBe("IOSLab");
+    expect(sockets()).toHaveLength(1);
   });
 
   it("stops reconnecting a revoked socket without retrying the credential", () => {

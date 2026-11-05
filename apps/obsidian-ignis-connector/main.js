@@ -31,6 +31,7 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
+  ConnectorSettings: () => ConnectorSettings,
   default: () => IgnisConnector
 });
 module.exports = __toCommonJS(main_exports);
@@ -10892,6 +10893,35 @@ var NativeYjs = class {
     const room = this.rooms.get(path);
     return !!room?.views.size;
   }
+  async resetForConnection() {
+    this.disconnected();
+    const views = [...new Set(
+      [...this.rooms.values()].flatMap((room) => [...room.views])
+    )];
+    for (const view of views) {
+      if (view.dom.isConnected) {
+        view.dispatch({ effects: this.compartment.reconfigure([]) });
+      }
+    }
+    this.paths.clear();
+    this.bound.clear();
+    for (const overlay of this.overlays.values())
+      overlay.destroy();
+    this.overlays.clear();
+    for (const room of this.rooms.values()) {
+      if (room.retryTimer !== null)
+        clearTimeout(room.retryTimer);
+      await room.persistence?.destroy().catch(() => {
+      });
+      room.undo?.destroy();
+      room.doc?.destroy();
+    }
+    this.rooms.clear();
+    for (const view of views) {
+      if (view.dom.isConnected)
+        this.observe(view);
+    }
+  }
   async dispose() {
     this.disposed = true;
     this.disconnected();
@@ -11046,6 +11076,60 @@ async function readChangesThrough(start, through, fetchPage) {
   return result;
 }
 
+// src/connection-setup.ts
+var TOKEN = /^ignis_dev_[A-Za-z0-9_-]{43}$/;
+var VAULT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+function normalizeOrigin(raw) {
+  const input = raw.trim();
+  if (!input)
+    throw new Error("Enter your Ignis server URL first.");
+  let url;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error("Enter a complete URL, including https://.");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+    throw new Error("Use only the HTTPS server address, including its port; no extra path.");
+  }
+  return url.origin;
+}
+function validateConnection(draft, existingToken = "") {
+  const origin = normalizeOrigin(draft.serverUrl);
+  const vaultId = draft.vaultId.trim();
+  if (!vaultId)
+    throw new Error("Enter the Vault ID provided by your server.");
+  if (!VAULT_ID.test(vaultId)) {
+    throw new Error("The Vault ID can contain letters, numbers, dots, hyphens and underscores.");
+  }
+  const token = draft.token.trim() || existingToken;
+  if (!token)
+    throw new Error("Paste your device token to connect.");
+  if (!TOKEN.test(token)) {
+    throw new Error("This is not an Ignis device token. It must start with ignis_dev_.");
+  }
+  return { origin, vaultId, token, scope: origin + "|" + vaultId };
+}
+function sessionError(status, body, expectedVaultId) {
+  if (status === 401 || status === 403) {
+    return "Device not authorized for this Vault. Check the Vault ID and device token together.";
+  }
+  if (status === 404) {
+    return "Sync API not found. Check the full server address and port, and confirm that the Vault ID exists.";
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return "The HTTPS gateway cannot reach Ignis. Check that the Mac server is running.";
+  }
+  if (status !== 200) {
+    return "Ignis returned HTTP " + status + ". Check the server address and try again.";
+  }
+  const data = body;
+  if (data?.vaultId !== expectedVaultId || typeof data?.deviceId !== "string" || !data.deviceId) {
+    return "The server confirmed a different Vault or returned an invalid device identity.";
+  }
+  return null;
+}
+
 // src/main.ts
 var DEFAULT = {
   serverUrl: "",
@@ -11084,11 +11168,7 @@ function encodeBase64(bytes) {
   return btoa(text2);
 }
 function validServerUrl(input) {
-  const url = new URL(input);
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
-    throw new Error("Use an HTTPS server origin without a path, query or credentials");
-  }
-  return url.origin;
+  return normalizeOrigin(input);
 }
 async function sha256(content) {
   const copy2 = new Uint8Array(content.byteLength);
@@ -11132,6 +11212,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   authBlocked = false;
   retryCount = 0;
   persistTail = Promise.resolve();
+  connectionAttempt = 0;
   persistSettings() {
     const snapshot = JSON.parse(JSON.stringify(this.settings));
     const next = this.persistTail.catch(() => {
@@ -11201,11 +11282,6 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         this.lastError
       ).open()
     });
-    this.addCommand({
-      id: "archive-and-switch-server",
-      name: "Archive old connector state and switch server or Vault",
-      callback: () => void this.archiveAndSwitch()
-    });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof import_obsidian.TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
         this.schedule();
@@ -11265,72 +11341,106 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       return "";
     return secrets.getSecret(SECRET_PREFIX + this.settings.scope) || "";
   }
-  async saveToken(token) {
-    if (this.needsReload) {
-      new import_obsidian.Notice("Restart Ignis Connector to change the server or Vault");
-      return;
+  async connectToServer(draft) {
+    const attempt = ++this.connectionAttempt;
+    let target;
+    try {
+      const origin = normalizeOrigin(draft.serverUrl);
+      const scope = origin + "|" + draft.vaultId.trim();
+      target = validateConnection(
+        draft,
+        scope === this.settings.scope ? this.token || this.getSavedSecret() : ""
+      );
+    } catch (error) {
+      return { ok: false, message: error.message };
     }
-    if (!/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(token)) {
-      new import_obsidian.Notice("Use an Ignis device token, not the server administrator token");
-      return;
+    const switching = !!this.settings.scope && this.settings.scope !== target.scope;
+    if (switching && (this.settings.pending.length || this.settings.pendingWrites.length)) {
+      return {
+        ok: false,
+        message: "Unsent local operations exist for the old Vault. Finish syncing those changes before switching servers."
+      };
     }
-    const secrets = this.app.secretStorage;
-    if (!this.settings.scope)
-      this.settings.scope = this.currentScope();
-    if (!this.matchesScope()) {
-      new import_obsidian.Notice("Server/Vault changed: archive the old sync state before entering a new token");
-      return;
-    }
-    const scope = this.settings.scope;
     let session;
     try {
       const response = await (0, import_obsidian.requestUrl)({
-        url: this.url("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/session"),
+        url: target.origin + "/api/sync/v1/vaults/" + encodeURIComponent(target.vaultId) + "/session",
         method: "GET",
-        headers: { Authorization: "Bearer " + token },
+        headers: { Authorization: "Bearer " + target.token },
         throw: false
       });
-      if (response.status !== 200 || response.json?.vaultId !== this.settings.vaultId || typeof response.json?.deviceId !== "string") {
-        new import_obsidian.Notice("This device token was rejected or belongs to another Vault");
-        return;
-      }
+      const error = sessionError(response.status, response.json, target.vaultId);
+      if (error)
+        return { ok: false, message: error };
       session = response.json;
     } catch {
-      new import_obsidian.Notice("Could not verify the device token via HTTPS; it was not saved");
-      return;
+      return {
+        ok: false,
+        message: "Cannot reach the Ignis server. Check the HTTPS address, Tailscale connection and whether the Mac server is running."
+      };
     }
-    if (this.stopped || !this.matchesScope() || this.settings.scope !== scope)
-      return;
-    if (!secrets?.setSecret || !this.settings.vaultId) {
-      new import_obsidian.Notice("Obsidian SecretStorage is required; token kept only until app exit");
-    } else {
-      secrets.setSecret(SECRET_PREFIX + this.settings.scope, token);
+    if (this.stopped || attempt !== this.connectionAttempt) {
+      return { ok: false, message: "The connection check was interrupted. Try again." };
     }
-    this.token = token;
+    const oldSocket = this.socket;
+    this.socket = null;
+    oldSocket?.close();
+    this.live.disconnected();
+    if (switching) {
+      this.settings.archivedScopes.push({
+        scope: this.settings.scope,
+        cursor: this.settings.cursor,
+        baselines: this.settings.baselines,
+        pending: this.settings.pending,
+        pendingWrites: this.settings.pendingWrites,
+        syncIssues: this.settings.syncIssues,
+        yjsIds: this.settings.yjsIds
+      });
+      this.settings.cursor = 0;
+      this.settings.baselines = {};
+      this.settings.pending = [];
+      this.settings.pendingWrites = [];
+      this.settings.syncIssues = [];
+      this.settings.yjsIds = {};
+    }
+    this.settings.serverUrl = target.origin;
+    this.settings.vaultId = target.vaultId;
+    this.settings.scope = target.scope;
     this.settings.deviceId = session.deviceId;
+    this.token = target.token;
+    if (switching)
+      await this.live.resetForConnection();
+    const secrets = this.app.secretStorage;
+    let memoryOnly = !secrets?.setSecret;
+    if (secrets?.setSecret) {
+      try {
+        await secrets.setSecret(SECRET_PREFIX + target.scope, target.token);
+      } catch {
+        memoryOnly = true;
+      }
+    }
     await this.persistSettings();
     this.authBlocked = false;
+    this.needsReload = false;
     this.retryCount = 0;
     this.connectSocket();
     this.schedule();
-    new import_obsidian.Notice("Ignis device linked: " + session.label);
+    this.showStatus("Verified \xB7 " + target.vaultId);
+    return {
+      ok: true,
+      message: "Connected to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (memoryOnly ? ". Device token is held only until Obsidian closes." : "."),
+      memoryOnly
+    };
   }
   async saveSettings() {
     await this.persistSettings();
-    const sameScope = this.matchesScope();
-    const storedToken = this.getSavedSecret();
-    this.token = sameScope ? storedToken || this.token : "";
-    this.live.disconnected();
-    const previous = this.socket;
-    this.socket = null;
-    previous?.close();
-    if (!this.matchesScope()) {
-      this.showStatus("Server/Vault changed \xB7 archive old state before switching");
-      return;
-    }
-    if (this.ready())
-      this.connectSocket();
-    this.schedule();
+  }
+  connectionSummary() {
+    return {
+      ready: this.ready(),
+      vaultId: this.settings.vaultId,
+      deviceId: this.settings.deviceId
+    };
   }
   currentScope() {
     return validServerUrl(this.settings.serverUrl) + "|" + this.settings.vaultId;
@@ -11344,39 +11454,6 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   }
   ready() {
     return !!(!this.authBlocked && !this.needsReload && this.matchesScope() && this.settings.vaultId && /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token));
-  }
-  async archiveAndSwitch() {
-    const newScope = this.currentScope();
-    if (newScope === this.settings.scope) {
-      new import_obsidian.Notice("The current server and Vault are already selected");
-      return;
-    }
-    this.settings.archivedScopes.push({
-      scope: this.settings.scope,
-      cursor: this.settings.cursor,
-      baselines: this.settings.baselines,
-      pending: this.settings.pending,
-      pendingWrites: this.settings.pendingWrites,
-      syncIssues: this.settings.syncIssues,
-      yjsIds: this.settings.yjsIds
-    });
-    this.settings.scope = newScope;
-    this.settings.cursor = 0;
-    this.settings.baselines = {};
-    this.settings.pending = [];
-    this.settings.pendingWrites = [];
-    this.settings.syncIssues = [];
-    this.settings.yjsIds = {};
-    this.settings.deviceId = "";
-    this.token = "";
-    this.authBlocked = false;
-    this.retryCount = 0;
-    this.needsReload = true;
-    this.live.disconnected();
-    this.socket?.close();
-    await this.persistSettings();
-    this.showStatus("Archived old state \xB7 restart plugin before connecting");
-    new import_obsidian.Notice("Old pending work was archived, not deleted. Disable and re-enable Ignis Connector before entering a token.");
   }
   showStatus(status) {
     if (this.status)
@@ -11904,32 +11981,95 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Ignis HTTPS origin").setDesc("Manually trusted origin. Discovery cannot silently replace it.").addText((t) => t.setPlaceholder("https://ignis.example.org").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
-      this.plugin.settings.serverUrl = value.trim();
-      await this.plugin.saveSettings();
-    }));
-    new import_obsidian.Setting(containerEl).setName("Vault ID").addText((t) => t.setValue(this.plugin.settings.vaultId).onChange(async (value) => {
-      this.plugin.settings.vaultId = value.trim();
-      await this.plugin.saveSettings();
-    }));
-    new import_obsidian.Setting(containerEl).setName("This device's Ignis token").setDesc("Have the server administrator enroll this device and paste its ignis_dev_ token. Never enter IGNIS_SYNC_TOKEN here.").addText((t) => t.setPlaceholder("ignis_dev_\u2026").onChange(async (value) => {
-      if (/^ignis_dev_[A-Za-z0-9_-]{43}$/.test(value)) {
-        await this.plugin.saveToken(value);
-        t.setValue("");
+    containerEl.createEl("h3", { text: "Connect to Ignis" });
+    containerEl.createEl("p", {
+      text: "Fill in all three fields, then tap Connect. Nothing is sent or saved while you type."
+    });
+    const draft = {
+      serverUrl: this.plugin.settings.serverUrl,
+      vaultId: this.plugin.settings.vaultId,
+      token: ""
+    };
+    const state = this.plugin.connectionSummary();
+    const feedback = containerEl.createDiv({ cls: "ignis-connection-feedback" });
+    feedback.setAttr("role", "status");
+    feedback.setAttr("aria-live", "polite");
+    feedback.setText(state.ready ? "Connected to " + state.vaultId + " \xB7 Device " + state.deviceId.slice(0, 8) : "Not connected. Your Vault ID and device token must match.");
+    let serverInput;
+    let vaultInput;
+    let tokenInput;
+    let syncButton;
+    new import_obsidian.Setting(containerEl).setName("1. Server address").setDesc("Full HTTPS address, including the port (for example :8451).").addText((t) => {
+      t.setPlaceholder("https://your-mac.example.ts.net:8451").setValue(draft.serverUrl).onChange((value) => {
+        draft.serverUrl = value;
+      });
+      t.inputEl.type = "url";
+      serverInput = t.inputEl;
+    });
+    new import_obsidian.Setting(containerEl).setName("2. Vault ID").setDesc("Enter the exact ID from your Mac server. Capitalization matters.").addText((t) => {
+      t.setPlaceholder("IOSLab").setValue(draft.vaultId).onChange((value) => {
+        draft.vaultId = value;
+      });
+      vaultInput = t.inputEl;
+    });
+    new import_obsidian.Setting(containerEl).setName("3. Device token").setDesc("Paste your ignis_dev_ token. It stays here if verification fails.").addText((t) => {
+      t.setPlaceholder("ignis_dev_\u2026").onChange((value) => {
+        draft.token = value;
+      });
+      t.inputEl.type = "password";
+      t.inputEl.autocomplete = "off";
+      tokenInput = t.inputEl;
+    });
+    containerEl.createEl("p", {
+      text: "Tailscale provides private network access; the device token separately authorizes this Vault.",
+      cls: "setting-item-description"
+    });
+    new import_obsidian.Setting(containerEl).setName("Verify connection").setDesc("Checks the URL, Vault and device together. No automatic authentication on paste.").addButton((button) => button.setButtonText("Connect and verify").setCta().onClick(async () => {
+      serverInput.disabled = true;
+      vaultInput.disabled = true;
+      tokenInput.disabled = true;
+      button.setDisabled(true).setButtonText("Checking connection\u2026");
+      feedback.setText("Checking server and Vault\u2026");
+      try {
+        const result = await this.plugin.connectToServer({ ...draft });
+        feedback.setText(result.message);
+        if (result.ok) {
+          draft.token = "";
+          tokenInput.value = "";
+          button.setButtonText("Connected");
+          syncButton?.setDisabled(false);
+        } else {
+          button.setButtonText("Retry connection");
+        }
+      } catch {
+        feedback.setText("Could not save this connection. Your fields are unchanged; try again.");
+        button.setButtonText("Retry connection");
+      } finally {
+        serverInput.disabled = false;
+        vaultInput.disabled = false;
+        tokenInput.disabled = false;
+        button.setDisabled(false);
       }
     }));
-    new import_obsidian.Setting(containerEl).setName("Registered device ID").setDesc(this.plugin.settings.deviceId || "No device credential verified");
-    new import_obsidian.Setting(containerEl).setName("Syncthing Discovery URL").setDesc("Optional private stdiscosrv /v2/ HTTPS endpoint").addText((t) => t.setValue(this.plugin.settings.discoveryUrl).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Sync now").setDesc("Available after the server confirms this device. Conflicting local content is retained.").addButton((b) => {
+      syncButton = b;
+      b.setButtonText("Sync").setDisabled(!state.ready).onClick(() => void this.plugin.syncNow());
+    });
+    new import_obsidian.Setting(containerEl).setName("Move verified remote deletions to local trash").setDesc("Off by default. Only a server tombstone for the same file ID and unchanged local content can move a file into Obsidian's recoverable .trash.").addToggle((toggle) => toggle.setValue(this.plugin.settings.applyRemoteDeletes).onChange(async (value) => {
+      this.plugin.settings.applyRemoteDeletes = value;
+      await this.plugin.saveSettings();
+    }));
+    const advanced = containerEl.createEl("details");
+    advanced.createEl("summary", { text: "Advanced: Syncthing Discovery" });
+    advanced.createEl("p", {
+      text: "Optional address lookup. Discovery never overrides the verified HTTPS server."
+    });
+    new import_obsidian.Setting(advanced).setName("Discovery URL").setDesc("Optional private stdiscosrv /v2/ HTTPS endpoint").addText((t) => t.setValue(this.plugin.settings.discoveryUrl).onChange(async (value) => {
       this.plugin.settings.discoveryUrl = value.trim();
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Ignis Syncthing Device ID").addText((t) => t.setValue(this.plugin.settings.serverDeviceId).onChange(async (value) => {
+    new import_obsidian.Setting(advanced).setName("Syncthing Device ID").addText((t) => t.setValue(this.plugin.settings.serverDeviceId).onChange(async (value) => {
       this.plugin.settings.serverDeviceId = value.trim();
-      await this.plugin.saveSettings();
-    }));
-    new import_obsidian.Setting(containerEl).setName("Sync now").setDesc("Experimental preview. Conflicting local content is never overwritten.").addButton((b) => b.setButtonText("Sync").onClick(() => void this.plugin.syncNow()));
-    new import_obsidian.Setting(containerEl).setName("Move verified remote deletions to local trash").setDesc("Off by default. Only a server tombstone for the same file ID and unchanged local content can move a file into Obsidian's recoverable .trash.").addToggle((toggle) => toggle.setValue(this.plugin.settings.applyRemoteDeletes).onChange(async (value) => {
-      this.plugin.settings.applyRemoteDeletes = value;
       await this.plugin.saveSettings();
     }));
   }
