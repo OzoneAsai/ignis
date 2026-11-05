@@ -368,10 +368,37 @@ try {
   const [localInit, peerInit] = await Promise.all([localInitWait, peerInitWait]);
   assert.equal(localInit.documentId, peerInit.documentId);
   assert.equal(localInit.documentId, init.documentId);
+  assert.notEqual(localInit.self.id, peerInit.self.id,
+    "two real devices need distinct remote cursor identities");
+  assert.match(localInit.self.color, /^#[a-f0-9]{6}$/i);
+  assert.match(peerInit.self.color, /^#[a-f0-9]{6}$/i);
   const nativeDoc = new Y.Doc();
   const peerDoc = new Y.Doc();
   Y.applyUpdate(nativeDoc, Buffer.from(localInit.state, "base64"));
   Y.applyUpdate(peerDoc, Buffer.from(peerInit.state, "base64"));
+  // The native Connector uses these very same server-originated Yjs-relative
+  // cursor messages; never introduce a second y-websocket Awareness protocol.
+  const relative = Y.createRelativePositionFromTypeIndex(peerDoc.getText("content"), 2);
+  const encodedCursor = Buffer.from(Y.encodeRelativePosition(relative)).toString("base64");
+  const cursorReceived = recv(socket, msg =>
+    msg.channel === "collab" && msg.type === "cursor" &&
+    msg.id === peerInit.self.id, "second client's cursor");
+  peerSocket.send(JSON.stringify({
+    channel: "collab", type: "cursor", path: "alpha.md",
+    anchor: encodedCursor, head: encodedCursor
+  }));
+  assert.deepEqual(
+    (({ id, anchor, head }) => ({ id, anchor, head }))(await cursorReceived),
+    { id: peerInit.self.id, anchor: encodedCursor, head: encodedCursor }
+  );
+  const awayReceived = recv(socket, msg =>
+    msg.channel === "collab" && msg.type === "cursor" &&
+    msg.id === peerInit.self.id && msg.anchor === null,
+  "second client's cursor away");
+  peerSocket.send(JSON.stringify({
+    channel: "collab", type: "cursor-away", path: "alpha.md"
+  }));
+  assert.equal((await awayReceived).head, null);
   const nativeVector = Y.encodeStateVector(nativeDoc);
   const peerVector = Y.encodeStateVector(peerDoc);
   nativeDoc.getText("content").insert(0, "native:");
@@ -446,7 +473,7 @@ try {
     "/api/sync/v1/vaults/lab/session", secondDevice.token
   )).status, 200);
 
-  console.log("Sync smoke passed: two-client Yjs merge, shared Yjs/Sync generation, persisted CRDT ACK, scoped enrollment and persistent individual revocation, WSS disconnect, binary attachments, chained offline renames/deletion, bounded download, idempotency, conflicts, reboot");
+  console.log("Sync smoke passed: native/WebUI-compatible cursor and away, two-client Yjs merge, shared generation, persisted CRDT ACK, scoped enrollment and individual revocation, WS disconnect, binary attachments, offline rename/delete, bounded download, idempotency, conflicts, reboot");
 } catch (e) {
   console.error("Sync smoke failed:", e.message);
   console.error(output.slice(-6000));
