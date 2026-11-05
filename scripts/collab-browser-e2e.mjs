@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { WebSocket } = require("ws");
+const Y = require("yjs");
 const base = process.env.BASE_URL || "http://127.0.0.1:3191";
 const chromePath = process.env.CHROME_PATH ||
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -115,6 +116,7 @@ const chrome = spawn(chromePath, [
 ], { stdio: "ignore" });
 
 let cdp;
+let thirdPeer = null;
 
 try {
   const debug = await poll(async () => {
@@ -195,6 +197,84 @@ try {
   })()`), 18000);
 
   console.log("PASS: distinct remote identity, caret, and text selection:", JSON.stringify(awareness));
+
+  // A third online collaborator publishes three independent Yjs-relative
+  // selections. WebUI must draw all three, keep the other editor in its
+  // roster even when the cursor goes away, and clear nodes on departure.
+  thirdPeer = new WebSocket(base.replace(/^http/, "ws") +
+    "/ws?vault=" + encodeURIComponent(vaultId));
+  await new Promise((resolve, reject) => {
+    thirdPeer.once("open", resolve);
+    thirdPeer.once("error", reject);
+  });
+  const thirdInit = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Third participant did not join")), 10000);
+    const listener = (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.channel === "collab" && message.type === "init" &&
+          message.path === notePath) {
+        clearTimeout(timer);
+        thirdPeer.off("message", listener);
+        resolve(message);
+      }
+    };
+    thirdPeer.on("message", listener);
+  });
+  thirdPeer.send(JSON.stringify({
+    channel: "collab", type: "join", path: notePath, name: "Third Editor"
+  }));
+  const info = await thirdInit;
+  const thirdDoc = new Y.Doc();
+  Y.applyUpdate(thirdDoc, Buffer.from(info.state, "base64"));
+  const text = thirdDoc.getText("content");
+  const at = (position) => Buffer.from(Y.encodeRelativePosition(
+    Y.createRelativePositionFromTypeIndex(text, Math.min(position, text.length))
+  )).toString("base64");
+  const selections = [
+    { anchor: at(1), head: at(3) },
+    { anchor: at(Math.max(0, text.length - 70)),
+      head: at(Math.max(0, text.length - 40)) },
+    { anchor: at(9), head: at(9) }
+  ];
+  thirdPeer.send(JSON.stringify({
+    channel: "collab", type: "cursor", path: notePath,
+    documentId: info.documentId, mainIndex: 1, selections,
+    ...selections[1]
+  }));
+  await poll(() => cdp.evaluate(b, `(() => {
+    const id = ${JSON.stringify(info.self.id)};
+    const carets = [...document.querySelectorAll('.ignis-collab-remote-caret')]
+      .filter(element => element.dataset.collabPeer === id);
+    const roster = [...document.querySelectorAll('.ignis-collab-people-jump')]
+      .find(element => element.dataset.collabPeer === id);
+    if (carets.length !== 3 || !roster) return false;
+    const cm = window.app.workspace.activeLeaf.view.editor.cm;
+    const before = cm.state.selection.main.head;
+    window.__ignisCursorJumpScrollBefore = cm.scrollDOM.scrollTop;
+    roster.click();
+    return cm.state.selection.main.head === before;
+  })()`), 15000);
+  await poll(() => cdp.evaluate(b, `(() => {
+    const cm = window.app.workspace.activeLeaf.view.editor.cm;
+    return cm.scrollDOM.scrollTop >
+      (window.__ignisCursorJumpScrollBefore || 0) + 150;
+  })()`), 12000);
+  console.log("PASS: three independent cursors and navigable third participant in real Chrome");
+  thirdPeer.send(JSON.stringify({
+    channel: "collab", type: "cursor-away", path: notePath,
+    documentId: info.documentId
+  }));
+  await poll(() => cdp.evaluate(b, `(() => {
+    const id = ${JSON.stringify(info.self.id)};
+    return ![...document.querySelectorAll('.ignis-collab-remote-caret')]
+      .some(element => element.dataset.collabPeer === id) &&
+      [...document.querySelectorAll('.ignis-collab-people-jump')]
+        .some(element => element.dataset.collabPeer === id);
+  })()`), 15000);
+  thirdPeer.close();
+  thirdPeer = null;
+  thirdDoc.destroy();
+  console.log("PASS: cursor-away removes all remote caret nodes while presence remains");
 
   await cdp.evaluate(b, `(() => {
     const editor = window.app.workspace.activeLeaf.view.editor;
@@ -450,6 +530,7 @@ try {
   console.log("PASS: departed user's remote caret removed");
   socket.close();
 } finally {
+  thirdPeer?.close();
   if (cdp?.ws.readyState === WebSocket.OPEN) {
     cdp.ws.close();
   }

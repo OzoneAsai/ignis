@@ -2,6 +2,8 @@
 // insertions/deletions can rebase the remote caret without absolute offsets.
 import * as Y from "yjs";
 
+export const MAX_SHARED_SELECTIONS = 32;
+
 function encode(bytes) {
   let value = "";
 
@@ -30,6 +32,32 @@ export function encodeCursorSelection(text, anchor, head) {
   return { anchor: at(anchor), head: at(head) };
 }
 
+export function encodeCursorSelections(text, ranges, mainIndex = 0) {
+  if (!Array.isArray(ranges) || ranges.length === 0 ||
+      ranges.length > MAX_SHARED_SELECTIONS ||
+      !Number.isSafeInteger(mainIndex) || mainIndex < 0 ||
+      mainIndex >= ranges.length) return null;
+  const selections = ranges.map(({ anchor, head }) =>
+    encodeCursorSelection(text, anchor, head));
+  if (selections.some(({ anchor, head }) =>
+    anchor.length > 512 || head.length > 512)) return null;
+  return { selections, mainIndex, ...selections[mainIndex] };
+}
+
+export function selectionEntries(peer) {
+  if (Array.isArray(peer?.selections)) {
+    if (peer.selections.length > MAX_SHARED_SELECTIONS) return [];
+    return peer.selections;
+  }
+  return peer?.anchor && peer?.head
+    ? [{ anchor: peer.anchor, head: peer.head }] : [];
+}
+
+export function resolveCursorSelections(text, peer) {
+  return selectionEntries(peer).map((entry) =>
+    resolveCursorSelection(text, entry));
+}
+
 export function resolveCursorSelection(text, peer) {
   try {
     const start = Y.createAbsolutePositionFromRelativePosition(
@@ -49,14 +77,15 @@ export function resolveCursorSelection(text, peer) {
   }
 }
 
-function selectionRects(cm, root, start, end) {
+function selectionRects(cm, root, start, end, budget) {
   const rects = [];
   const doc = cm.state.doc;
   const visibleFrom = Math.max(start, cm.viewport?.from ?? 0);
   const visibleTo = Math.min(end, cm.viewport?.to ?? doc.length);
   let count = 0;
 
-  for (let position = visibleFrom; position < visibleTo && count < 250;) {
+  for (let position = visibleFrom;
+    position < visibleTo && count < Math.min(250, budget);) {
     const line = doc.lineAt(position);
     const lineEnd = Math.min(line.to, visibleTo);
     const first = cm.coordsAtPos(position);
@@ -89,9 +118,56 @@ export function createCursorOverlay(session) {
   root.className = "ignis-collab-cursors";
   root.setAttribute("aria-hidden", "true");
   cm.dom.appendChild(root);
+  const roster = document.createElement("details");
+  roster.className = "ignis-collab-people-roster";
+  const rosterTitle = document.createElement("summary");
+  roster.appendChild(rosterTitle);
+  const rosterList = document.createElement("div");
+  rosterList.className = "ignis-collab-people-roster-list";
+  roster.appendChild(rosterList);
+  cm.dom.appendChild(roster);
+  let rosterFingerprint = "";
   let raf = 0;
   let peers = [];
   const nodes = new Map();
+
+  function updateRoster() {
+    roster.hidden = peers.length === 0;
+    rosterTitle.textContent = peers.length + " other editor" +
+      (peers.length === 1 ? "" : "s") + " · show locations";
+    const fingerprint = peers.map((peer) =>
+      [peer.id, peer.name, peer.color, peer.label].join(":")).join("|");
+    if (fingerprint === rosterFingerprint) return;
+    rosterFingerprint = fingerprint;
+    rosterList.replaceChildren();
+    for (const peer of peers) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.collabPeer = peer.id;
+      button.className = "ignis-collab-people-jump";
+      button.textContent = peer.label || peer.name;
+      button.title = "Go to " + (peer.label || peer.name) + "'s cursor";
+      button.style.borderLeftColor = /^#[0-9a-fA-F]{6}$/.test(peer.color)
+        ? peer.color : "#59baf2";
+      button.addEventListener("click", () => {
+        const current = peers.find((p) => p.id === peer.id);
+        if (!current) return;
+        const selections = resolveCursorSelections(session.text, current);
+        const mainIndex = Number.isSafeInteger(current.mainIndex) &&
+          current.mainIndex >= 0 && current.mainIndex < selections.length
+          ? current.mainIndex : 0;
+        const head = selections[mainIndex]?.head;
+        if (head === undefined) return;
+        // Use the mounted editor's own geometry, not a StateEffect created
+        // by another bundled copy of CodeMirror (Obsidian may own one).
+        const pos = Math.max(0, Math.min(head, cm.state.doc.length));
+        const block = cm.lineBlockAt(pos);
+        cm.scrollDOM.scrollTop = Math.max(0,
+          block.top - cm.scrollDOM.clientHeight / 2);
+      });
+      rosterList.appendChild(button);
+    }
+  }
 
   function discard(id) {
     const record = nodes.get(id);
@@ -109,20 +185,21 @@ export function createCursorOverlay(session) {
     nodes.delete(id);
   }
 
-  function ensure(peer) {
-    if (nodes.has(peer.id)) {
-      return nodes.get(peer.id);
+  function ensure(peer, key) {
+    if (nodes.has(key)) {
+      return nodes.get(key);
     }
 
     const caret = document.createElement("div");
     caret.className = "ignis-collab-remote-caret";
     caret.dataset.collabPeer = peer.id;
+    caret.dataset.collabSelection = key;
     const label = document.createElement("span");
     label.className = "ignis-collab-remote-label";
     caret.appendChild(label);
     root.appendChild(caret);
     const record = { caret, label, marks: [] };
-    nodes.set(peer.id, record);
+    nodes.set(key, record);
     return record;
   }
 
@@ -130,29 +207,35 @@ export function createCursorOverlay(session) {
     raf = 0;
     const bounds = cm.dom.getBoundingClientRect();
     const displayed = new Set();
+    // Carets remain visible for every participant, while long overlapping
+    // selections share a bounded DOM budget rather than freezing mobile.
+    let remainingMarks = 480;
+    let highlightsLimited = false;
 
     for (const peer of peers) {
-      const selection = resolveCursorSelection(session.text, peer);
-
-      if (!selection) {
-        continue;
-      }
-
-      displayed.add(peer.id);
+      const selected = resolveCursorSelections(session.text, peer);
+      const mainIndex = Number.isSafeInteger(peer.mainIndex) &&
+        peer.mainIndex >= 0 && peer.mainIndex < selected.length
+        ? peer.mainIndex : 0;
+      for (const [index, selection] of selected.entries()) {
+        if (!selection) continue;
+        const key = peer.id + ":" + index;
+        displayed.add(key);
       const offset = Math.max(0, Math.min(cm.state.doc.length, selection.head));
       const caretCoords = cm.coordsAtPos(offset);
       const visible = caretCoords && caretCoords.bottom >= bounds.top &&
         caretCoords.top <= bounds.bottom;
       const color = /^#[0-9a-fA-F]{6}$/.test(peer.color) ? peer.color : "#59baf2";
-      const record = ensure(peer);
+      const record = ensure(peer, key);
       record.caret.style.display = visible ? "" : "none";
       record.caret.style.setProperty("--ignis-peer-color", color);
-      const name = peer.label || peer.name;
+      const name = index === mainIndex ? peer.label || peer.name : "";
 
       if (record.label.textContent !== name) {
         record.label.textContent = name;
       }
 
+      record.label.style.display = index === mainIndex ? "" : "none";
       if (visible) {
         record.caret.style.left = `${caretCoords.left - bounds.left}px`;
         record.caret.style.top = `${caretCoords.top - bounds.top}px`;
@@ -161,7 +244,11 @@ export function createCursorOverlay(session) {
 
       const from = Math.min(selection.anchor, selection.head);
       const to = Math.max(selection.anchor, selection.head);
-      const rects = selectionRects(cm, bounds, from, to);
+      const selectedInViewport = Math.max(from, cm.viewport?.from ?? 0) <
+        Math.min(to, cm.viewport?.to ?? cm.state.doc.length);
+      if (selectedInViewport && remainingMarks === 0) highlightsLimited = true;
+      const rects = selectionRects(cm, bounds, from, to, remainingMarks);
+      remainingMarks -= rects.length;
 
       for (let i = 0; i < rects.length; i++) {
         let mark = record.marks[i];
@@ -184,6 +271,7 @@ export function createCursorOverlay(session) {
       while (record.marks.length > rects.length) {
         record.marks.pop().remove();
       }
+      }
     }
 
     for (const id of nodes.keys()) {
@@ -191,11 +279,15 @@ export function createCursorOverlay(session) {
         discard(id);
       }
     }
+    rosterTitle.textContent = peers.length + " other editor" +
+      (peers.length === 1 ? "" : "s") +
+      (highlightsLimited ? " · highlights limited" : " · show locations");
   }
 
   function render(nextPeers) {
     if (nextPeers) {
       peers = nextPeers;
+      updateRoster();
     }
 
     // Clearing awareness must not depend on animation frames: browsers pause
@@ -238,6 +330,7 @@ export function createCursorOverlay(session) {
       cm.scrollDOM?.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", onScroll);
       root.remove();
+      roster.remove();
     },
   };
 }

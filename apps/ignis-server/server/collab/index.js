@@ -11,6 +11,9 @@ const MAX_UPDATE_BYTES = 1024 * 1024;
 const MAX_NOTE_BYTES = 4 * 1024 * 1024;
 const SAVE_DELAY_MS = 120;
 const MAX_CURSOR_BYTES = 512;
+// Bound per-message work and WebSocket payload size. If an editor exceeds
+// this limit it receives an explicit error; no selection is silently dropped.
+const MAX_SELECTIONS = 32;
 const DOCUMENT_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const CURSOR_COLORS = [
   "#ee6b72", "#59baf2", "#e3ad54", "#ac8cf2",
@@ -696,6 +699,7 @@ function createCollaborationManager({
 
   function announcePresence(room) {
     broadcast(room, "presence", {
+      documentId: room.documentId,
       participants: room.members.size,
       people: peopleIn(room),
     });
@@ -706,6 +710,7 @@ function createCollaborationManager({
       return null;
     }
 
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return null;
     const bytes = Buffer.from(encoded, "base64");
 
     if (!bytes.length || bytes.length > MAX_CURSOR_BYTES) {
@@ -715,6 +720,29 @@ function createCollaborationManager({
     const relative = Y.decodeRelativePosition(bytes);
     const absolute = Y.createAbsolutePositionFromRelativePosition(relative, room.doc);
     return absolute && absolute.type === room.text ? encoded : null;
+  }
+
+  function cursorSelections(msg, room) {
+    if (msg.documentId != null && msg.documentId !== room.documentId) {
+      return null;
+    }
+    const supplied = msg.selections == null
+      ? [{ anchor: msg.anchor, head: msg.head }]
+      : msg.selections;
+    if (!Array.isArray(supplied) || supplied.length === 0 ||
+        supplied.length > MAX_SELECTIONS) return null;
+    const mainIndex = msg.selections == null ? 0 : msg.mainIndex ?? 0;
+    if (!Number.isSafeInteger(mainIndex) || mainIndex < 0 ||
+        mainIndex >= supplied.length) return null;
+    const selections = [];
+    for (const entry of supplied) {
+      if (!entry || typeof entry !== "object") return null;
+      const anchor = cursorPosition(entry.anchor, room);
+      const head = cursorPosition(entry.head, room);
+      if (!anchor || !head) return null;
+      selections.push({ anchor, head });
+    }
+    return { selections, mainIndex };
   }
 
   channel.on("join", async (msg, ws) => {
@@ -736,6 +764,8 @@ function createCollaborationManager({
           color,
           anchor: null,
           head: null,
+          selections: [],
+          mainIndex: 0,
         });
       }
 
@@ -818,18 +848,21 @@ function createCollaborationManager({
     }
 
     try {
-      const anchor = cursorPosition(msg.anchor, room);
-      const head = cursorPosition(msg.head, room);
-
-      if (!anchor || !head) {
+      const parsed = cursorSelections(msg, room);
+      if (!parsed) {
+        send(ws, "error", { path: room.path, code: "INVALID_SELECTION",
+          error: "Invalid, outdated or excessive cursor selections" });
         return;
       }
-
-      person.anchor = anchor;
-      person.head = head;
-      broadcast(room, "cursor", { id: person.id, anchor, head }, ws);
+      const primary = parsed.selections[parsed.mainIndex];
+      Object.assign(person, parsed, primary);
+      broadcast(room, "cursor", {
+        id: person.id, documentId: room.documentId,
+        ...parsed, anchor: primary.anchor, head: primary.head,
+      }, ws);
     } catch {
-      // Malformed or outdated Yjs positions are ignored, never broadcast.
+      send(ws, "error", { path: room.path, code: "INVALID_SELECTION",
+        error: "Invalid cursor position" });
     }
   });
 
@@ -842,9 +875,15 @@ function createCollaborationManager({
       return;
     }
 
+    if (msg.documentId != null && msg.documentId !== room.documentId) return;
     person.anchor = null;
     person.head = null;
-    broadcast(room, "cursor", { id: person.id, anchor: null, head: null }, ws);
+    person.selections = [];
+    person.mainIndex = 0;
+    broadcast(room, "cursor", {
+      id: person.id, documentId: room.documentId,
+      anchor: null, head: null, selections: [], mainIndex: 0
+    }, ws);
   });
 
   wss.on("connection", (ws) => {

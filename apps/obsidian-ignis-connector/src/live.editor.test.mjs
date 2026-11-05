@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import "fake-indexeddb/auto";
 import * as Y from "yjs";
 import { IndexeddbPersistence } from "y-indexeddb";
-import { EditorState } from "@codemirror/state";
+import { EditorState, EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { NativeYjs, encodeYjs, decodeYjs } from "./live.ts";
@@ -39,7 +39,9 @@ async function mount() {
   document.body.appendChild(mountpoint);
   const editor = new EditorView({
     parent: mountpoint,
-    state: EditorState.create({ doc: "Initial", extensions: manager.extension() })
+    state: EditorState.create({ doc: "Initial", extensions: [
+      EditorState.allowMultipleSelections.of(true), ...manager.extension()
+    ] })
   });
   cleanup.push(async () => {
     editor.destroy();
@@ -65,6 +67,56 @@ async function mount() {
 }
 
 describe("real CodeMirror 6 native binding", () => {
+  it("refuses unrelated CRDT histories reusing a known generation instead of duplicating text", async () => {
+    const origin = "https://example.test/lineage-" + crypto.randomUUID();
+    const old = new Y.Doc();
+    old.getText("content").insert(0, "Same baseline");
+    const storage = new IndexeddbPersistence([
+      "ignis-connector-yjs-v2", origin, "lab", ID
+    ].join("|"), old);
+    await storage.whenSynced;
+    await tick();
+    await storage.destroy();
+    old.destroy();
+
+    // A server rebuilding the same generation from Markdown creates a new
+    // Yjs client ID; merging this independently reconstructed history with
+    // the native IndexedDB state would duplicate identical baseline bytes.
+    const independent = new Y.Doc();
+    independent.getText("content").insert(0, "Same baseline");
+    const sent = [], notices = [];
+    const manager = new NativeYjs({
+      vaultId: () => "lab", origin: () => origin,
+      pathForView: () => "test.md",
+      knownId: () => ID,
+      rememberId: async () => {},
+      send: (message) => sent.push(message),
+      notify: (_path, status) => notices.push(status)
+    });
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const editor = new EditorView({
+      parent, state: EditorState.create({
+        doc: "Same baseline", extensions: manager.extension()
+      })
+    });
+    cleanup.push(async () => {
+      editor.destroy();
+      await manager.dispose();
+      independent.destroy();
+    });
+    manager.connected();
+    await manager.handle({
+      channel: "collab", type: "init", path: "test.md", documentId: ID,
+      state: encodeYjs(Y.encodeStateAsUpdate(independent))
+    });
+    await tick();
+    expect(manager.rooms.get("test.md").blocked).toBe(true);
+    expect(editor.state.doc.toString()).toBe("Same baseline");
+    expect(manager.rooms.get("test.md").text.toString()).toBe("Same baseline");
+    expect(sent.some((msg) => msg.type === "update")).toBe(false);
+    expect(notices.some((status) => /lineage/i.test(status))).toBe(true);
+  });
   it("keeps the same bound CM6 Y.Doc through a native file rename", async () => {
     const { manager, editor, sent, server, renamePath } = await mount();
     editor.dispatch({ changes: { from: 7, insert: " offline" } });
@@ -166,6 +218,43 @@ describe("real CodeMirror 6 native binding", () => {
     expect(undo.run(editor)).toBe(true);
     expect(editor.state.doc.toString()).toBe("remote Initial");
     expect(manager.rooms.get("test.md").text.toString()).toBe("remote Initial");
+    server.destroy();
+  });
+
+  it("publishes every CodeMirror selection and ignores stale-document cursor notifications", async () => {
+    const { manager, editor, sent, server } = await mount();
+    editor.focus();
+    editor.dispatch({ selection: EditorSelection.create([
+      EditorSelection.range(0, 2),
+      EditorSelection.range(4, 6),
+      EditorSelection.cursor(7)
+    ], 1) });
+    await new Promise(resolve => setTimeout(resolve, 105));
+    const shared = sent.filter((m) => m.type === "cursor").at(-1);
+    expect(shared?.documentId).toBe(ID);
+    expect(shared?.selections).toHaveLength(3);
+    expect(shared.mainIndex).toBe(1);
+    const room = manager.rooms.get("test.md");
+    await manager.handle({ channel: "collab", type: "presence",
+      path: "test.md", documentId: ID, people: [
+        { id: room.selfId, name: "Self", color: "#ee6b72" },
+        { id: "other", name: "Remote", color: "#59baf2", selections: [] }
+      ]
+    });
+    expect(room.peers.get("other").selections).toHaveLength(0);
+    await manager.handle({ channel: "collab", type: "cursor",
+      path: "test.md", documentId: crypto.randomUUID(), id: "other",
+      selections: shared.selections, mainIndex: 1 });
+    expect(room.peers.get("other").selections).toHaveLength(0);
+    await manager.handle({ channel: "collab", type: "cursor",
+      path: "test.md", documentId: ID, id: "other",
+      selections: shared.selections, mainIndex: 1 });
+    expect(room.peers.get("other").selections).toHaveLength(3);
+    expect(room.peers.get("other").mainIndex).toBe(1);
+    await manager.handle({ channel: "collab", type: "cursor",
+      path: "test.md", documentId: ID, id: "other",
+      selections: [], anchor: null, head: null, mainIndex: 0 });
+    expect(room.peers.get("other").selections).toEqual([]);
     server.destroy();
   });
 

@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
-import { CursorOverlay, encodeSelection, resolveSelection, sanitizePeers } from "./presence.ts";
+import { CursorOverlay, encodeSelection, encodeSelections, resolveSelection,
+  resolveSelections, sanitizePeers, sanitizeCursorMessage } from "./presence.ts";
 
 describe("Ignis native presence uses the existing server relative cursor protocol", () => {
   it("preserves a remote selection when another author inserts preceding text", () => {
@@ -31,6 +32,42 @@ describe("Ignis native presence uses the existing server relative cursor protoco
     expect(people[0].name).toBe("<script>hello</script>");
     expect(people[0].color).toBe("#59baf2");
     expect(people[1].color).toBe("#33CC44");
+  });
+  it("preserves multiple reversed selections and the primary index through Yjs edits", () => {
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    text.insert(0, "hello world");
+    const sent = encodeSelections(text, [
+      { anchor: 0, head: 1 }, { anchor: 10, head: 6 }, { anchor: 8, head: 8 }
+    ], 1);
+    expect(sent.selections).toHaveLength(3);
+    expect(sent.mainIndex).toBe(1);
+    const peer = { ...sent };
+    expect(resolveSelections(text, peer)).toEqual([
+      { anchor: 0, head: 1 }, { anchor: 10, head: 6 },
+      { anchor: 8, head: 8 }
+    ]);
+    text.insert(0, "NEW ");
+    expect(resolveSelections(text, peer)).toEqual([
+      { anchor: 4, head: 5 }, { anchor: 14, head: 10 },
+      { anchor: 12, head: 12 }
+    ]);
+    expect(encodeSelections(text, Array.from({ length: 33 },
+      () => ({ anchor: 0, head: 1 })), 0)).toBe(null);
+    expect(sanitizeCursorMessage({
+      selections: [{ anchor: "nonsense", head: "nonsense" }]
+    }).selections).toEqual([]);
+    doc.destroy();
+  });
+  it("sanitizes all 50 peers without the former 32-person cap", () => {
+    const source = Array.from({ length: 50 }, (_, i) => ({
+      id: "peer-" + i, name: "User " + i, color: "#33CC44",
+      selections: [], mainIndex: 0
+    }));
+    const peers = sanitizePeers(source, "self");
+    expect(peers).toHaveLength(50);
+    expect(peers.at(-1).name).toBe("User 49");
+    expect(peers[0].selections).toEqual([]);
   });
   it("paints and immediately removes a visible remote caret/selection", async () => {
     const d = new Y.Doc();
@@ -68,6 +105,62 @@ describe("Ignis native presence uses the existing server relative cursor protoco
       expect(label?.querySelector("b")).toBeNull();
       overlay.set(t, []);
       expect(parent.querySelector(".ignis-native-remote-caret")).toBeNull();
+      overlay.destroy();
+    } finally {
+      globalThis.requestAnimationFrame = originalRaf;
+      globalThis.cancelAnimationFrame = originalCancel;
+      parent.remove();
+      d.destroy();
+      vi.restoreAllMocks();
+    }
+  });
+  it("renders three caret nodes for one peer and keeps all 50 peers navigable", async () => {
+    const d = new Y.Doc();
+    const t = d.getText("content");
+    t.insert(0, "hello world");
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const scroller = document.createElement("div");
+    parent.append(scroller);
+    vi.spyOn(parent, "getBoundingClientRect").mockImplementation(() => ({
+      left: 0, top: 0, right: 500, bottom: 250, width: 500, height: 250
+    }));
+    const view = {
+      dom: parent, scrollDOM: scroller,
+      lineBlockAt: (pos) => ({ top: pos * 18 }),
+      coordsAtPos: () => ({ left: 35, right: 37, top: 24, bottom: 40 }),
+      state: { doc: { length: 11, lineAt: () => ({ to: 11 }) } },
+      viewport: { from: 0, to: 11 }
+    };
+    const originalRaf = globalThis.requestAnimationFrame;
+    const originalCancel = globalThis.cancelAnimationFrame;
+    globalThis.requestAnimationFrame = cb => setTimeout(() => cb(0), 1);
+    globalThis.cancelAnimationFrame = id => clearTimeout(id);
+    try {
+      const overlay = new CursorOverlay(view);
+      const selected = encodeSelections(t, [
+        { anchor: 1, head: 2 }, { anchor: 4, head: 7 },
+        { anchor: 10, head: 9 }
+      ], 1);
+      const peers = sanitizePeers([
+        { id: "remote", name: "Remote", color: "#aabbcc", ...selected },
+        ...Array.from({ length: 49 }, (_, i) => ({
+          id: "other-" + i, name: "Other " + i, color: "#ee6b72"
+        }))
+      ], "self");
+      overlay.set(t, peers);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(parent.querySelectorAll(".ignis-native-remote-caret")).toHaveLength(3);
+      expect(parent.querySelectorAll(".ignis-native-remote-label"))
+        .toHaveLength(3);
+      expect([...parent.querySelectorAll(".ignis-native-remote-label")]
+        .filter(el => el.style.display !== "none")).toHaveLength(1);
+      expect(parent.querySelectorAll(".ignis-native-people-jump")).toHaveLength(50);
+      parent.querySelector('.ignis-native-people-jump[data-ignis-peer="remote"]').click();
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+      overlay.set(t, []);
+      expect(parent.querySelectorAll(".ignis-native-remote-caret")).toHaveLength(0);
+      expect(parent.querySelector(".ignis-native-people-roster").hidden).toBe(true);
       overlay.destroy();
     } finally {
       globalThis.requestAnimationFrame = originalRaf;

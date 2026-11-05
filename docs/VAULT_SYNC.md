@@ -209,9 +209,16 @@ The deferred IME update queue is capped at 4 MiB: exceeding that limit
 blocks the room and preserves the native draft rather than exhausting
 mobile WebView memory or applying a partial remote history.
 
-The current native binding has no remote-selection overlay. Existing Ignis
-browser collaboration remains unchanged and interoperates through the same
-Yjs room wire format. Sync and Yjs now share generation identity; fileId
+The native CodeMirror 6 binding now has the same multi-caret remote-selection
+overlay and accessible per-note participant roster as Ignis WebUI. Both clients
+use the same `collab` WebSocket channel: each online participant advertises
+up to 32 Yjs-relative selections in one message, and the participant list
+includes off-screen positions and people without an active caret. A collapsed
+roster can jump to the selected peer's primary caret without changing the
+local selection; highlight rectangles have a shared 480-per-frame budget
+for mobile performance. Existing old single-caret clients remain compatible,
+and document-generation mismatches discard cursor/presence notifications.
+Sync and Yjs now share generation identity; fileId
 remains the stable entity ID across moves. An actively joined collaborative
 note cannot be renamed/deleted by the old server APIs until the room is
 released. The Connector keeps unsent rename operations pending until it

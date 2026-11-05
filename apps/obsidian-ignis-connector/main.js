@@ -9883,7 +9883,7 @@ var yCollab = (ytext, awareness, { undoManager = new UndoManager(ytext) } = {}) 
 
 // src/presence.ts
 var MAX_CURSOR_BYTES = 512;
-var MAX_PEERS = 32;
+var MAX_SHARED_SELECTIONS = 32;
 function encodeBytes(bytes) {
   let raw = "";
   for (const byte of bytes)
@@ -9897,7 +9897,11 @@ function decodeBytes(value) {
     const raw = atob(value);
     if (!raw.length || raw.length > MAX_CURSOR_BYTES)
       return null;
-    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+    const bytes = Uint8Array.from(raw, (c) => c.charCodeAt(0));
+    const canonical = encodeRelativePosition(decodeRelativePosition(bytes));
+    if (canonical.byteLength !== bytes.byteLength || canonical.some((byte, index) => byte !== bytes[index]))
+      return null;
+    return bytes;
   } catch {
     return null;
   }
@@ -9913,6 +9917,60 @@ function encodeSelection(text2, anchor, head) {
   if (result.anchor.length > 688 || result.head.length > 688)
     return null;
   return result;
+}
+function encodeSelections(text2, ranges, mainIndex = 0) {
+  if (!Array.isArray(ranges) || ranges.length === 0 || ranges.length > MAX_SHARED_SELECTIONS || !Number.isSafeInteger(mainIndex) || mainIndex < 0 || mainIndex >= ranges.length)
+    return null;
+  const selections = [];
+  for (const range of ranges) {
+    const encoded = encodeSelection(text2, range.anchor, range.head);
+    if (!encoded)
+      return null;
+    selections.push(encoded);
+  }
+  return { selections, mainIndex, ...selections[mainIndex] };
+}
+function selectionEntries(peer) {
+  if (Array.isArray(peer.selections)) {
+    if (peer.selections.length > MAX_SHARED_SELECTIONS)
+      return [];
+    return peer.selections;
+  }
+  return peer.anchor && peer.head ? [{ anchor: peer.anchor, head: peer.head }] : [];
+}
+function resolveSelections(text2, peer) {
+  return selectionEntries(peer).map((entry) => resolveSelection(text2, entry));
+}
+function safeSelections(item) {
+  if (Array.isArray(item.selections)) {
+    if (item.selections.length > MAX_SHARED_SELECTIONS)
+      return [];
+    const selections = [];
+    for (const entry of item.selections) {
+      if (!entry || typeof entry !== "object")
+        return [];
+      const anchor = entry.anchor;
+      const head = entry.head;
+      if (!decodeBytes(anchor) || !decodeBytes(head))
+        return [];
+      selections.push({ anchor, head });
+    }
+    return selections;
+  }
+  return decodeBytes(item.anchor) && decodeBytes(item.head) ? [{ anchor: item.anchor, head: item.head }] : [];
+}
+function sanitizeCursorMessage(item) {
+  const data = item && typeof item === "object" ? item : {};
+  const selections = safeSelections(data);
+  const requested = data.mainIndex;
+  const mainIndex = Number.isSafeInteger(requested) && requested >= 0 && requested < selections.length ? requested : 0;
+  const primary = selections[mainIndex];
+  return {
+    selections,
+    mainIndex,
+    anchor: primary?.anchor || null,
+    head: primary?.head || null
+  };
 }
 function resolveSelection(text2, peer) {
   const start = decodeBytes(peer.anchor);
@@ -9940,7 +9998,7 @@ function sanitizePeers(input, selfId) {
     return [];
   const unique = /* @__PURE__ */ new Set();
   const peers = [];
-  for (const item of input.slice(0, MAX_PEERS * 4)) {
+  for (const item of input) {
     if (!item || typeof item !== "object" || typeof item.id !== "string" || item.id.length > 128 || !item.id || item.id === selfId || unique.has(item.id))
       continue;
     unique.add(item.id);
@@ -9948,11 +10006,8 @@ function sanitizePeers(input, selfId) {
       id: item.id,
       name: typeof item.name === "string" ? item.name.slice(0, 40) : "Peer",
       color: typeof item.color === "string" && /^#[a-fA-F0-9]{6}$/.test(item.color) ? item.color : "#59baf2",
-      anchor: typeof item.anchor === "string" ? item.anchor : null,
-      head: typeof item.head === "string" ? item.head : null
+      ...sanitizeCursorMessage(item)
     });
-    if (peers.length === MAX_PEERS)
-      break;
   }
   return peers;
 }
@@ -9974,10 +10029,40 @@ var CursorOverlay = class {
       view.dom.style.position = "relative";
     }
     view.dom.appendChild(this.root);
+    this.roster = document.createElement("details");
+    this.roster.className = "ignis-native-people-roster";
+    Object.assign(this.roster.style, {
+      position: "absolute",
+      top: "5px",
+      right: "6px",
+      maxWidth: "min(65vw, 250px)",
+      maxHeight: "42vh",
+      overflow: "auto",
+      zIndex: "9",
+      pointerEvents: "auto",
+      background: "var(--background-primary, #202127)",
+      color: "var(--text-normal, #fff)",
+      fontSize: "12px",
+      borderRadius: "5px",
+      padding: "3px 6px",
+      boxShadow: "0 1px 5px #0004"
+    });
+    this.rosterTitle = document.createElement("summary");
+    this.rosterTitle.style.cursor = "pointer";
+    this.roster.appendChild(this.rosterTitle);
+    this.rosterList = document.createElement("div");
+    this.rosterList.style.maxHeight = "35vh";
+    this.rosterList.style.overflowY = "auto";
+    this.roster.appendChild(this.rosterList);
+    view.dom.appendChild(this.roster);
     view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
     window.addEventListener("resize", this.scroll);
   }
   root;
+  roster;
+  rosterTitle;
+  rosterList;
+  rosterFingerprint = "";
   nodes = /* @__PURE__ */ new Map();
   peers = [];
   text = null;
@@ -9987,10 +10072,56 @@ var CursorOverlay = class {
   set(text2, peers) {
     this.text = text2;
     this.peers = peers;
+    this.updateRoster();
     if (!text2 || peers.length === 0) {
       this.clear();
     } else {
       this.schedule();
+    }
+  }
+  updateRoster() {
+    this.roster.hidden = this.peers.length === 0;
+    this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + " \xB7 show locations";
+    const fingerprint = this.peers.map((peer) => [peer.id, peer.name, peer.color].join(":")).join("|");
+    if (fingerprint === this.rosterFingerprint)
+      return;
+    this.rosterFingerprint = fingerprint;
+    this.rosterList.replaceChildren();
+    for (const peer of this.peers) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ignis-native-people-jump";
+      button.dataset.ignisPeer = peer.id;
+      button.textContent = peer.name;
+      button.title = "Go to " + peer.name + "'s cursor";
+      Object.assign(button.style, {
+        display: "block",
+        width: "100%",
+        textAlign: "left",
+        color: "var(--text-normal, #fff)",
+        background: "transparent",
+        border: "0",
+        borderLeft: "3px solid " + peer.color,
+        padding: "4px",
+        cursor: "pointer"
+      });
+      button.addEventListener("click", () => {
+        const current = this.peers.find((entry) => entry.id === peer.id);
+        if (!current || !this.text)
+          return;
+        const selections = resolveSelections(this.text, current);
+        const main = current.mainIndex ?? 0;
+        const head = selections[main]?.head;
+        if (head === void 0)
+          return;
+        const pos = Math.max(0, Math.min(head, this.view.state.doc.length));
+        const block = this.view.lineBlockAt(pos);
+        this.view.scrollDOM.scrollTop = Math.max(
+          0,
+          block.top - this.view.scrollDOM.clientHeight / 2
+        );
+      });
+      this.rosterList.appendChild(button);
     }
   }
   discard(id2) {
@@ -10020,114 +10151,127 @@ var CursorOverlay = class {
       return;
     const bounds = this.view.dom.getBoundingClientRect();
     const visible = /* @__PURE__ */ new Set();
+    let remainingMarks = 480;
+    let highlightsLimited = false;
     for (const peer of this.peers) {
-      const selection = resolveSelection(this.text, peer);
-      if (!selection)
-        continue;
-      visible.add(peer.id);
-      let record = this.nodes.get(peer.id);
-      if (!record) {
-        const caret = document.createElement("div");
-        caret.className = "ignis-native-remote-caret";
-        caret.dataset.ignisPeer = peer.id;
-        Object.assign(caret.style, {
-          position: "absolute",
-          width: "2px",
-          pointerEvents: "none",
-          backgroundColor: peer.color
-        });
-        const label = document.createElement("span");
-        label.className = "ignis-native-remote-label";
-        Object.assign(label.style, {
-          position: "absolute",
-          left: "0",
-          bottom: "100%",
-          color: "#fff",
-          backgroundColor: peer.color,
-          fontSize: "11px",
-          fontWeight: "600",
-          borderRadius: "3px",
-          padding: "2px 5px",
-          whiteSpace: "nowrap",
-          maxWidth: "180px",
-          overflow: "hidden",
-          textOverflow: "ellipsis"
-        });
-        caret.appendChild(label);
-        this.root.appendChild(caret);
-        record = { caret, label, marks: [] };
-        this.nodes.set(peer.id, record);
-      }
-      record.label.textContent = peer.name;
-      record.label.style.backgroundColor = peer.color;
-      record.caret.style.backgroundColor = peer.color;
-      const at = Math.min(this.view.state.doc.length, selection.head);
-      const coords = this.view.coordsAtPos(at);
-      const onScreen = !!coords && coords.bottom >= bounds.top && coords.top <= bounds.bottom && coords.right >= bounds.left && coords.left <= bounds.right;
-      record.caret.style.display = onScreen ? "" : "none";
-      if (coords && onScreen) {
-        record.caret.style.left = coords.left - bounds.left + "px";
-        record.caret.style.top = coords.top - bounds.top + "px";
-        record.caret.style.height = Math.max(1, coords.bottom - coords.top) + "px";
-      }
-      const from2 = Math.max(0, Math.min(selection.anchor, selection.head));
-      const to = Math.min(
-        this.view.state.doc.length,
-        Math.max(selection.anchor, selection.head)
-      );
-      const marks = [];
-      const viewport = this.view.viewport;
-      let index = Math.max(from2, viewport.from);
-      const end = Math.min(to, viewport.to);
-      while (index < end && marks.length < 120) {
-        const line = this.view.state.doc.lineAt(index);
-        const stop = Math.min(end, line.to);
-        const a = this.view.coordsAtPos(index);
-        const b = this.view.coordsAtPos(stop);
-        if (a && b) {
-          marks.push({
-            left: a.left - bounds.left,
-            top: a.top - bounds.top,
-            width: Math.max(2, b.left - a.left),
-            height: Math.max(1, b.bottom - a.top)
-          });
-        }
-        index = Math.max(index + 1, stop + 1);
-      }
-      for (let i = 0; i < marks.length; i++) {
-        let mark = record.marks[i];
-        if (!mark) {
-          mark = document.createElement("span");
-          mark.className = "ignis-native-remote-selection";
-          Object.assign(mark.style, {
+      const selections = resolveSelections(this.text, peer);
+      const mainIndex = Number.isSafeInteger(peer.mainIndex) && peer.mainIndex >= 0 && peer.mainIndex < selections.length ? peer.mainIndex : 0;
+      for (const [index, selection] of selections.entries()) {
+        if (!selection)
+          continue;
+        const key = peer.id + ":" + index;
+        visible.add(key);
+        let record = this.nodes.get(key);
+        if (!record) {
+          const caret = document.createElement("div");
+          caret.className = "ignis-native-remote-caret";
+          caret.dataset.ignisPeer = peer.id;
+          caret.dataset.ignisSelection = String(index);
+          Object.assign(caret.style, {
             position: "absolute",
+            width: "2px",
             pointerEvents: "none",
-            opacity: "0.22"
+            backgroundColor: peer.color
           });
-          this.root.appendChild(mark);
-          record.marks.push(mark);
+          const label = document.createElement("span");
+          label.className = "ignis-native-remote-label";
+          Object.assign(label.style, {
+            position: "absolute",
+            left: "0",
+            bottom: "100%",
+            color: "#fff",
+            backgroundColor: peer.color,
+            fontSize: "11px",
+            fontWeight: "600",
+            borderRadius: "3px",
+            padding: "2px 5px",
+            whiteSpace: "nowrap",
+            maxWidth: "180px",
+            overflow: "hidden",
+            textOverflow: "ellipsis"
+          });
+          caret.appendChild(label);
+          this.root.appendChild(caret);
+          record = { caret, label, marks: [] };
+          this.nodes.set(key, record);
         }
-        Object.assign(mark.style, {
-          backgroundColor: peer.color,
-          left: marks[i].left + "px",
-          top: marks[i].top + "px",
-          width: marks[i].width + "px",
-          height: marks[i].height + "px"
-        });
+        record.label.textContent = peer.name;
+        record.label.style.display = index === mainIndex ? "" : "none";
+        record.label.style.backgroundColor = peer.color;
+        record.caret.style.backgroundColor = peer.color;
+        const at = Math.min(this.view.state.doc.length, selection.head);
+        const coords = this.view.coordsAtPos(at);
+        const onScreen = !!coords && coords.bottom >= bounds.top && coords.top <= bounds.bottom && coords.right >= bounds.left && coords.left <= bounds.right;
+        record.caret.style.display = onScreen ? "" : "none";
+        if (coords && onScreen) {
+          record.caret.style.left = coords.left - bounds.left + "px";
+          record.caret.style.top = coords.top - bounds.top + "px";
+          record.caret.style.height = Math.max(1, coords.bottom - coords.top) + "px";
+        }
+        const from2 = Math.max(0, Math.min(selection.anchor, selection.head));
+        const to = Math.min(
+          this.view.state.doc.length,
+          Math.max(selection.anchor, selection.head)
+        );
+        const marks = [];
+        const viewport = this.view.viewport;
+        let position = Math.max(from2, viewport.from);
+        const end = Math.min(to, viewport.to);
+        if (position < end && remainingMarks === 0)
+          highlightsLimited = true;
+        while (position < end && marks.length < Math.min(120, remainingMarks)) {
+          const line = this.view.state.doc.lineAt(position);
+          const stop = Math.min(end, line.to);
+          const a = this.view.coordsAtPos(position);
+          const b = this.view.coordsAtPos(stop);
+          if (a && b) {
+            marks.push({
+              left: a.left - bounds.left,
+              top: a.top - bounds.top,
+              width: Math.max(2, b.left - a.left),
+              height: Math.max(1, b.bottom - a.top)
+            });
+          }
+          position = Math.max(position + 1, stop + 1);
+        }
+        remainingMarks -= marks.length;
+        for (let i = 0; i < marks.length; i++) {
+          let mark = record.marks[i];
+          if (!mark) {
+            mark = document.createElement("span");
+            mark.className = "ignis-native-remote-selection";
+            Object.assign(mark.style, {
+              position: "absolute",
+              pointerEvents: "none",
+              opacity: "0.22"
+            });
+            this.root.appendChild(mark);
+            record.marks.push(mark);
+          }
+          Object.assign(mark.style, {
+            backgroundColor: peer.color,
+            left: marks[i].left + "px",
+            top: marks[i].top + "px",
+            width: marks[i].width + "px",
+            height: marks[i].height + "px"
+          });
+        }
+        while (record.marks.length > marks.length)
+          record.marks.pop().remove();
       }
-      while (record.marks.length > marks.length)
-        record.marks.pop().remove();
     }
     for (const id2 of [...this.nodes.keys()]) {
       if (!visible.has(id2))
         this.discard(id2);
     }
+    this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + (highlightsLimited ? " \xB7 highlights limited" : " \xB7 show locations");
   }
   destroy() {
     this.clear();
     this.view.scrollDOM.removeEventListener("scroll", this.scroll);
     window.removeEventListener("resize", this.scroll);
     this.root.remove();
+    this.roster.remove();
     this.view.dom.style.position = this.originalPosition;
   }
 };
@@ -10455,7 +10599,12 @@ var NativeYjs = class {
       clearTimeout(room.cursorTimer);
     room.cursorTimer = null;
     if (room.lastCursor !== null && room.joined && this.online) {
-      this.opts.send({ channel: "collab", type: "cursor-away", path: room.path });
+      this.opts.send({
+        channel: "collab",
+        type: "cursor-away",
+        path: room.path,
+        documentId: room.documentId || void 0
+      });
     }
     room.lastCursor = null;
   }
@@ -10479,11 +10628,14 @@ var NativeYjs = class {
       const focused = [...room.views].find((v) => v.hasFocus && this.bound.get(v) === room);
       if (!focused || !room.text || !room.joined || room.composing || room.blocked || !this.online)
         return;
-      const selection = focused.state.selection.main;
-      const encoded = encodeSelection(room.text, selection.anchor, selection.head);
-      if (!encoded)
+      const selection = focused.state.selection;
+      const encoded = encodeSelections(room.text, selection.ranges, selection.mainIndex);
+      if (!encoded) {
+        this.sendCursorAway(room);
+        this.opts.notify(room.path, "Shared cursors allow up to 32 selections; none were truncated");
         return;
-      const signature = encoded.anchor + ":" + encoded.head;
+      }
+      const signature = JSON.stringify([encoded.selections, encoded.mainIndex]);
       if (room.lastCursor === signature)
         return;
       room.lastCursor = signature;
@@ -10491,6 +10643,7 @@ var NativeYjs = class {
         channel: "collab",
         type: "cursor",
         path: room.path,
+        documentId: room.documentId || void 0,
         ...encoded
       });
     }, 65);
@@ -10601,19 +10754,19 @@ var NativeYjs = class {
     const room = this.rooms.get(message.path);
     if (!room)
       return;
+    if ((message.type === "cursor" || message.type === "presence") && (!room.joined || room.blocked || message.documentId && room.documentId !== message.documentId))
+      return;
     if (message.type === "presence") {
-      if (room.joined)
-        this.receivePeople(room, message.people, room.selfId);
+      this.receivePeople(room, message.people, room.selfId);
       return;
     }
     if (message.type === "cursor") {
-      if (!room.joined || !message.id || message.id === room.selfId)
+      if (!message.id || message.id === room.selfId)
         return;
       const peer = room.peers.get(message.id);
       if (!peer)
         return;
-      peer.anchor = typeof message.anchor === "string" ? message.anchor : null;
-      peer.head = typeof message.head === "string" ? message.head : null;
+      Object.assign(peer, sanitizeCursorMessage(message));
       this.refreshPeers(room);
       return;
     }

@@ -3,7 +3,10 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import { Compartment, Prec } from "@codemirror/state";
 import { EditorView, ViewPlugin, keymap, type ViewUpdate } from "@codemirror/view";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
-import { CursorOverlay, encodeSelection, sanitizePeers, type Peer } from "./presence";
+import {
+  CursorOverlay, encodeSelections, sanitizePeers, sanitizeCursorMessage,
+  type Peer, type CursorSelection
+} from "./presence";
 
 // Native Obsidian, mobile included, uses the same Yjs wire protocol as Ignis
 // Bridge. We only install the CM6 binding after checking native file content,
@@ -28,6 +31,8 @@ type WireMessage = {
   id?: string;
   anchor?: string | null;
   head?: string | null;
+  selections?: CursorSelection[];
+  mainIndex?: number;
   name?: string;
 };
 type Room = {
@@ -352,7 +357,8 @@ export class NativeYjs {
     if (room.cursorTimer !== null) clearTimeout(room.cursorTimer);
     room.cursorTimer = null;
     if (room.lastCursor !== null && room.joined && this.online) {
-      this.opts.send({ channel: "collab", type: "cursor-away", path: room.path });
+      this.opts.send({ channel: "collab", type: "cursor-away",
+        path: room.path, documentId: room.documentId || undefined });
     }
     room.lastCursor = null;
   }
@@ -373,14 +379,18 @@ export class NativeYjs {
         v.hasFocus && this.bound.get(v) === room);
       if (!focused || !room.text || !room.joined || room.composing ||
           room.blocked || !this.online) return;
-      const selection = focused.state.selection.main;
-      const encoded = encodeSelection(room.text, selection.anchor, selection.head);
-      if (!encoded) return;
-      const signature = encoded.anchor + ":" + encoded.head;
+      const selection = focused.state.selection;
+      const encoded = encodeSelections(room.text, selection.ranges, selection.mainIndex);
+      if (!encoded) {
+        this.sendCursorAway(room);
+        this.opts.notify(room.path, "Shared cursors allow up to 32 selections; none were truncated");
+        return;
+      }
+      const signature = JSON.stringify([encoded.selections, encoded.mainIndex]);
       if (room.lastCursor === signature) return;
       room.lastCursor = signature;
       this.opts.send({ channel: "collab", type: "cursor", path: room.path,
-        ...encoded });
+        documentId: room.documentId || undefined, ...encoded });
     }, 65);
   }
 
@@ -490,16 +500,18 @@ export class NativeYjs {
     if (this.disposed || message.channel !== "collab" || !message.path) return;
     const room = this.rooms.get(message.path);
     if (!room) return;
+    if ((message.type === "cursor" || message.type === "presence") &&
+        (!room.joined || room.blocked ||
+        (message.documentId && room.documentId !== message.documentId))) return;
     if (message.type === "presence") {
-      if (room.joined) this.receivePeople(room, message.people, room.selfId);
+      this.receivePeople(room, message.people, room.selfId);
       return;
     }
     if (message.type === "cursor") {
-      if (!room.joined || !message.id || message.id === room.selfId) return;
+      if (!message.id || message.id === room.selfId) return;
       const peer = room.peers.get(message.id);
       if (!peer) return;
-      peer.anchor = typeof message.anchor === "string" ? message.anchor : null;
-      peer.head = typeof message.head === "string" ? message.head : null;
+      Object.assign(peer, sanitizeCursorMessage(message));
       this.refreshPeers(room);
       return;
     }

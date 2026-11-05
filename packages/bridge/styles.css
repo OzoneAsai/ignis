@@ -355,6 +355,43 @@
   z-index: 45;
 }
 
+.ignis-collab-people-roster {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  z-index: 46;
+  max-width: min(240px, 65%);
+  max-height: 42%;
+  overflow: auto;
+  padding: 3px 6px;
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+.ignis-collab-people-roster summary {
+  cursor: pointer;
+}
+
+.ignis-collab-people-roster-list {
+  max-height: 34vh;
+  overflow-y: auto;
+}
+
+.ignis-collab-people-jump {
+  display: block;
+  width: 100%;
+  padding: 4px;
+  text-align: left;
+  border: 0;
+  border-left: 3px solid;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
 .ignis-collab-remote-caret {
   position: absolute;
   width: 0;

@@ -437,6 +437,120 @@ describe("collaboration room", () => {
     expect(reduced.people[0].id).toBe(bInfo.self.id);
   });
 
+  it("shares all selections with three peers, late joiners, and old clients", async () => {
+    const alice = await connect();
+    const bob = await connect();
+    const carol = await connect();
+    const readyA = waitFor(alice, "init");
+    alice.send(JSON.stringify({ channel: "collab", type: "join",
+      path: "test.md", name: "Alice" }));
+    const a = await readyA;
+    const readyB = waitFor(bob, "init");
+    bob.send(JSON.stringify({ channel: "collab", type: "join",
+      path: "test.md", name: "Bob" }));
+    await readyB;
+    const readyC = waitFor(carol, "init");
+    carol.send(JSON.stringify({ channel: "collab", type: "join",
+      path: "test.md", name: "Carol" }));
+    const c = await readyC;
+    expect(c.people).toHaveLength(3);
+    expect(c.people.every(person => Array.isArray(person.selections))).toBe(true);
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Buffer.from(a.state, "base64"));
+    const note = doc.getText("content");
+    const pos = n => Buffer.from(Y.encodeRelativePosition(
+      Y.createRelativePositionFromTypeIndex(note, n))).toString("base64");
+    const ranges = [
+      { anchor: pos(0), head: pos(1) },
+      { anchor: pos(4), head: pos(2) },
+      { anchor: pos(5), head: pos(5) }
+    ];
+    const gotB = waitFor(bob, "cursor");
+    const gotC = waitFor(carol, "cursor");
+    alice.send(JSON.stringify({ channel: "collab", type: "cursor",
+      path: "test.md", documentId: a.documentId,
+      selections: ranges, mainIndex: 1,
+      ...ranges[1] }));
+    for (const result of await Promise.all([gotB, gotC])) {
+      expect(result.documentId).toBe(a.documentId);
+      expect(result.selections).toEqual(ranges);
+      expect(result.mainIndex).toBe(1);
+      expect(result.anchor).toBe(ranges[1].anchor);
+      expect(result.head).toBe(ranges[1].head);
+    }
+    const dave = await connect();
+    const readyD = waitFor(dave, "init");
+    dave.send(JSON.stringify({ channel: "collab", type: "join",
+      path: "test.md", name: "Dave" }));
+    const d = await readyD;
+    expect(d.people).toHaveLength(4);
+    expect(d.people.find(person => person.id === a.self.id).selections)
+      .toEqual(ranges);
+    // A peer using the old anchor/head-only wire format still becomes a
+    // single-selection member of the same canonical presence model.
+    const legacy = waitFor(alice, "cursor", "test.md",
+      msg => msg.id === d.self.id);
+    dave.send(JSON.stringify({ channel: "collab", type: "cursor",
+      path: "test.md", anchor: pos(1), head: pos(3) }));
+    const forwarded = await legacy;
+    expect(forwarded.selections).toEqual([
+      { anchor: pos(1), head: pos(3) }]);
+    expect(forwarded.mainIndex).toBe(0);
+    doc.destroy();
+  });
+
+  it("rejects stale generations, excessive selections, and malformed cursor positions", async () => {
+    const alice = await connect();
+    const bob = await connect();
+    const joined = waitFor(alice, "init");
+    alice.send(JSON.stringify({ channel: "collab", type: "join", path: "test.md" }));
+    const info = await joined;
+    const joinedB = waitFor(bob, "init");
+    bob.send(JSON.stringify({ channel: "collab", type: "join", path: "test.md" }));
+    await joinedB;
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Buffer.from(info.state, "base64"));
+    const position = Buffer.from(Y.encodeRelativePosition(
+      Y.createRelativePositionFromTypeIndex(doc.getText("content"), 1)
+    )).toString("base64");
+    for (const overrides of [
+      { documentId: crypto.randomUUID(), selections: [{ anchor: position, head: position }] },
+      { documentId: info.documentId, selections: Array.from(
+        { length: 33 }, () => ({ anchor: position, head: position })) },
+      { documentId: info.documentId, selections: [{ anchor: "corrupt", head: position }] },
+      { documentId: info.documentId, selections: [{ anchor: position, head: position }], mainIndex: 1 },
+    ]) {
+      const error = waitFor(alice, "error");
+      alice.send(JSON.stringify({ channel: "collab", type: "cursor",
+        path: "test.md", ...overrides }));
+      expect((await error).code).toBe("INVALID_SELECTION");
+    }
+    const current = waitFor(alice, "presence", "test.md",
+      msg => msg.people.length === 2);
+    bob.send(JSON.stringify({ channel: "collab", type: "identity",
+      path: "test.md", name: "Bob Updated" }));
+    const people = (await current).people;
+    expect(people.find(person => person.id === info.self.id).selections).toEqual([]);
+    doc.destroy();
+  });
+
+  it("keeps every joined person in presence beyond the previous 32-peer cap", async () => {
+    const sockets = await Promise.all(Array.from({ length: 36 }, () => connect()));
+    for (const [i, ws] of sockets.entries()) {
+      const ready = waitFor(ws, "init");
+      ws.send(JSON.stringify({ channel: "collab", type: "join",
+        path: "test.md", name: "Member " + i }));
+      await ready;
+    }
+    const last = waitFor(sockets[0], "presence", "test.md",
+      msg => msg.people.length === 36);
+    sockets[35].send(JSON.stringify({ channel: "collab", type: "identity",
+      path: "test.md", name: "Changed" }));
+    const presence = await last;
+    expect(presence.people).toHaveLength(36);
+    expect(new Set(presence.people.map(person => person.id)).size).toBe(36);
+  });
+
   function historyPath(notePath) {
     const name = crypto.createHash("sha256")
       .update(JSON.stringify(["test", notePath])).digest("hex");

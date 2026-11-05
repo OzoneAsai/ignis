@@ -14,7 +14,7 @@ import {
 } from "./collaboration-editor.js";
 import {
   createCursorOverlay,
-  encodeCursorSelection,
+  encodeCursorSelections,
 } from "./collaboration-cursors.js";
 
 const REMOTE = "remote";
@@ -438,21 +438,28 @@ export function initCollaboration(plugin) {
       return;
     }
 
-    const selected = current.editor.cm?.state?.selection?.main;
+    const selected = current.editor.cm?.state?.selection;
 
     if (!selected) {
       return;
     }
 
-    const encoded = encodeCursorSelection(current.text, selected.anchor, selected.head);
-    const signature = encoded.anchor + ":" + encoded.head;
+    const encoded = encodeCursorSelections(current.text, selected.ranges, selected.mainIndex);
+    if (!encoded) {
+      current.protocolError = "Too many selections for shared cursor protocol (maximum 32)";
+      render();
+      return;
+    }
+    const signature = JSON.stringify([encoded.selections, encoded.mainIndex]);
 
     if (current.lastSelection === signature) {
       return;
     }
 
     current.lastSelection = signature;
-    channel.send("cursor", { path: current.path, ...encoded });
+    channel.send("cursor", {
+      path: current.path, documentId: current.serverDocumentId, ...encoded
+    });
   }
 
   function scheduleSelection(current) {
@@ -473,7 +480,9 @@ export function initCollaboration(plugin) {
     current.lastSelection = null;
 
     if (current.joined && ws.isOpen()) {
-      channel.send("cursor-away", { path: current.path });
+      channel.send("cursor-away", {
+        path: current.path, documentId: current.serverDocumentId
+      });
     }
   }
 
@@ -1002,7 +1011,8 @@ export function initCollaboration(plugin) {
     channel.subscribe("presence", (msg) => {
       const current = sessions.get(msg.path);
 
-      if (current) {
+      if (current?.joined && !current.generationMismatch &&
+          (!msg.documentId || msg.documentId === current.serverDocumentId)) {
         current.participants = msg.participants;
         if (Array.isArray(msg.people)) {
           current.people = new Map(msg.people.map((person) => [person.id, person]));
@@ -1019,7 +1029,9 @@ export function initCollaboration(plugin) {
     channel.subscribe("cursor", (msg) => {
       const current = sessions.get(msg.path);
 
-      if (!current || msg.id === current.self?.id) {
+      if (!current?.joined || current.generationMismatch ||
+          (msg.documentId && msg.documentId !== current.serverDocumentId) ||
+          msg.id === current.self?.id) {
         return;
       }
 
@@ -1028,6 +1040,11 @@ export function initCollaboration(plugin) {
       if (person) {
         person.anchor = msg.anchor;
         person.head = msg.head;
+        person.selections = Array.isArray(msg.selections)
+          ? msg.selections : msg.anchor && msg.head
+            ? [{ anchor: msg.anchor, head: msg.head }] : [];
+        person.mainIndex = Number.isSafeInteger(msg.mainIndex)
+          ? msg.mainIndex : 0;
         renderPeers(current);
       }
     }),
