@@ -1,8 +1,9 @@
 import * as Y from "yjs";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { Compartment, Prec } from "@codemirror/state";
-import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
+import { EditorView, ViewPlugin, keymap, type ViewUpdate } from "@codemirror/view";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
+import { CursorOverlay, encodeSelection, sanitizePeers, type Peer } from "./presence";
 
 // Native Obsidian, mobile included, uses the same Yjs wire protocol as Ignis
 // Bridge. We only install the CM6 binding after checking native file content,
@@ -22,6 +23,12 @@ type WireMessage = {
   update?: string;
   seq?: number;
   error?: string;
+  self?: Peer;
+  people?: Peer[];
+  id?: string;
+  anchor?: string | null;
+  head?: string | null;
+  name?: string;
 };
 type Room = {
   path: string;
@@ -46,6 +53,10 @@ type Room = {
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   snapshot: string | null;
+  selfId: string | null;
+  peers: Map<string, Peer>;
+  cursorTimer: ReturnType<typeof setTimeout> | null;
+  lastCursor: string | null;
 };
 
 function encode(update: Uint8Array): string {
@@ -73,7 +84,8 @@ function newRoom(path: string, documentId: string | null): Room {
     composing: false, pendingHandshake: false, waiting: [], waitingBytes: 0,
     sentSeq: 0, savedSeq: 0,
     retryCount: 0, retryTimer: null,
-    snapshot: null
+    snapshot: null, selfId: null, peers: new Map(),
+    cursorTimer: null, lastCursor: null
   };
 }
 
@@ -81,6 +93,7 @@ export class NativeYjs {
   private readonly rooms = new Map<string, Room>();
   private readonly paths = new Map<EditorView, string>();
   private readonly bound = new Map<EditorView, Room>();
+  private readonly overlays = new Map<EditorView, CursorOverlay>();
   private readonly compartment = new Compartment();
   private online = false;
   private disposed = false;
@@ -91,6 +104,7 @@ export class NativeYjs {
     pathForView: (view: EditorView) => string | null;
     knownId: (path: string) => string | null;
     rememberId: (path: string, id: string) => Promise<void>;
+    displayName?: () => string;
     send: (message: WireMessage) => void;
     notify: (path: string, status: string) => void;
   }) {}
@@ -103,8 +117,11 @@ export class NativeYjs {
         constructor(readonly view: EditorView) {
           manager.observe(view);
         }
-        update(update: { view: EditorView }) {
+        update(update: ViewUpdate) {
           manager.observe(update.view);
+          if (update.selectionSet || update.docChanged || update.focusChanged) {
+            manager.selectionChanged(update.view);
+          }
         }
         destroy() {
           manager.forget(this.view);
@@ -146,6 +163,8 @@ export class NativeYjs {
       old?.views.delete(view);
       this.paths.delete(view);
       this.bound.delete(view);
+      this.overlays.get(view)?.destroy();
+      this.overlays.delete(view);
       // Reconfiguration is deferred to avoid dispatching during CM6 update.
       queueMicrotask(() => {
         if (view.dom.isConnected && !this.disposed) {
@@ -153,8 +172,10 @@ export class NativeYjs {
         }
       });
       if (old && old.views.size === 0 && old.joined) {
+        this.sendCursorAway(old);
         this.opts.send({ channel: "collab", type: "leave", path: old.path });
         old.joined = false;
+        this.clearPeers(old);
       }
     }
     if (!path) return;
@@ -167,6 +188,7 @@ export class NativeYjs {
       if (id) void this.hydrate(room, id);
     }
     room.views.add(view);
+    this.refreshPeers(room);
     this.tryAttach(room);
     if (this.online) this.join(room);
   }
@@ -176,12 +198,16 @@ export class NativeYjs {
     if (!path) return;
     this.paths.delete(view);
     this.bound.delete(view);
+    this.overlays.get(view)?.destroy();
+    this.overlays.delete(view);
     const room = this.rooms.get(path);
     if (!room) return;
     room.views.delete(view);
     if (room.views.size === 0 && room.joined) {
+      this.sendCursorAway(room);
       this.opts.send({ channel: "collab", type: "leave", path });
       room.joined = false;
+      this.clearPeers(room);
     }
   }
 
@@ -205,6 +231,7 @@ export class NativeYjs {
           room.joined && !room.blocked && this.online) {
         this.sendUpdate(room, update);
       }
+      if (room.peers.size) this.refreshPeers(room);
     });
     const hydrateTask = async () => {
       try {
@@ -263,6 +290,8 @@ export class NativeYjs {
           return;
         }
         view.dispatch({ effects: this.compartment.reconfigure(extension) });
+        this.refreshPeers(room);
+        this.selectionChanged(view);
       });
     }
   }
@@ -306,7 +335,73 @@ export class NativeYjs {
 
   private join(room: Room) {
     if (!this.online || room.blocked || !room.views.size) return;
-    this.opts.send({ channel: "collab", type: "join", path: room.path });
+    this.opts.send({ channel: "collab", type: "join", path: room.path,
+      name: this.opts.displayName?.() || "Native Obsidian" });
+  }
+
+  private clearPeers(room: Room) {
+    room.peers.clear();
+    room.selfId = null;
+    room.lastCursor = null;
+    if (room.cursorTimer !== null) clearTimeout(room.cursorTimer);
+    room.cursorTimer = null;
+    this.refreshPeers(room);
+  }
+
+  private sendCursorAway(room: Room) {
+    if (room.cursorTimer !== null) clearTimeout(room.cursorTimer);
+    room.cursorTimer = null;
+    if (room.lastCursor !== null && room.joined && this.online) {
+      this.opts.send({ channel: "collab", type: "cursor-away", path: room.path });
+    }
+    room.lastCursor = null;
+  }
+
+  private selectionChanged(view: EditorView) {
+    const room = this.bound.get(view);
+    if (!room) return;
+    if (room.peers.size) this.refreshPeers(room);
+    if (!view.hasFocus) {
+      if (![...room.views].some(v => v.hasFocus)) this.sendCursorAway(room);
+      return;
+    }
+    if (!room.joined || !this.online || room.blocked || room.composing) return;
+    if (room.cursorTimer !== null) clearTimeout(room.cursorTimer);
+    room.cursorTimer = setTimeout(() => {
+      room.cursorTimer = null;
+      const focused = [...room.views].find(v =>
+        v.hasFocus && this.bound.get(v) === room);
+      if (!focused || !room.text || !room.joined || room.composing ||
+          room.blocked || !this.online) return;
+      const selection = focused.state.selection.main;
+      const encoded = encodeSelection(room.text, selection.anchor, selection.head);
+      if (!encoded) return;
+      const signature = encoded.anchor + ":" + encoded.head;
+      if (room.lastCursor === signature) return;
+      room.lastCursor = signature;
+      this.opts.send({ channel: "collab", type: "cursor", path: room.path,
+        ...encoded });
+    }, 65);
+  }
+
+  private refreshPeers(room: Room) {
+    for (const view of room.views) {
+      if (typeof document === "undefined" || !view.dom ||
+          !("nodeType" in view.dom) || view.dom.nodeType !== 1) continue;
+      let overlay = this.overlays.get(view);
+      if (!overlay) {
+        overlay = new CursorOverlay(view);
+        this.overlays.set(view, overlay);
+      }
+      overlay.set(room.text, [...room.peers.values()]);
+    }
+  }
+
+  private receivePeople(room: Room, people: unknown, selfId: string | null) {
+    room.selfId = selfId;
+    room.peers = new Map(sanitizePeers(people, selfId).map(peer =>
+      [peer.id, peer]));
+    this.refreshPeers(room);
   }
 
   connected() {
@@ -318,6 +413,7 @@ export class NativeYjs {
     this.online = false;
     for (const room of this.rooms.values()) {
       room.joined = false;
+      this.clearPeers(room);
       if (room.retryTimer !== null) {
         clearTimeout(room.retryTimer);
         room.retryTimer = null;
@@ -337,9 +433,11 @@ export class NativeYjs {
       return false;
     }
     if (room.joined) {
+      this.sendCursorAway(room);
       this.opts.send({ channel: "collab", type: "leave", path: oldPath });
     }
     room.joined = false;
+    this.clearPeers(room);
     this.rooms.delete(oldPath);
     room.path = newPath;
     this.rooms.set(newPath, room);
@@ -392,6 +490,19 @@ export class NativeYjs {
     if (this.disposed || message.channel !== "collab" || !message.path) return;
     const room = this.rooms.get(message.path);
     if (!room) return;
+    if (message.type === "presence") {
+      if (room.joined) this.receivePeople(room, message.people, room.selfId);
+      return;
+    }
+    if (message.type === "cursor") {
+      if (!room.joined || !message.id || message.id === room.selfId) return;
+      const peer = room.peers.get(message.id);
+      if (!peer) return;
+      peer.anchor = typeof message.anchor === "string" ? message.anchor : null;
+      peer.head = typeof message.head === "string" ? message.head : null;
+      this.refreshPeers(room);
+      return;
+    }
     if (message.type === "init") {
       if (!message.documentId || !ID_PATTERN.test(message.documentId)) {
         this.opts.notify(room.path, "Invalid server Yjs identity");
@@ -416,7 +527,27 @@ export class NativeYjs {
         const candidate = new Y.Doc();
         Y.applyUpdate(candidate, remote);
         const serverText = candidate.getText("content").toString();
+        // A known generation must keep its actual Yjs operation lineage.
+        // Reconstructing a new Y.Doc from unchanged Markdown does NOT
+        // recreate the same CRDT. Merging two independent nonempty histories
+        // would duplicate even identical text on the native Mac editor.
+        // Zero-history peers are allowed (the first empty server document
+        // can still accept offline edits). Use shared client IDs rather than
+        // a fragile text-equality special case.
+        const localVector = Y.decodeStateVector(Y.encodeStateVector(room.doc));
+        const remoteVector = Y.decodeStateVector(Y.encodeStateVector(candidate));
+        const unrelated = room.wasKnown && localVector.size > 0 &&
+          remoteVector.size > 0 &&
+          ![...localVector.keys()].some((clientId) => remoteVector.has(clientId));
         candidate.destroy();
+        if (unrelated) {
+          room.blocked = true;
+          room.joined = false;
+          this.opts.send({ channel: "collab", type: "leave", path: room.path });
+          this.opts.notify(room.path,
+            "Yjs lineage mismatch; server history was recreated; native draft preserved");
+          return;
+        }
         // If the local editor diverged from the persisted local Yjs cache,
         // treat it as a separate unsent native draft, never overwrite it.
         // New sessions have an empty cache, so compare directly to server.
@@ -445,12 +576,15 @@ export class NativeYjs {
           }
         }
         room.joined = true;
+        this.receivePeople(room, message.people,
+          typeof message.self?.id === "string" ? message.self.id : null);
         if (room.composing) this.deferRemote(room, remote);
         else Y.applyUpdate(room.doc, remote, REMOTE);
         if (room.blocked) return;
         await this.opts.rememberId(room.path, message.documentId);
         room.wasKnown = true;
         this.tryAttach(room);
+        for (const view of room.views) this.selectionChanged(view);
         // Replays offline CRDT history without turning a note into a
         // stale whole-file overwrite; the server ACKs only after fsync.
         if (!room.composing) this.sendUpdate(room, Y.encodeStateAsUpdate(room.doc));
@@ -501,6 +635,8 @@ export class NativeYjs {
     this.disconnected();
     this.paths.clear();
     this.bound.clear();
+    for (const overlay of this.overlays.values()) overlay.destroy();
+    this.overlays.clear();
     for (const room of this.rooms.values()) {
       if (room.retryTimer !== null) clearTimeout(room.retryTimer);
       await room.persistence?.destroy().catch(() => {});
