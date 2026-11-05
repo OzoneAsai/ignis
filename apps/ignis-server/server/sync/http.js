@@ -2,6 +2,7 @@
 // WSS notifications deliberately do not replace the durable SQLite cursor.
 const crypto = require("node:crypto");
 const express = require("express");
+const { tailnetPrincipal, authorizedVaults } = require("./tailnet-auth");
 
 function secureEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
@@ -10,7 +11,7 @@ function secureEqual(left, right) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function createSyncRouter({ store, token }) {
+function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
   if (typeof token !== "string" || Buffer.byteLength(token) < 32) {
     throw new Error("IGNIS_SYNC_TOKEN must have at least 32 bytes");
   }
@@ -22,8 +23,18 @@ function createSyncRouter({ store, token }) {
   router.get("/capabilities", (_req, res) => {
     res.json({ protocol: "ignis-sync/1", transport: ["https", "wss"],
       supported: ["manifest", "changes", "conditional-text", "conditional-binary-4MiB", "file-identity"],
-      auth: "scoped-device-token",
+      auth: tailnetAccess.size ? ["scoped-device-token", "tailscale-serve"] :
+        ["scoped-device-token"],
       experimental: true });
+  });
+  router.get("/link", (req, res) => {
+    const login = tailnetPrincipal(req.headers, req.socket.remoteAddress, tailnetAccess);
+    if (!login) {
+      return res.status(401).json({ code: "IDENTITY_REQUIRED",
+        error: "Open this server through Tailscale Serve to discover your Vaults" });
+    }
+    res.json({ auth: "tailnet", vaults: authorizedVaults(tailnetAccess, login)
+      .filter((id) => !!store.getVaultPath(id)) });
   });
   function adminOnly(req, res, next) {
     if (!secureEqual(req.get("Authorization"), "Bearer " + token)) {
@@ -64,16 +75,21 @@ function createSyncRouter({ store, token }) {
     const match = /^Bearer (ignis_dev_[A-Za-z0-9_-]{43})$/.exec(
       req.get("Authorization") || ""
     );
-    const device = match && store.authenticateDevice(match[1], req.params.vaultId);
+    const login = tailnetPrincipal(req.headers, req.socket.remoteAddress,
+      tailnetAccess, req.params.vaultId);
+    const device = match ? store.authenticateDevice(match[1], req.params.vaultId) :
+      login ? store.ensureTailnetDevice(login, req.params.vaultId, token) : null;
     if (!device) {
       return res.status(401).json({ code: "UNAUTHORIZED", error: "Device authorization required" });
     }
     req.ignisSyncDevice = device;
+    req.ignisSyncAuth = login && !match ? "tailnet" : "device";
     next();
   });
   router.get("/vaults/:vaultId/session", (req, res) => {
     const device = req.ignisSyncDevice;
-    res.json({ deviceId: device.deviceId, vaultId: device.vaultId, label: device.label });
+    res.json({ deviceId: device.deviceId, vaultId: device.vaultId,
+      label: device.label, auth: req.ignisSyncAuth });
   });
   router.get("/vaults/:vaultId/manifest", route(async (req, res) => {
     res.json(await store.scan(req.params.vaultId));
@@ -108,18 +124,23 @@ function createSyncRouter({ store, token }) {
   return router;
 }
 
-function registerSyncChannel(wss, store) {
+function registerSyncChannel(wss, store, { token, tailnetAccess = new Map() } = {}) {
   const authorized = new WeakMap();
   const peers = new Set();
   const channel = wss.channel("sync");
   channel.on("auth", (msg, ws) => {
-    const device = store.authenticateDevice(msg.token, ws.ignisVaultId);
+    const login = ws.ignisTailnetLogin;
+    const device = typeof msg.token === "string" && msg.token ?
+      store.authenticateDevice(msg.token, ws.ignisVaultId) :
+      login && tailnetAccess.get(login)?.has(ws.ignisVaultId) ?
+        store.ensureTailnetDevice(login, ws.ignisVaultId, token) : null;
     if (!device || authorized.has(ws)) {
       ws.send(JSON.stringify({ channel: "sync", type: "auth-error", code: "UNAUTHORIZED" }));
       ws.close(4003, "Sync authorization failed");
       return;
     }
     authorized.set(ws, device.deviceId);
+    ws.ignisSyncAuthorized = true;
     peers.add(ws);
     ws.send(JSON.stringify({ channel: "sync", type: "ready",
       vaultId: ws.ignisVaultId, deviceId: device.deviceId,
@@ -153,6 +174,11 @@ function registerSyncChannel(wss, store) {
     }
   });
   const stopRevocation = store.onRevoke((deviceId) => {
+    // Close even a newly connected Tailnet socket that has not yet sent its
+    // sync.auth frame. Its authenticated identity was fixed at WS upgrade.
+    for (const ws of wss.clients || []) {
+      if (ws.ignisTailnetDevice === deviceId) ws.close(4003, "Access revoked");
+    }
     for (const ws of peers) {
       if (authorized.get(ws) === deviceId) ws.close(4003, "Device revoked");
     }

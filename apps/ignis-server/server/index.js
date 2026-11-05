@@ -117,11 +117,20 @@ const vaultLifecycle = require("./vault/lifecycle");
 const collaboration = require("./collab");
 const { VaultSyncStore, permittedPath } = require("./sync/store");
 const { createSyncRouter, registerSyncChannel } = require("./sync/http");
+const { parseTailnetAccess, tailnetPrincipal } = require("./sync/tailnet-auth");
 const { startDiscoveryFromEnv } = require("./sync/discovery");
 
 // Opt-in until the surrounding Ignis HTTP API has authenticated access
 // control. Keep this state in DATA_ROOT, never in a synced Vault.
 const syncToken = process.env.IGNIS_SYNC_TOKEN;
+const tailnetAccess = parseTailnetAccess(process.env.IGNIS_TAILNET_ACCESS);
+if (tailnetAccess.size && process.env.IGNIS_BIND_HOST !== "127.0.0.1" &&
+    process.env.IGNIS_BIND_HOST !== "::1") {
+  throw new Error("Tailnet identity auth requires IGNIS_BIND_HOST=127.0.0.1 or ::1");
+}
+if (tailnetAccess.size && !syncToken) {
+  throw new Error("Tailnet identity auth requires the Ignis Sync server to be enabled");
+}
 const syncStore = syncToken ? new VaultSyncStore({
   dataRoot: config.dataRoot,
   getVaultPath: config.getVaultPath,
@@ -129,9 +138,43 @@ const syncStore = syncToken ? new VaultSyncStore({
   writeCoalescer,
 }) : null;
 if (syncStore) {
-  app.use("/api/sync/v1", createSyncRouter({ store: syncStore, token: syncToken }));
+  app.use("/api/sync/v1", createSyncRouter({
+    store: syncStore, token: syncToken, tailnetAccess
+  }));
 }
 let discoveryHandle = null;
+
+// Secret-free invitation URL for mobile Obsidian. Opening an invite never
+// changes a Vault; the Tailnet identity must have explicit access.
+app.get("/join/:vaultId", (req, res) => {
+  const login = tailnetPrincipal(req.headers, req.socket.remoteAddress,
+    tailnetAccess, req.params.vaultId);
+  const host = req.get("Host") || "";
+  if (!login || !config.getVaultPath(req.params.vaultId) ||
+      !/^[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(host)) {
+    return res.status(404).type("text/plain").send("Connection link unavailable");
+  }
+  const invite = "https://" + host + "/join/" +
+    encodeURIComponent(req.params.vaultId);
+  const open = "obsidian://ignis-connector?link=" + encodeURIComponent(invite);
+  res.set("Cache-Control", "no-store");
+  res.type("html").send([
+    '<!doctype html><html lang="en"><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<title>Connect Obsidian to Ignis</title>',
+    '<style>body{font:16px system-ui;margin:2rem auto;max-width:32rem;',
+    'padding:0 1rem;background:#17171b;color:#f1f1f1;line-height:1.6}',
+    'a{display:block;background:#815ae5;color:white;padding:1rem;',
+    'border-radius:.7rem;text-align:center;text-decoration:none;font-weight:bold}',
+    'code{overflow-wrap:anywhere;color:#d3c4ff}</style>',
+    '<h1>Connect to Ignis</h1><p>Your Tailscale account can access ',
+    '<strong>', req.params.vaultId, '</strong>. Review your connection in Obsidian.</p>',
+    '<p><a href="', open, '">Open in Obsidian</a></p>',
+    '<p>Or paste this into Ignis Connector settings:<br><code>',
+    invite, '</code></p><p>No password or token is contained in this link.</p>',
+    '</html>'
+  ].join(""));
+});
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
@@ -263,6 +306,15 @@ const server = app.listen(...listenArgs, async () => {
 const wss = setupWebSocket(server, {
   getVaultPath: config.getVaultPath,
   originAllowlist: settings.get("wsOrigins"),
+  authorizeConnection: (req, vaultId) => {
+    const login = tailnetPrincipal(req.headers, req.socket.remoteAddress,
+      tailnetAccess, vaultId);
+    // A trusted local reverse proxy marks Tailnet-only WS connections.
+    // Legacy loopback /ws access retains its original behavior.
+    if (!login) return req.headers["x-ignis-tailnet-only"] === "1" ? false : null;
+    const device = syncStore?.ensureTailnetDevice(login, vaultId, syncToken);
+    return device ? { login, deviceId: device.deviceId } : false;
+  },
   // A live CRDT room, not the conventional file watcher, owns the note body.
   // Metadata listeners are still notified independently.
   filterFileEvent: (vaultId, event) => !(
@@ -280,7 +332,7 @@ collaboration.register({
     syncStore.recordCollaborationSave(vaultId, relPath, documentId, digest, byteLength) : undefined,
 });
 if (syncStore) {
-  registerSyncChannel(wss, syncStore);
+  registerSyncChannel(wss, syncStore, { token: syncToken, tailnetAccess });
   const scanTimers = new Map();
   watcher.addGlobalListener((vaultId, event) => {
     if (!permittedPath(event.path)) return;

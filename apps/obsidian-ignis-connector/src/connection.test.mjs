@@ -50,6 +50,7 @@ function connector() {
   const plugin = new IgnisConnector();
   plugin.settings = {
     serverUrl: "https://ignis.example/",
+    authMode: "device",
     scope: "https://ignis.example|lab",
     vaultId: "lab",
     deviceId: "device-a",
@@ -91,6 +92,41 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     expect(current.sent).toEqual([{
       channel: "sync", type: "auth", token: plugin.token
     }]);
+  });
+
+  it("connects via a one-link Tailnet session without storing or sending a token", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const plugin = connector();
+    plugin.app = { secretStorage: null };
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    plugin.live.resetForConnection = vi.fn().mockResolvedValue(undefined);
+    plugin.settings.pendingWrites = [];
+    plugin.settings.syncIssues = [];
+    plugin.settings.archivedScopes = [];
+    plugin.settings.cursor = 0;
+    plugin.settings.discoveryUrl = "";
+    plugin.settings.serverDeviceId = "";
+    plugin.settings.applyRemoteDeletes = false;
+    mockRequest.mockResolvedValueOnce({
+      status: 200, json: {
+        auth: "tailnet", vaultId: "IOSLab", deviceId: "tailnet-user-a",
+        label: "Tailnet user"
+      }
+    });
+    const result = await plugin.connectToServer({
+      serverUrl: "https://mac.example:8452/join/IOSLab",
+      vaultId: "", token: ""
+    });
+    expect(result).toMatchObject({ ok: true, memoryOnly: false });
+    expect(plugin.settings).toMatchObject({
+      authMode: "tailnet", vaultId: "IOSLab",
+      serverUrl: "https://mac.example:8452", deviceId: "tailnet-user-a"
+    });
+    expect(plugin.token).toBe("");
+    expect(mockRequest.mock.calls[0][0].headers).toEqual({});
+    const socket = sockets()[0];
+    socket.open();
+    expect(socket.sent).toEqual([{ channel: "sync", type: "auth" }]);
   });
 
   it("does not forward stale collaboration frames after replacing a socket", () => {
@@ -238,8 +274,12 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
       token: "ignis_dev_" + "b".repeat(43)
     });
     expect(result).toMatchObject({ ok: false });
-    expect(result.message).toMatch(/Vault ID/);
-    expect(mockRequest).not.toHaveBeenCalled();
+    expect(result.message).toMatch(/Vault could be detected/);
+    expect(mockRequest).toHaveBeenCalledOnce();
+    expect(mockRequest.mock.calls[0][0]).toMatchObject({
+      url: "https://ignis.example/api/sync/v1/link", method: "GET"
+    });
+    expect(mockRequest.mock.calls[0][0].headers?.Authorization).toBeUndefined();
     expect(plugin.token).toBe(existing);
     expect(plugin.settings.vaultId).toBe("lab");
     expect(plugin.saveData).not.toHaveBeenCalled();
