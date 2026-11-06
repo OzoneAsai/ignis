@@ -31,7 +31,9 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
+  CollaboratorsModal: () => CollaboratorsModal,
   ConnectorSettings: () => ConnectorSettings,
+  DisplayNameModal: () => DisplayNameModal,
   default: () => IgnisConnector
 });
 module.exports = __toCommonJS(main_exports);
@@ -9356,8 +9358,8 @@ var IndexeddbPersistence = class extends Observable {
 };
 
 // src/live.ts
-var import_state = require("@codemirror/state");
-var import_view = require("@codemirror/view");
+var import_state2 = require("@codemirror/state");
+var import_view2 = require("@codemirror/view");
 
 // ../../node_modules/y-codemirror.next/src/index.js
 var cmView4 = __toESM(require("@codemirror/view"), 1);
@@ -10025,6 +10027,49 @@ function visibleContentObstacles(contentDOM, space, viewport, limit = 1500) {
   }
 }
 
+// src/selection-decorations.ts
+var import_state = require("@codemirror/state");
+var import_view = require("@codemirror/view");
+var MAX_REMOTE_MARKS = 480;
+var replaceRemoteMarks = import_state.StateEffect.define();
+function cssTint(color) {
+  if (!/^#[0-9a-f]{6}$/i.test(color))
+    return "rgba(89, 186, 242, 0.24)";
+  const parts = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
+  return `rgba(${parts.join(", ")}, 0.24)`;
+}
+function makeMarkDecorations(marks, length2) {
+  const ranges = [];
+  for (const { from: from2, to, color } of marks.slice(0, MAX_REMOTE_MARKS)) {
+    if (!Number.isSafeInteger(from2) || !Number.isSafeInteger(to))
+      continue;
+    const start = Math.max(0, Math.min(length2, from2));
+    const end = Math.max(0, Math.min(length2, to));
+    if (start >= end)
+      continue;
+    ranges.push(import_view.Decoration.mark({
+      class: "ignis-native-remote-highlight",
+      attributes: { style: `background-color: ${cssTint(color)};` },
+      inclusive: false
+    }).range(start, end));
+  }
+  return ranges.length ? import_view.Decoration.set(ranges, true) : import_view.Decoration.none;
+}
+var remoteSelectionField = import_state.StateField.define({
+  create: () => import_view.Decoration.none,
+  update(value, transaction) {
+    let next = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(replaceRemoteMarks)) {
+        next = makeMarkDecorations(effect.value, transaction.state.doc.length);
+      }
+    }
+    return next;
+  },
+  provide: (field) => import_view.EditorView.decorations.from(field)
+});
+var remoteSelectionExtension = remoteSelectionField;
+
 // src/presence.ts
 var MAX_CURSOR_BYTES = 512;
 var MAX_SHARED_SELECTIONS = 32;
@@ -10156,8 +10201,9 @@ function sanitizePeers(input, selfId) {
   return peers;
 }
 var CursorOverlay = class {
-  constructor(view) {
+  constructor(view, mobile = false) {
     this.view = view;
+    this.mobile = mobile;
     this.root = document.createElement("div");
     this.root.className = "ignis-native-cursors";
     this.root.setAttribute("aria-hidden", "true");
@@ -10176,9 +10222,10 @@ var CursorOverlay = class {
     this.roster = document.createElement("details");
     this.roster.className = "ignis-native-people-roster";
     Object.assign(this.roster.style, {
-      position: "absolute",
-      top: "5px",
-      right: "6px",
+      position: mobile ? "fixed" : "absolute",
+      top: mobile ? "auto" : "5px",
+      right: mobile ? "auto" : "6px",
+      left: mobile ? "max(12px, env(safe-area-inset-left, 0px))" : "auto",
       maxWidth: "min(65vw, 250px)",
       maxHeight: "42vh",
       overflow: "auto",
@@ -10193,14 +10240,56 @@ var CursorOverlay = class {
     });
     this.rosterTitle = document.createElement("summary");
     this.rosterTitle.style.cursor = "pointer";
+    this.rosterTitle.setAttribute("aria-label", "Open Ignis collaborators");
+    if (mobile) {
+      Object.assign(this.roster.style, {
+        zIndex: "1000",
+        overflow: "visible",
+        padding: "0",
+        borderRadius: "12px",
+        boxShadow: "0 3px 18px #0006"
+      });
+      Object.assign(this.rosterTitle.style, {
+        display: "flex",
+        alignItems: "center",
+        minHeight: "44px",
+        padding: "0 14px",
+        fontSize: "13px",
+        fontWeight: "600",
+        touchAction: "manipulation",
+        whiteSpace: "nowrap"
+      });
+    }
     this.roster.appendChild(this.rosterTitle);
     this.rosterList = document.createElement("div");
     this.rosterList.style.maxHeight = "35vh";
     this.rosterList.style.overflowY = "auto";
+    if (mobile) {
+      Object.assign(this.rosterList.style, {
+        position: "absolute",
+        bottom: "calc(100% + 8px)",
+        left: "0",
+        minWidth: "min(78vw, 240px)",
+        maxWidth: "min(86vw, 300px)",
+        padding: "8px",
+        borderRadius: "10px",
+        background: "var(--background-primary, #202127)",
+        boxShadow: "0 4px 18px #0006"
+      });
+    }
     this.roster.appendChild(this.rosterList);
-    view.dom.appendChild(this.roster);
+    if (mobile) {
+      document.body.appendChild(this.roster);
+      this.positionMobileRoster();
+      window.visualViewport?.addEventListener("resize", this.mobileViewportChange);
+      window.visualViewport?.addEventListener("scroll", this.mobileViewportChange);
+    } else {
+      view.dom.appendChild(this.roster);
+    }
     view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
     window.addEventListener("resize", this.scroll);
+    if (mobile)
+      window.addEventListener("resize", this.mobileViewportChange);
     this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM ? new MutationObserver(this.scroll) : null;
     this.contentMutation?.observe(view.contentDOM, {
       subtree: true,
@@ -10224,9 +10313,29 @@ var CursorOverlay = class {
   originalPosition;
   scroll = () => this.schedule();
   contentMutation;
+  mobileViewportChange = () => {
+    this.positionMobileRoster();
+    this.schedule();
+  };
+  highlightFingerprint = "";
+  highlightEpoch = 0;
+  highlightsLimited = false;
+  positionMobileRoster() {
+    if (!this.mobile)
+      return;
+    const viewport = window.visualViewport;
+    const height = viewport?.height ?? window.innerHeight;
+    const y = (viewport?.offsetTop ?? 0) + height - 104;
+    this.roster.style.top = Math.max(12, Math.min(
+      window.innerHeight - 56,
+      y
+    )) + "px";
+    this.rosterList.style.maxHeight = Math.max(88, height - 180) + "px";
+  }
   set(text2, peers) {
     this.text = text2;
     this.peers = peers;
+    this.syncHighlights();
     this.updateRoster();
     if (!text2 || peers.length === 0) {
       this.clear();
@@ -10237,6 +10346,7 @@ var CursorOverlay = class {
   updateRoster() {
     this.roster.hidden = this.peers.length === 0;
     this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + " \xB7 show locations";
+    this.rosterTitle.setAttribute("aria-label", this.rosterTitle.textContent);
     const fingerprint = this.peers.map((peer) => [peer.id, peer.name, peer.color].join(":")).join("|");
     if (fingerprint === this.rosterFingerprint)
       return;
@@ -10257,7 +10367,8 @@ var CursorOverlay = class {
         background: "transparent",
         border: "0",
         borderLeft: "3px solid " + peer.color,
-        padding: "4px",
+        padding: this.mobile ? "12px 8px" : "4px",
+        minHeight: this.mobile ? "44px" : "auto",
         cursor: "pointer"
       });
       button.addEventListener("click", () => {
@@ -10284,8 +10395,6 @@ var CursorOverlay = class {
     if (!record)
       return;
     record.caret.remove();
-    for (const mark of record.marks)
-      mark.remove();
     this.nodes.delete(id2);
     this.lastBadgePositions.delete(id2);
   }
@@ -10295,6 +10404,47 @@ var CursorOverlay = class {
     this.raf = 0;
     for (const id2 of [...this.nodes.keys()])
       this.discard(id2);
+    this.publishHighlights([]);
+  }
+  publishHighlights(marks) {
+    const fingerprint = JSON.stringify(marks);
+    if (fingerprint === this.highlightFingerprint)
+      return;
+    this.highlightFingerprint = fingerprint;
+    const epoch = ++this.highlightEpoch;
+    queueMicrotask(() => {
+      if (epoch !== this.highlightEpoch || !this.view.dom.isConnected || !this.view.dispatch || !this.view.state?.field)
+        return;
+      try {
+        if (this.view.state.field(remoteSelectionField, false) === void 0)
+          return;
+        this.view.dispatch({ effects: replaceRemoteMarks.of(marks) });
+      } catch {
+      }
+    });
+  }
+  syncHighlights() {
+    const marks = [];
+    this.highlightsLimited = false;
+    if (this.text) {
+      const length2 = this.view.state.doc.length;
+      for (const peer of this.peers) {
+        for (const selection of resolveSelections(this.text, peer)) {
+          if (!selection)
+            continue;
+          const from2 = Math.max(0, Math.min(length2, selection.anchor, selection.head));
+          const to = Math.min(length2, Math.max(selection.anchor, selection.head));
+          if (from2 >= to)
+            continue;
+          if (marks.length < MAX_REMOTE_MARKS) {
+            marks.push({ from: from2, to, color: peer.color });
+          } else {
+            this.highlightsLimited = true;
+          }
+        }
+      }
+    }
+    this.publishHighlights(marks);
   }
   schedule() {
     if (!this.raf && this.root.isConnected) {
@@ -10322,8 +10472,6 @@ var CursorOverlay = class {
     const visible = /* @__PURE__ */ new Set();
     const badgeItems = [];
     const caretBlockers = [];
-    let remainingMarks = 480;
-    let highlightsLimited = false;
     for (const peer of this.peers) {
       const selections = resolveSelections(this.text, peer);
       const mainIndex = Number.isSafeInteger(peer.mainIndex) && peer.mainIndex >= 0 && peer.mainIndex < selections.length ? peer.mainIndex : 0;
@@ -10363,7 +10511,7 @@ var CursorOverlay = class {
           });
           caret.appendChild(label);
           this.root.appendChild(caret);
-          record = { caret, label, marks: [] };
+          record = { caret, label };
           this.nodes.set(key, record);
         }
         record.label.textContent = peer.name;
@@ -10394,58 +10542,6 @@ var CursorOverlay = class {
             });
           }
         }
-        const from2 = Math.max(0, Math.min(selection.anchor, selection.head));
-        const to = Math.min(
-          this.view.state.doc.length,
-          Math.max(selection.anchor, selection.head)
-        );
-        const marks = [];
-        const viewport = this.view.viewport;
-        let position = Math.max(from2, viewport.from);
-        const end = Math.min(to, viewport.to);
-        if (position < end && remainingMarks === 0)
-          highlightsLimited = true;
-        while (position < end && marks.length < Math.min(120, remainingMarks)) {
-          const line = this.view.state.doc.lineAt(position);
-          const stop = Math.min(end, line.to);
-          const a = this.view.coordsAtPos(position);
-          const b = this.view.coordsAtPos(stop);
-          if (a && b) {
-            const first = space.toLocal(a);
-            const last2 = space.toLocal(b);
-            marks.push({
-              left: first.left,
-              top: first.top,
-              width: Math.max(2, last2.left - first.left),
-              height: Math.max(1, last2.bottom - first.top)
-            });
-          }
-          position = Math.max(position + 1, stop + 1);
-        }
-        remainingMarks -= marks.length;
-        for (let i = 0; i < marks.length; i++) {
-          let mark = record.marks[i];
-          if (!mark) {
-            mark = document.createElement("span");
-            mark.className = "ignis-native-remote-selection";
-            Object.assign(mark.style, {
-              position: "absolute",
-              pointerEvents: "none",
-              opacity: "0.22"
-            });
-            this.root.appendChild(mark);
-            record.marks.push(mark);
-          }
-          Object.assign(mark.style, {
-            backgroundColor: peer.color,
-            left: marks[i].left + "px",
-            top: marks[i].top + "px",
-            width: marks[i].width + "px",
-            height: marks[i].height + "px"
-          });
-        }
-        while (record.marks.length > marks.length)
-          record.marks.pop().remove();
       }
     }
     for (const id2 of [...this.nodes.keys()]) {
@@ -10467,7 +10563,8 @@ var CursorOverlay = class {
       item.label.style.visibility = "visible";
       this.lastBadgePositions.set(item.key, placement);
     }
-    this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + (highlightsLimited ? " \xB7 highlights limited" : " \xB7 show locations");
+    this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + (this.highlightsLimited ? " \xB7 highlights limited" : " \xB7 show locations");
+    this.rosterTitle.setAttribute("aria-label", this.rosterTitle.textContent);
   }
   destroy() {
     this.clear();
@@ -10475,6 +10572,11 @@ var CursorOverlay = class {
     window.removeEventListener("resize", this.scroll);
     this.contentMutation?.disconnect();
     document.fonts?.removeEventListener?.("loadingdone", this.scroll);
+    if (this.mobile) {
+      window.visualViewport?.removeEventListener("resize", this.mobileViewportChange);
+      window.visualViewport?.removeEventListener("scroll", this.mobileViewportChange);
+      window.removeEventListener("resize", this.mobileViewportChange);
+    }
     this.root.remove();
     this.roster.remove();
     this.view.dom.style.position = this.originalPosition;
@@ -10542,14 +10644,15 @@ var NativeYjs = class {
   paths = /* @__PURE__ */ new Map();
   bound = /* @__PURE__ */ new Map();
   overlays = /* @__PURE__ */ new Map();
-  compartment = new import_state.Compartment();
+  compartment = new import_state2.Compartment();
   online = false;
   disposed = false;
   extension() {
     const manager = this;
     return [
       this.compartment.of([]),
-      import_view.ViewPlugin.fromClass(class {
+      remoteSelectionExtension,
+      import_view2.ViewPlugin.fromClass(class {
         constructor(view) {
           this.view = view;
           manager.observe(view);
@@ -10724,7 +10827,7 @@ var NativeYjs = class {
       this.bound.set(view, room);
       const extension = [
         yCollab(room.text, null, { undoManager: room.undo }),
-        import_state.Prec.highest(import_view.keymap.of(yUndoManagerKeymap))
+        import_state2.Prec.highest(import_view2.keymap.of(yUndoManagerKeymap))
       ];
       queueMicrotask(() => {
         if (this.disposed || this.paths.get(view) !== room.path || this.bound.get(view) !== room)
@@ -10859,11 +10962,46 @@ var NativeYjs = class {
         continue;
       let overlay = this.overlays.get(view);
       if (!overlay) {
-        overlay = new CursorOverlay(view);
+        overlay = new CursorOverlay(view, this.opts.mobile === true);
         this.overlays.set(view, overlay);
       }
       overlay.set(room.text, [...room.peers.values()]);
     }
+  }
+  updateDisplayName() {
+    const name = this.opts.displayName?.() || "Native Obsidian";
+    for (const room of this.rooms.values()) {
+      if (room.joined && !room.blocked && this.online) {
+        this.opts.send({
+          channel: "collab",
+          type: "identity",
+          path: room.path,
+          documentId: room.documentId || void 0,
+          name
+        });
+      }
+    }
+  }
+  participants(path) {
+    const room = path && this.rooms.get(path);
+    return room ? [...room.peers.values()].map(({ id: id2, name, color }) => ({ id: id2, name, color })) : [];
+  }
+  jumpToParticipant(path, id2) {
+    const room = this.rooms.get(path);
+    const peer = room?.peers.get(id2);
+    if (!peer || !room?.text)
+      return false;
+    const choices = resolveSelections(room.text, peer);
+    const main = peer.mainIndex ?? 0;
+    const head = choices[main]?.head;
+    if (head === void 0)
+      return false;
+    const view = [...room.views].find((item) => item.dom?.isConnected);
+    if (!view)
+      return false;
+    const at = Math.max(0, Math.min(view.state.doc.length, head));
+    view.dispatch({ effects: import_view2.EditorView.scrollIntoView(at, { y: "center" }) });
+    return true;
   }
   receivePeople(room, people, selfId) {
     room.selfId = selfId;
@@ -11146,6 +11284,15 @@ var NativeYjs = class {
   }
 };
 
+// src/display-name.ts
+var DISPLAY_NAME_LIMIT = 40;
+function normalizeDisplayName(input) {
+  return input.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, DISPLAY_NAME_LIMIT);
+}
+function effectiveDisplayName(name, deviceId) {
+  return normalizeDisplayName(name) || "Obsidian " + (deviceId ? deviceId.slice(0, 6) : "Native");
+}
+
 // src/pending.ts
 function sameIdentity(file, operation) {
   return file.fileId === operation.fileId && file.generationId === operation.generationId;
@@ -11364,6 +11511,7 @@ function sessionError(status, body, expectedVaultId) {
 
 // src/main.ts
 var DEFAULT = {
+  displayName: "",
   serverUrl: "",
   authMode: "device",
   discoveryUrl: "",
@@ -11436,7 +11584,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   syncing = false;
   queued = false;
   quiet = /* @__PURE__ */ new Set();
-  status;
+  status = null;
   timer = null;
   lastError = "";
   live;
@@ -11459,6 +11607,9 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings = {
       ...DEFAULT,
       ...saved,
+      displayName: normalizeDisplayName(
+        typeof saved?.displayName === "string" ? saved.displayName : ""
+      ),
       baselines: saved?.baselines || {},
       pending: saved?.pending || [],
       pendingWrites: saved?.pendingWrites || [],
@@ -11482,7 +11633,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         this.settings.yjsIds[path] = id2;
         await this.persistSettings();
       },
-      displayName: () => "Obsidian " + (this.settings.deviceId ? this.settings.deviceId.slice(0, 6) : "Native"),
+      displayName: () => this.getDisplayName(),
+      mobile: import_obsidian.Platform.isMobile,
       send: (message) => {
         if (this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify(message));
@@ -11494,9 +11646,21 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       }
     });
     this.registerEditorExtension(this.live.extension());
-    this.status = this.addStatusBarItem();
+    if (!import_obsidian.Platform.isMobile)
+      this.status = this.addStatusBarItem();
     this.showStatus("Not connected");
     this.addSettingTab(new ConnectorSettings(this.app, this));
+    this.addRibbonIcon("users", "Ignis collaborators and display name", () => this.openCollaborators());
+    this.addCommand({
+      id: "show-collaborators",
+      name: "Show collaborators and display name",
+      callback: () => this.openCollaborators()
+    });
+    this.addCommand({
+      id: "change-display-name",
+      name: "Change my Ignis display name",
+      callback: () => this.openDisplayName()
+    });
     this.registerObsidianProtocolHandler("ignis-connector", (params2) => {
       if (typeof params2.link !== "string")
         return;
@@ -11575,6 +11739,36 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     const link = this.incomingLink;
     this.incomingLink = "";
     return link;
+  }
+  getDisplayName() {
+    return effectiveDisplayName(
+      this.settings.displayName || "",
+      this.settings.deviceId
+    );
+  }
+  async setDisplayName(value) {
+    const next = normalizeDisplayName(value);
+    if (this.settings.displayName === next)
+      return;
+    this.settings.displayName = next;
+    await this.persistSettings();
+    this.live.updateDisplayName();
+  }
+  openDisplayName() {
+    new DisplayNameModal(this.app, this).open();
+  }
+  openCollaborators() {
+    new CollaboratorsModal(this.app, this).open();
+  }
+  currentParticipants() {
+    const path = this.app.workspace.getActiveFile()?.path || null;
+    return {
+      path,
+      peers: this.live.participants(path)
+    };
+  }
+  jumpToParticipant(path, id2) {
+    return this.live.jumpToParticipant(path, id2);
   }
   onunload() {
     this.stopped = true;
@@ -12225,6 +12419,74 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     }
   }
 };
+var DisplayNameModal = class extends import_obsidian.Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Your Ignis display name" });
+    contentEl.createEl("p", {
+      text: "This name is shown beside your live cursor on other devices. It does not change your Tailscale identity or device permissions."
+    });
+    let value = this.plugin.settings.displayName || "";
+    let input;
+    new import_obsidian.Setting(contentEl).setName("Display name").addText((text2) => {
+      text2.setValue(value).setPlaceholder(this.plugin.getDisplayName()).onChange((next) => {
+        value = next;
+      });
+      input = text2.inputEl;
+      input.maxLength = DISPLAY_NAME_LIMIT;
+      input.setAttribute("aria-label", "Your Ignis display name");
+    });
+    const save = async () => {
+      try {
+        await this.plugin.setDisplayName(value);
+        new import_obsidian.Notice("Ignis name: " + this.plugin.getDisplayName());
+        this.close();
+      } catch {
+        new import_obsidian.Notice("Could not save the display name. Try again.");
+      }
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        void save();
+      }
+    });
+    new import_obsidian.Setting(contentEl).addButton((b) => b.setButtonText("Save name").setCta().onClick(() => void save())).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+};
+var CollaboratorsModal = class extends import_obsidian.Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Ignis collaborators" });
+    new import_obsidian.Setting(contentEl).setName("Your display name").setDesc(this.plugin.getDisplayName()).addButton((b) => b.setButtonText("Change name").onClick(() => {
+      this.close();
+      this.plugin.openDisplayName();
+    }));
+    const { path, peers } = this.plugin.currentParticipants();
+    contentEl.createEl("p", { text: path || "Open a Markdown note to see collaborators." });
+    if (!peers.length) {
+      contentEl.createEl("p", { text: "No other editors are connected to this note." });
+    }
+    for (const peer of peers) {
+      new import_obsidian.Setting(contentEl).setName(peer.name).addButton((b) => b.setButtonText("Go to cursor").onClick(() => {
+        if (path && this.plugin.jumpToParticipant(path, peer.id))
+          this.close();
+        else
+          new import_obsidian.Notice("This collaborator has no visible cursor yet.");
+      }));
+    }
+  }
+};
 var SyncIssuesModal = class extends import_obsidian.Modal {
   constructor(app, issues, lastError) {
     super(app);
@@ -12266,6 +12528,7 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    new import_obsidian.Setting(containerEl).setName("Your display name").setDesc(this.plugin.getDisplayName() + " \xB7 Visible beside your cursor on other devices").addButton((b) => b.setButtonText("Change name").onClick(() => this.plugin.openDisplayName()));
     containerEl.createEl("h3", { text: "Connect to Ignis" });
     containerEl.createEl("p", {
       text: "Paste one connection link. If Tailscale is connected, no token or Vault ID entry is needed."

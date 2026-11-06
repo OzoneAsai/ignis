@@ -240,4 +240,54 @@ describe("Ignis native presence uses the existing server relative cursor protoco
       vi.restoreAllMocks();
     }
   });
+  it("moves the iOS roster into the visual viewport above mobile controls and keyboard", () => {
+    const original = window.visualViewport;
+    const listeners = new Map();
+    const visual = {
+      offsetTop: 20, height: 540,
+      addEventListener(type, cb) { listeners.set(type, cb); },
+      removeEventListener(type) { listeners.delete(type); }
+    };
+    Object.defineProperty(window, "visualViewport", {
+      configurable: true, value: visual
+    });
+    const parent = document.createElement("div");
+    const scroller = document.createElement("div");
+    document.body.append(parent);
+    parent.append(scroller);
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    text.insert(0, "Hello world");
+    const view = {
+      dom: parent, scrollDOM: scroller,
+      contentDOM: document.createElement("div"),
+      state: { doc: {length: text.length} }
+    };
+    try {
+      const overlay = new CursorOverlay(view, true);
+      overlay.set(text, [{id:"a", name:"Alice",color:"#59baf2",
+        ...encodeSelection(text, 3, 3)}]);
+      const roster = document.body.querySelector(".ignis-native-people-roster");
+      expect(roster).not.toBeNull();
+      expect(parent.contains(roster)).toBe(false);
+      expect(roster.style.position).toBe("fixed");
+      expect(roster.hidden).toBe(false);
+      expect(roster.querySelector("summary").style.minHeight).toBe("44px");
+      const oldTop = parseFloat(roster.style.top);
+      visual.height = 290; // iOS software keyboard occupies lower viewport
+      listeners.get("resize")();
+      expect(parseFloat(roster.style.top)).toBeLessThan(oldTop);
+      expect(roster.querySelector(".ignis-native-people-jump").style.minHeight)
+        .toBe("44px");
+      overlay.destroy();
+      expect(document.body.contains(roster)).toBe(false);
+      expect(listeners.size).toBe(0);
+    } finally {
+      Object.defineProperty(window, "visualViewport", {
+        configurable: true, value: original
+      });
+      parent.remove();
+      doc.destroy();
+    }
+  });
 });

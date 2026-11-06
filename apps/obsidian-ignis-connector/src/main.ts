@@ -1,7 +1,11 @@
 import {
-  Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, editorInfoField, requestUrl
+  Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, TFile,
+  editorInfoField, requestUrl
 } from "obsidian";
 import { NativeYjs } from "./live";
+import {
+  effectiveDisplayName, normalizeDisplayName, DISPLAY_NAME_LIMIT
+} from "./display-name";
 import {
   queueRename, queueDelete, acknowledgePending, localPaths,
   type TrackedFile, type PendingMutation
@@ -21,6 +25,7 @@ type Base = TrackedFile;
 type Pending = PendingMutation;
 type SyncIssue = { path: string; reason: string };
 type Settings = {
+  displayName: string;
   serverUrl: string;
   authMode: "device" | "tailnet";
   discoveryUrl: string;
@@ -60,6 +65,7 @@ type OperationResult = {
 };
 
 const DEFAULT: Settings = {
+  displayName: "",
   serverUrl: "", authMode: "device", discoveryUrl: "", serverDeviceId: "", vaultId: "", deviceId: "",
   cursor: 0, baselines: {}, pending: [], pendingWrites: [],
   applyRemoteDeletes: false, syncIssues: [], yjsIds: {},
@@ -127,7 +133,7 @@ export default class IgnisConnector extends Plugin {
   private syncing = false;
   private queued = false;
   private quiet = new Set<string>();
-  private status!: HTMLElement;
+  private status: HTMLElement | null = null;
   private timer: number | null = null;
   private lastError = "";
   private live!: NativeYjs;
@@ -154,6 +160,9 @@ export default class IgnisConnector extends Plugin {
     const saved = (await this.loadData()) as Partial<Settings> | null;
     this.settings = {
       ...DEFAULT, ...saved,
+      displayName: normalizeDisplayName(
+        typeof saved?.displayName === "string" ? saved.displayName : ""
+      ),
       baselines: saved?.baselines || {},
       pending: saved?.pending || [],
       pendingWrites: saved?.pendingWrites || [],
@@ -176,8 +185,8 @@ export default class IgnisConnector extends Plugin {
         this.settings.yjsIds[path] = id;
         await this.persistSettings();
       },
-      displayName: () => "Obsidian " +
-        (this.settings.deviceId ? this.settings.deviceId.slice(0, 6) : "Native"),
+      displayName: () => this.getDisplayName(),
+      mobile: Platform.isMobile,
       send: (message) => {
         if (this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify(message));
@@ -189,9 +198,25 @@ export default class IgnisConnector extends Plugin {
       }
     });
     this.registerEditorExtension(this.live.extension());
-    this.status = this.addStatusBarItem();
+    // Obsidian mobile does not support the desktop status bar API.
+    if (!Platform.isMobile) this.status = this.addStatusBarItem();
     this.showStatus("Not connected");
     this.addSettingTab(new ConnectorSettings(this.app, this));
+    // Mobile ribbon entries appear in Obsidian's bottom navigation menu.
+    // These commands are also accessible from the command palette when the
+    // keyboard is open or a floating participants control is obstructed.
+    this.addRibbonIcon("users", "Ignis collaborators and display name", () =>
+      this.openCollaborators());
+    this.addCommand({
+      id: "show-collaborators",
+      name: "Show collaborators and display name",
+      callback: () => this.openCollaborators()
+    });
+    this.addCommand({
+      id: "change-display-name",
+      name: "Change my Ignis display name",
+      callback: () => this.openDisplayName()
+    });
     this.registerObsidianProtocolHandler("ignis-connector", (params) => {
       if (typeof params.link !== "string") return;
       try {
@@ -268,6 +293,42 @@ export default class IgnisConnector extends Plugin {
     const link = this.incomingLink;
     this.incomingLink = "";
     return link;
+  }
+
+  getDisplayName(): string {
+    return effectiveDisplayName(
+      this.settings.displayName || "", this.settings.deviceId
+    );
+  }
+
+  async setDisplayName(value: string) {
+    const next = normalizeDisplayName(value);
+    if (this.settings.displayName === next) return;
+    this.settings.displayName = next;
+    await this.persistSettings();
+    // Existing live peers should see this change immediately, without
+    // disconnecting the socket or destroying unsaved editor CRDT state.
+    this.live.updateDisplayName();
+  }
+
+  openDisplayName() {
+    new DisplayNameModal(this.app, this).open();
+  }
+
+  openCollaborators() {
+    new CollaboratorsModal(this.app, this).open();
+  }
+
+  currentParticipants() {
+    const path = this.app.workspace.getActiveFile()?.path || null;
+    return {
+      path,
+      peers: this.live.participants(path)
+    };
+  }
+
+  jumpToParticipant(path: string, id: string) {
+    return this.live.jumpToParticipant(path, id);
   }
 
   onunload() {
@@ -925,6 +986,81 @@ export default class IgnisConnector extends Plugin {
   }
 }
 
+export class DisplayNameModal extends Modal {
+  constructor(app: IgnisConnector["app"], private readonly plugin: IgnisConnector) {
+    super(app);
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Your Ignis display name" });
+    contentEl.createEl("p", {
+      text: "This name is shown beside your live cursor on other devices. It does not change your Tailscale identity or device permissions."
+    });
+    let value = this.plugin.settings.displayName || "";
+    let input: HTMLInputElement;
+    new Setting(contentEl).setName("Display name")
+      .addText((text) => {
+        text.setValue(value)
+          .setPlaceholder(this.plugin.getDisplayName())
+          .onChange((next) => { value = next; });
+        input = text.inputEl;
+        input.maxLength = DISPLAY_NAME_LIMIT;
+        input.setAttribute("aria-label", "Your Ignis display name");
+      });
+    const save = async () => {
+      try {
+        await this.plugin.setDisplayName(value);
+        new Notice("Ignis name: " + this.plugin.getDisplayName());
+        this.close();
+      } catch {
+        new Notice("Could not save the display name. Try again.");
+      }
+    };
+    input!.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        void save();
+      }
+    });
+    new Setting(contentEl)
+      .addButton((b) => b.setButtonText("Save name").setCta()
+        .onClick(() => void save()))
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+}
+
+export class CollaboratorsModal extends Modal {
+  constructor(app: IgnisConnector["app"], private readonly plugin: IgnisConnector) {
+    super(app);
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Ignis collaborators" });
+    new Setting(contentEl).setName("Your display name")
+      .setDesc(this.plugin.getDisplayName())
+      .addButton((b) => b.setButtonText("Change name")
+        .onClick(() => {
+          this.close();
+          this.plugin.openDisplayName();
+        }));
+    const { path, peers } = this.plugin.currentParticipants();
+    contentEl.createEl("p", { text: path || "Open a Markdown note to see collaborators." });
+    if (!peers.length) {
+      contentEl.createEl("p", { text: "No other editors are connected to this note." });
+    }
+    for (const peer of peers) {
+      new Setting(contentEl).setName(peer.name)
+        .addButton((b) => b.setButtonText("Go to cursor")
+          .onClick(() => {
+            if (path && this.plugin.jumpToParticipant(path, peer.id)) this.close();
+            else new Notice("This collaborator has no visible cursor yet.");
+          }));
+    }
+  }
+}
+
 class SyncIssuesModal extends Modal {
   constructor(app: IgnisConnector["app"], private readonly issues: SyncIssue[],
     private readonly lastError: string) {
@@ -967,6 +1103,13 @@ export class ConnectorSettings extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    // Make identity editing discoverable without scrolling into Advanced.
+    // The same editor is reachable through the mobile ribbon and commands.
+    new Setting(containerEl).setName("Your display name")
+      .setDesc(this.plugin.getDisplayName() +
+        " · Visible beside your cursor on other devices")
+      .addButton((b) => b.setButtonText("Change name")
+        .onClick(() => this.plugin.openDisplayName()));
     containerEl.createEl("h3", { text: "Connect to Ignis" });
     containerEl.createEl("p", {
       text: "Paste one connection link. If Tailscale is connected, no token or Vault ID entry is needed."

@@ -5,8 +5,9 @@ import { EditorView, ViewPlugin, keymap, type ViewUpdate } from "@codemirror/vie
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import {
   CursorOverlay, encodeSelections, sanitizePeers, sanitizeCursorMessage,
-  type Peer, type CursorSelection
+  resolveSelections, type Peer, type CursorSelection
 } from "./presence";
+import { remoteSelectionExtension } from "./selection-decorations";
 
 // Native Obsidian, mobile included, uses the same Yjs wire protocol as Ignis
 // Bridge. We only install the CM6 binding after checking native file content,
@@ -110,6 +111,7 @@ export class NativeYjs {
     knownId: (path: string) => string | null;
     rememberId: (path: string, id: string) => Promise<void>;
     displayName?: () => string;
+    mobile?: boolean;
     send: (message: WireMessage) => void;
     notify: (path: string, status: string) => void;
   }) {}
@@ -118,6 +120,7 @@ export class NativeYjs {
     const manager = this;
     return [
       this.compartment.of([]),
+      remoteSelectionExtension,
       ViewPlugin.fromClass(class {
         constructor(readonly view: EditorView) {
           manager.observe(view);
@@ -400,11 +403,44 @@ export class NativeYjs {
           !("nodeType" in view.dom) || view.dom.nodeType !== 1) continue;
       let overlay = this.overlays.get(view);
       if (!overlay) {
-        overlay = new CursorOverlay(view);
+        overlay = new CursorOverlay(view, this.opts.mobile === true);
         this.overlays.set(view, overlay);
       }
       overlay.set(room.text, [...room.peers.values()]);
     }
+  }
+
+  updateDisplayName() {
+    const name = this.opts.displayName?.() || "Native Obsidian";
+    for (const room of this.rooms.values()) {
+      if (room.joined && !room.blocked && this.online) {
+        this.opts.send({
+          channel: "collab", type: "identity", path: room.path,
+          documentId: room.documentId || undefined, name
+        });
+      }
+    }
+  }
+
+  participants(path: string | null): Array<Pick<Peer, "id" | "name" | "color">> {
+    const room = path && this.rooms.get(path);
+    return room ? [...room.peers.values()].map(({ id, name, color }) =>
+      ({ id, name, color })) : [];
+  }
+
+  jumpToParticipant(path: string, id: string): boolean {
+    const room = this.rooms.get(path);
+    const peer = room?.peers.get(id);
+    if (!peer || !room?.text) return false;
+    const choices = resolveSelections(room.text, peer);
+    const main = peer.mainIndex ?? 0;
+    const head = choices[main]?.head;
+    if (head === undefined) return false;
+    const view = [...room.views].find(item => item.dom?.isConnected);
+    if (!view) return false;
+    const at = Math.max(0, Math.min(view.state.doc.length, head));
+    view.dispatch({ effects: EditorView.scrollIntoView(at, { y: "center" }) });
+    return true;
   }
 
   private receivePeople(room: Room, people: unknown, selfId: string | null) {
