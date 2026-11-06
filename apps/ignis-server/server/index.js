@@ -249,7 +249,10 @@ app.get("/favicon.png", (req, res) => {
   res.sendFile(path.join(REPO_ROOT, "images", "favicon.png"));
 });
 
-// Cache headers for static assets, by version query.
+app.get("/manifest.webmanifest", (req, res) => {
+  res.sendFile(path.join(__dirname, "assets", "manifest.webmanifest"));
+});
+
 // Set before express.static, which only fills Cache-Control when it is not already present.
 app.use((req, res, next) => {
   const cacheControl = cacheControlFor(req.path, !!req.query.v);

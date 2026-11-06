@@ -12,15 +12,21 @@ version that supports **GitHub Release assets** (v1.1.0 or later). In BRAT:
 2. Enter the repository **`OzoneAsai/ignis`**.
 3. Select the available Ignis Connector prerelease and enable
    **Ignis Connector** in Obsidian's Community plugins settings.
-4. Open Ignis Connector settings. Enter the full **HTTPS server address** (including
-   its port), the exact **Vault ID**, and an enrolled **ignis_dev_ device token**.
-5. Tap **Connect and verify**. Nothing is sent while you type; rejected credentials
-   stay in the masked input so you can correct the Vault ID or server address.
+4. On iOS, first connect **Tailscale** to the same tailnet as your Ignis server.
+   Open Ignis Connector settings and enter the full **HTTPS server address**
+   (including the port) and the exact **Vault ID**. An enrolled **ignis_dev_ device
+   token** is required for token-based servers. A server specifically configured
+   with Tailnet identity authorization can instead authorize the authenticated
+   Tailscale user; simply using Tailscale does not enable this server feature.
+5. Tap **Connect and verify**. Nothing is sent while you type; if verification
+   fails, check the Vault ID, server address and server-side authorization.
 6. After verification succeeds, tap **Sync** or let the Connector synchronize.
 
-The URL, Vault ID, and token are checked **together**. A 404 from the Sync API
-is reported separately from an unauthorized device. Tailscale protects the
-network route but does not substitute for per-Vault authorization in this beta.
+For token-based servers, the URL, Vault ID, and token are checked **together**.
+A 404 from the Sync API is reported separately from an unauthorized device.
+Tailscale protects network reachability; per-Vault authorization must still be
+configured on the server. If Sync is not enabled on Ignis, install succeeds but
+connection verification will fail.
 
 The matching `main.js` and `manifest.json` are served from
 [GitHub Releases](https://github.com/OzoneAsai/ignis/releases), so BRAT does
@@ -66,10 +72,12 @@ pointing multiple Vault sync plugins at the same files. Start with a
 disposable Vault or a verified backup.
 
 Native Yjs editing and collaborator cursors have been tested on macOS.
+The integrated main-based beta passed real Chrome HTTPS/WSS tests through
+Tailscale Serve, as well as tokenless Tailnet Connector authentication tests.
 Large attachments, device enrollment UX, stable large-Vault indexing and
-iOS hardware lifecycle are not yet production-certified. The transport
-tests currently use localhost HTTP/WS; external HTTPS/WSS deployment
-requires its own testing and whole-origin access control.
+iOS hardware lifecycle are not yet production-certified. Test with a copied
+or disposable iOS Vault first; installing the plugin alone does not configure
+or enroll a device on the server.
 
 For the protocol and data-safety design, see
 [VAULT_SYNC.md](VAULT_SYNC.md) and

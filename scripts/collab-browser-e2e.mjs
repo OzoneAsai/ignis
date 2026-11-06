@@ -161,6 +161,41 @@ try {
   const status = (tab) => cdp.evaluate(tab,
     "document.querySelector('.ignis-collaboration-status')?.textContent || ''");
 
+  async function checkBadgeGeometry(tab) {
+    return cdp.evaluate(tab, `(() => {
+      const cm = window.app.workspace.activeLeaf.view.editor.cm;
+      const labels = [...document.querySelectorAll('.ignis-collab-remote-label')]
+        .filter(label => {
+          const style = getComputedStyle(label);
+          return style.display !== 'none' && style.visibility === 'visible' &&
+            getComputedStyle(label.parentElement).display !== 'none';
+        });
+      const glyphs = [];
+      const range = document.createRange();
+      const walker = document.createTreeWalker(cm.contentDOM, NodeFilter.SHOW_TEXT);
+      let textNode;
+      while ((textNode = walker.nextNode())) {
+        range.selectNodeContents(textNode);
+        glyphs.push(...range.getClientRects());
+      }
+      const intersects = (a, b) => a.left < b.right && a.right > b.left &&
+        a.top < b.bottom && a.bottom > b.top;
+      const badgeRects = labels.map(label => label.getBoundingClientRect());
+      const viewport = cm.scrollDOM.getBoundingClientRect();
+      return {
+        visible: labels.length,
+        textOverlaps: badgeRects.flatMap((a, index) =>
+          glyphs.filter(b => b.width && b.height && intersects(a, b))
+            .map(() => index)).length,
+        badgeOverlaps: badgeRects.flatMap((a, index) =>
+          badgeRects.slice(index + 1).filter(b => intersects(a, b))).length,
+        clipped: badgeRects.filter(rect => rect.left < viewport.left - 1 ||
+          rect.right > viewport.right + 1 || rect.top < viewport.top - 1 ||
+          rect.bottom > viewport.bottom + 1).length
+      };
+    })()`);
+  }
+
   await poll(async () => (await status(a)).includes("online") &&
     (await status(b)).includes("online"), 15000);
   console.log("Both Markdown editors joined:", await status(a), await status(b));
@@ -197,6 +232,62 @@ try {
   })()`), 18000);
 
   console.log("PASS: distinct remote identity, caret, and text selection:", JSON.stringify(awareness));
+
+  // The blank line allows a real badge to appear without hiding glyphs.
+  // Inspect Chrome's actual Range rectangles rather than trusting CSS offsets
+  // or simulated unit-test coordinates. Repeat at 150% zoom.
+  await cdp.evaluate(a, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.setCursor({ line: 1, ch: 0 });
+    editor.cm.dom.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowDown', bubbles: true }));
+    return true;
+  })()`);
+  const badges = await poll(async () => {
+    const result = await checkBadgeGeometry(b);
+    return result.visible ? result : null;
+  }, 12000);
+  if (badges.textOverlaps || badges.badgeOverlaps || badges.clipped) {
+    throw new Error("Badge covers text or leaves viewport: " + JSON.stringify(badges));
+  }
+  await cdp.evaluate(b, "document.documentElement.style.zoom = '150%'; true");
+  const zoomed = await poll(async () => {
+    const result = await checkBadgeGeometry(b);
+    return result.visible && !result.textOverlaps &&
+      !result.badgeOverlaps && !result.clipped ? result : null;
+  }, 12000);
+  await cdp.evaluate(b, "document.documentElement.style.zoom = ''; true");
+  console.log("PASS: measured labels avoid text at 100% and 150% zoom:",
+    JSON.stringify({ badges, zoomed }));
+
+  // Zooming the document and transforming an editor are different coordinate
+  // systems. Regress both: overlay CSS pixels must match the actual glyph
+  // geometry after a transformed editor is remeasured.
+  for (const transform of ["scale(0.75)", "scale(1.25)"]) {
+    await cdp.evaluate(b, `(async () => {
+      const cm = window.app.workspace.activeLeaf.view.editor.cm;
+      cm.dom.style.transformOrigin = 'top left';
+      cm.dom.style.transform = ${JSON.stringify(transform)};
+      cm.scrollDOM.dispatchEvent(new Event('scroll'));
+      await new Promise(resolve => requestAnimationFrame(() =>
+        requestAnimationFrame(resolve)));
+      return true;
+    })()`);
+    const measured = await checkBadgeGeometry(b);
+    if (!measured.visible || measured.textOverlaps ||
+        measured.badgeOverlaps || measured.clipped) {
+      throw new Error("Transformed editor collision: " +
+        JSON.stringify({ transform, measured }));
+    }
+    await cdp.evaluate(b, `(async () => {
+      const cm = window.app.workspace.activeLeaf.view.editor.cm;
+      cm.dom.style.transform = '';
+      cm.dom.style.transformOrigin = '';
+      cm.scrollDOM.dispatchEvent(new Event('scroll'));
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      return true;
+    })()`);
+  }
+  console.log("PASS: CSS transformed editor coordinates avoid text at 75% and 125%");
 
   // A third online collaborator publishes three independent Yjs-relative
   // selections. WebUI must draw all three, keep the other editor in its

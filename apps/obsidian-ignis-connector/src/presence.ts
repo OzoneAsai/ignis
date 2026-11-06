@@ -1,5 +1,12 @@
 import * as Y from "yjs";
 import type { EditorView } from "@codemirror/view";
+import {
+  createOverlaySpace, cursorLabelTextColor, layoutCursorLabels,
+  visibleContentObstacles
+} from
+  "../../../packages/bridge/src/cursor-label-layout.js";
+import type { LabelItem, LabelPlacement, LabelRect } from
+  "../../../packages/bridge/src/cursor-label-layout.js";
 
 // Ignis's /ws collab channel already carries ephemeral presence and Yjs
 // relative positions. Native Obsidian uses that same protocol; Yjs Awareness
@@ -155,11 +162,13 @@ export class CursorOverlay {
   private readonly nodes = new Map<string, {
     caret: HTMLDivElement; label: HTMLSpanElement; marks: HTMLSpanElement[];
   }>();
+  private readonly lastBadgePositions = new Map<string, LabelPlacement>();
   private peers: Peer[] = [];
   private text: Y.Text | null = null;
   private raf = 0;
   private readonly originalPosition: string;
   private readonly scroll = () => this.schedule();
+  private readonly contentMutation: MutationObserver | null;
 
   constructor(private readonly view: EditorView) {
     this.root = document.createElement("div");
@@ -195,6 +204,13 @@ export class CursorOverlay {
     view.dom.appendChild(this.roster);
     view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
     window.addEventListener("resize", this.scroll);
+    this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM
+      ? new MutationObserver(this.scroll) : null;
+    this.contentMutation?.observe(view.contentDOM, {
+      subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ["style", "class"]
+    });
+    document.fonts?.addEventListener?.("loadingdone", this.scroll);
   }
 
   set(text: Y.Text | null, peers: Peer[]) {
@@ -253,6 +269,7 @@ export class CursorOverlay {
     record.caret.remove();
     for (const mark of record.marks) mark.remove();
     this.nodes.delete(id);
+    this.lastBadgePositions.delete(id);
   }
 
   private clear() {
@@ -270,8 +287,22 @@ export class CursorOverlay {
   private paint() {
     this.raf = 0;
     if (!this.text) return;
-    const bounds = this.view.dom.getBoundingClientRect();
+    const space = createOverlaySpace(this.view.dom);
+    if (!space) {
+      for (const item of this.nodes.values()) item.caret.style.display = "none";
+      return;
+    }
+    const bounds = space.bounds;
+    const scrollBounds = space.toLocal(this.view.scrollDOM.getBoundingClientRect());
+    const viewBounds: LabelRect = {
+      left: Math.max(0, scrollBounds.left),
+      top: Math.max(0, scrollBounds.top),
+      right: Math.min(bounds.right, scrollBounds.right),
+      bottom: Math.min(bounds.bottom, scrollBounds.bottom)
+    };
     const visible = new Set<string>();
+    const badgeItems: (LabelItem & { label: HTMLSpanElement })[] = [];
+    const caretBlockers: LabelRect[] = [];
     // A single bounded highlight budget protects iOS when many participants
     // select long documents. All cursors and roster entries still render.
     let remainingMarks = 480;
@@ -298,8 +329,8 @@ export class CursorOverlay {
         const label = document.createElement("span");
         label.className = "ignis-native-remote-label";
         Object.assign(label.style, {
-          position: "absolute", left: "0", bottom: "100%",
-          color: "#fff", backgroundColor: peer.color,
+          position: "absolute", left: "0", top: "0",
+          color: cursorLabelTextColor(peer.color), backgroundColor: peer.color,
           fontSize: "11px", fontWeight: "600", borderRadius: "3px",
           padding: "2px 5px", whiteSpace: "nowrap", maxWidth: "180px",
           overflow: "hidden", textOverflow: "ellipsis"
@@ -311,18 +342,29 @@ export class CursorOverlay {
       }
       record.label.textContent = peer.name;
       record.label.style.display = index === mainIndex ? "" : "none";
+      record.label.style.visibility = "hidden";
+      record.label.style.color = cursorLabelTextColor(peer.color);
       record.label.style.backgroundColor = peer.color;
       record.caret.style.backgroundColor = peer.color;
       const at = Math.min(this.view.state.doc.length, selection.head);
       const coords = this.view.coordsAtPos(at);
-      const onScreen = !!coords && coords.bottom >= bounds.top &&
-        coords.top <= bounds.bottom && coords.right >= bounds.left &&
-        coords.left <= bounds.right;
+      const local = coords ? space.toLocal(coords) : null;
+      const onScreen = !!local && local.bottom >= viewBounds.top &&
+        local.top <= viewBounds.bottom && local.right >= viewBounds.left &&
+        local.left <= viewBounds.right;
       record.caret.style.display = onScreen ? "" : "none";
-      if (coords && onScreen) {
-        record.caret.style.left = (coords.left - bounds.left) + "px";
-        record.caret.style.top = (coords.top - bounds.top) + "px";
-        record.caret.style.height = Math.max(1, coords.bottom - coords.top) + "px";
+      if (local && onScreen) {
+        const { left, top, bottom } = local;
+        record.caret.style.left = left + "px";
+        record.caret.style.top = top + "px";
+        record.caret.style.height = Math.max(1, bottom - top) + "px";
+        caretBlockers.push({ left: left - 1, top, right: left + 3, bottom });
+        if (index === mainIndex && peer.name) {
+          const measured = record.label.getBoundingClientRect();
+          badgeItems.push({ key, caret: { left, top, bottom },
+            width: measured.width / space.scaleX,
+            height: measured.height / space.scaleY, label: record.label });
+        }
       }
       const from = Math.max(0, Math.min(selection.anchor, selection.head));
       const to = Math.min(this.view.state.doc.length,
@@ -340,11 +382,13 @@ export class CursorOverlay {
         const a = this.view.coordsAtPos(position);
         const b = this.view.coordsAtPos(stop);
         if (a && b) {
+          const first = space.toLocal(a);
+          const last = space.toLocal(b);
           marks.push({
-            left: a.left - bounds.left,
-            top: a.top - bounds.top,
-            width: Math.max(2, b.left - a.left),
-            height: Math.max(1, b.bottom - a.top)
+            left: first.left,
+            top: first.top,
+            width: Math.max(2, last.left - first.left),
+            height: Math.max(1, last.bottom - first.top)
           });
         }
         position = Math.max(position + 1, stop + 1);
@@ -372,6 +416,22 @@ export class CursorOverlay {
     for (const id of [...this.nodes.keys()]) {
       if (!visible.has(id)) this.discard(id);
     }
+    const textRects = visibleContentObstacles(this.view.contentDOM, space, viewBounds);
+    const obstacles: LabelRect[] = textRects ? [...textRects, ...caretBlockers] : [];
+    if (!this.roster.hidden) {
+      obstacles.push(space.toLocal(this.roster.getBoundingClientRect()));
+    }
+    const placements = textRects
+      ? layoutCursorLabels(badgeItems, obstacles, viewBounds, this.lastBadgePositions)
+      : new Map<string, LabelPlacement>();
+    for (const item of badgeItems) {
+      const placement = placements.get(item.key);
+      if (!placement) continue;
+      item.label.style.left = (placement.left - item.caret.left) + "px";
+      item.label.style.top = (placement.top - item.caret.top) + "px";
+      item.label.style.visibility = "visible";
+      this.lastBadgePositions.set(item.key, placement);
+    }
     this.rosterTitle.textContent = this.peers.length + " other editor" +
       (this.peers.length === 1 ? "" : "s") +
       (highlightsLimited ? " · highlights limited" : " · show locations");
@@ -381,6 +441,8 @@ export class CursorOverlay {
     this.clear();
     this.view.scrollDOM.removeEventListener("scroll", this.scroll);
     window.removeEventListener("resize", this.scroll);
+    this.contentMutation?.disconnect();
+    document.fonts?.removeEventListener?.("loadingdone", this.scroll);
     this.root.remove();
     this.roster.remove();
     this.view.dom.style.position = this.originalPosition;

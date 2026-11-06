@@ -80,6 +80,9 @@ describe("Ignis native presence uses the existing server relative cursor protoco
     vi.spyOn(parent, "getBoundingClientRect").mockImplementation(() => ({
       left: 0, top: 0, right: 500, bottom: 250, width: 500, height: 250
     }));
+    vi.spyOn(scroller, "getBoundingClientRect").mockImplementation(() => ({
+      left: 0, top: 0, right: 500, bottom: 250, width: 500, height: 250
+    }));
     const view = {
       dom: parent, scrollDOM: scroller,
       coordsAtPos: () => ({ left: 36, right: 38, top: 24, bottom: 41 }),
@@ -167,6 +170,73 @@ describe("Ignis native presence uses the existing server relative cursor protoco
       globalThis.cancelAnimationFrame = originalCancel;
       parent.remove();
       d.destroy();
+      vi.restoreAllMocks();
+    }
+  });
+  it("places native name labels without covering rendered text or other labels", async () => {
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    text.insert(0, "日本語 aaa");
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const scroller = document.createElement("div");
+    const content = document.createElement("div");
+    content.textContent = "日本語 aaa";
+    scroller.append(content);
+    parent.append(scroller);
+    const area = (left, top, right, bottom) => ({
+      left, top, right, bottom, width: right - left, height: bottom - top
+    });
+    vi.spyOn(parent, "getBoundingClientRect").mockReturnValue(area(0, 0, 420, 260));
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue(area(0, 0, 420, 260));
+    const oldRangeRects = Range.prototype.getClientRects;
+    const oldElementRect = HTMLElement.prototype.getBoundingClientRect;
+    Range.prototype.getClientRects = () => [area(0, 76, 126, 98)];
+    HTMLElement.prototype.getBoundingClientRect = function() {
+      return this.classList.contains("ignis-native-remote-label")
+        ? area(0, 0, 60, 18) : oldElementRect.call(this);
+    };
+    const view = {
+      dom: parent, scrollDOM: scroller, contentDOM: content,
+      coordsAtPos: () => area(140, 100, 142, 120),
+      state: { doc: { length: text.length, lineAt: () => ({ to: text.length }) } },
+      viewport: { from: 0, to: text.length }
+    };
+    const oldRaf = globalThis.requestAnimationFrame;
+    const oldCancel = globalThis.cancelAnimationFrame;
+    globalThis.requestAnimationFrame = cb => setTimeout(cb, 1);
+    globalThis.cancelAnimationFrame = clearTimeout;
+    try {
+      const overlay = new CursorOverlay(view);
+      const shared = encodeSelection(text, 3, 3);
+      overlay.set(text, [
+        { id: "one", name: "Guest One", color: "#ee6b72", ...shared },
+        { id: "two", name: "Guest Two", color: "#59baf2", ...shared }
+      ]);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      const labels = [...parent.querySelectorAll(".ignis-native-remote-label")]
+        .filter(element => element.style.visibility === "visible");
+      expect(labels).toHaveLength(2);
+      const rectangles = labels.map(label => {
+        const caret = label.parentElement;
+        const left = parseFloat(caret.style.left) + parseFloat(label.style.left);
+        const top = parseFloat(caret.style.top) + parseFloat(label.style.top);
+        return area(left, top, left + 60, top + 18);
+      });
+      const intersects = (a, b) => a.left < b.right && a.right > b.left &&
+        a.top < b.bottom && a.bottom > b.top;
+      expect(intersects(rectangles[0], rectangles[1])).toBe(false);
+      for (const badge of rectangles) {
+        expect(intersects(badge, area(0, 76, 126, 98))).toBe(false);
+      }
+      overlay.destroy();
+    } finally {
+      Range.prototype.getClientRects = oldRangeRects;
+      HTMLElement.prototype.getBoundingClientRect = oldElementRect;
+      globalThis.requestAnimationFrame = oldRaf;
+      globalThis.cancelAnimationFrame = oldCancel;
+      parent.remove();
+      doc.destroy();
       vi.restoreAllMocks();
     }
   });

@@ -162,6 +162,11 @@ function setupWebSocket(server, opts = {}) {
       if (principal && typeof principal === "object") {
         ws.ignisTailnetLogin = principal.login;
         ws.ignisTailnetDevice = principal.deviceId;
+        // authorizeConnection has already validated the revocable, Vault-scoped
+        // Tailnet principal. Browser collaboration can therefore join without
+        // the native Connector's separate Sync journal registration frame.
+        // Native clients still send sync.auth to enable journal resume.
+        ws.ignisSyncAuthorized = true;
       }
     }
 
