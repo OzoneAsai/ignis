@@ -428,6 +428,24 @@ export class NativeYjs {
       ({ id, name, color })) : [];
   }
 
+  saveState(): {
+    online: boolean;
+    active: number;
+    awaitingServer: number;
+    reconnecting: number;
+    blocked: number;
+  } {
+    const active = [...this.rooms.values()].filter(room => room.views.size > 0);
+    return {
+      online: this.online,
+      active: active.length,
+      awaitingServer: active.filter(room => room.sentSeq > room.savedSeq ||
+        room.pendingHandshake).length,
+      reconnecting: active.filter(room => !room.joined && !room.blocked).length,
+      blocked: active.filter(room => room.blocked).length
+    };
+  }
+
   jumpToParticipant(path: string, id: string): boolean {
     const room = this.rooms.get(path);
     const peer = room?.peers.get(id);

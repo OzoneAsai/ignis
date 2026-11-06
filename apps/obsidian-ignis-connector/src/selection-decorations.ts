@@ -1,5 +1,7 @@
 import { StateEffect, StateField, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, type DecorationSet } from "@codemirror/view";
+import { cursorHighlightTint } from
+  "../../../packages/bridge/src/cursor-label-layout.js";
 
 // A remote selection belongs to document text, not to an approximate screen
 // rectangle. CodeMirror splits mark decorations along wrapped lines and syntax
@@ -14,12 +16,6 @@ export const MAX_REMOTE_MARKS = 480;
 
 export const replaceRemoteMarks = StateEffect.define<readonly RemoteMark[]>();
 
-function cssTint(color: string): string {
-  if (!/^#[0-9a-f]{6}$/i.test(color)) return "rgba(89, 186, 242, 0.24)";
-  const parts = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
-  return `rgba(${parts.join(", ")}, 0.24)`;
-}
-
 export function makeMarkDecorations(
   marks: readonly RemoteMark[], length: number
 ): DecorationSet {
@@ -31,7 +27,7 @@ export function makeMarkDecorations(
     if (start >= end) continue;
     ranges.push(Decoration.mark({
       class: "ignis-native-remote-highlight",
-      attributes: { style: `background-color: ${cssTint(color)};` },
+      attributes: { style: `background-color: ${cursorHighlightTint(color)};` },
       inclusive: false
     }).range(start, end));
   }

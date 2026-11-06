@@ -145,6 +145,8 @@ function setup() {
     },
     getDisplayName: () => "Obsidian Native",
     openDisplayName: vi.fn(),
+    getCurrentStatus: () => "Offline · local Vault retained",
+    openSyncIssues: vi.fn(),
     currentParticipants: () => ({path: "demo.md", peers: []}),
     takeIncomingLink: () => "",
     connectionSummary: () => ({ ready: false, vaultId: "", deviceId: "" }),
@@ -175,6 +177,12 @@ describe("native Obsidian one-button onboarding UI", () => {
     expect(plugin.ribbon[0].icon).toBe("users");
     expect(plugin.commands.map(x => x.id)).toContain("show-collaborators");
     expect(plugin.commands.map(x => x.id)).toContain("change-display-name");
+    expect(plugin.collaborationRibbon.getAttribute("aria-label"))
+      .toContain("Not connected");
+    plugin.showStatus("Offline · local Vault retained");
+    expect(plugin.collaborationRibbon.getAttribute("aria-label"))
+      .toContain("Offline · local Vault retained");
+    expect(plugin.getCurrentStatus()).toBe("Offline · local Vault retained");
     plugin.commands.find(x => x.id === "change-display-name").callback();
     // Obsidian's modal is available even when no collaborative note is open.
     expect(plugin.getDisplayName()).toMatch(/^Obsidian /);
@@ -216,6 +224,11 @@ describe("native Obsidian one-button onboarding UI", () => {
     plugin.jumpToParticipant = vi.fn(() => true);
     const modal = new CollaboratorsModal({}, plugin);
     modal.open();
+    expect(modal.contentEl.textContent).toContain("Offline · local Vault retained");
+    const review = [...modal.contentEl.querySelectorAll("button")]
+      .find(element => element.textContent === "Review issues");
+    review.click();
+    expect(plugin.openSyncIssues).toHaveBeenCalledOnce();
     const change = [...modal.contentEl.querySelectorAll("button")]
       .find(element => element.textContent === "Change name");
     change.click();
