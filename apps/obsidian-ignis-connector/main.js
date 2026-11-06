@@ -283,7 +283,7 @@ var MIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER;
 var LOWEST_INT32 = 1 << 31;
 var isInteger = Number.isInteger || ((num) => typeof num === "number" && isFinite(num) && floor(num) === num);
 var isNaN2 = Number.isNaN;
-var parseInt = Number.parseInt;
+var parseInt2 = Number.parseInt;
 
 // ../../node_modules/lib0/string.js
 var fromCharCode = String.fromCharCode;
@@ -9882,6 +9882,149 @@ var yCollab = (ytext, awareness, { undoManager = new UndoManager(ytext) } = {}) 
   return plugins;
 };
 
+// ../../packages/bridge/src/cursor-label-layout.js
+var GAP = 3;
+var MAX_BADGE_DISTANCE = 96;
+function finiteRect(rect) {
+  return rect && [rect.left, rect.top, rect.right, rect.bottom].every(Number.isFinite) && rect.right > rect.left && rect.bottom > rect.top;
+}
+function overlaps(a, b) {
+  return a.left < b.right + GAP && a.right + GAP > b.left && a.top < b.bottom + GAP && a.bottom + GAP > b.top;
+}
+function within(rect, bounds) {
+  return rect.left >= bounds.left && rect.top >= bounds.top && rect.right <= bounds.right && rect.bottom <= bounds.bottom;
+}
+function rectangle(left, top, width, height) {
+  return { left, top, right: left + width, bottom: top + height };
+}
+function createOverlaySpace(host) {
+  if (!host?.getBoundingClientRect)
+    return null;
+  const visual = host.getBoundingClientRect();
+  const width = host.offsetWidth || visual.width;
+  const height = host.offsetHeight || visual.height;
+  const scaleX = visual.width / width;
+  const scaleY = visual.height / height;
+  if (!finiteRect(visual) || !Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0)
+    return null;
+  const toLocal = (rect) => ({
+    left: (rect.left - visual.left) / scaleX,
+    top: (rect.top - visual.top) / scaleY,
+    right: (rect.right - visual.left) / scaleX,
+    bottom: (rect.bottom - visual.top) / scaleY
+  });
+  return {
+    bounds: rectangle(0, 0, width, height),
+    toLocal,
+    scaleX,
+    scaleY
+  };
+}
+function cursorLabelTextColor(background) {
+  const valid = /^#([a-f0-9]{6})$/i.exec(background || "");
+  if (!valid)
+    return "#000000";
+  const hex = valid[1];
+  const components = [0, 2, 4].map((index) => {
+    const c = parseInt(hex.slice(index, index + 2), 16) / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  const luminance = components[0] * 0.2126 + components[1] * 0.7152 + components[2] * 0.0722;
+  return luminance >= Math.sqrt(0.0525) - 0.05 ? "#000000" : "#ffffff";
+}
+function candidates(item, previous) {
+  const { caret, width, height } = item;
+  const x = caret.left;
+  const above = caret.top - height - GAP;
+  const below = caret.bottom + GAP;
+  const offsets = [0, -width, 9, -width - 9, -width / 2];
+  const choices = [];
+  if (previous && Number.isFinite(previous.dx) && Number.isFinite(previous.dy) && Math.abs(previous.dx) <= MAX_BADGE_DISTANCE + width && Math.abs(previous.dy) <= MAX_BADGE_DISTANCE) {
+    choices.push([x + previous.dx, caret.top + previous.dy]);
+  }
+  for (const y of [
+    above,
+    below,
+    above - height - GAP,
+    below + height + GAP,
+    above - 2 * (height + GAP),
+    below + 2 * (height + GAP)
+  ]) {
+    for (const offset of offsets)
+      choices.push([x + offset, y]);
+  }
+  const center = caret.top + (caret.bottom - caret.top - height) / 2;
+  choices.push([x + 12, center], [x - width - 12, center]);
+  return choices;
+}
+function layoutCursorLabels(items, obstacles, bounds, previous = /* @__PURE__ */ new Map()) {
+  const placed = /* @__PURE__ */ new Map();
+  if (!finiteRect(bounds))
+    return placed;
+  const reserved = obstacles.filter(finiteRect).slice();
+  const ordered = [...items].sort((a, b) => a.key.localeCompare(b.key));
+  for (const item of ordered) {
+    if (!item.caret || !Number.isFinite(item.caret.left) || !Number.isFinite(item.caret.top) || !Number.isFinite(item.caret.bottom) || !Number.isFinite(item.width) || !Number.isFinite(item.height) || item.width <= 0 || item.height <= 0)
+      continue;
+    for (const [left, top] of candidates(item, previous.get(item.key))) {
+      const rect = rectangle(left, top, item.width, item.height);
+      if (!within(rect, bounds) || reserved.some((other) => overlaps(rect, other))) {
+        continue;
+      }
+      placed.set(item.key, {
+        left,
+        top,
+        dx: left - item.caret.left,
+        dy: top - item.caret.top
+      });
+      reserved.push(rect);
+      break;
+    }
+  }
+  return placed;
+}
+function visibleContentObstacles(contentDOM, space, viewport, limit = 1500) {
+  if (!space || !contentDOM?.ownerDocument?.createTreeWalker || !contentDOM.ownerDocument.createRange)
+    return null;
+  const doc2 = contentDOM.ownerDocument;
+  const walker = doc2.createTreeWalker(contentDOM, doc2.defaultView?.NodeFilter?.SHOW_TEXT ?? 4);
+  const range = doc2.createRange();
+  const found = [];
+  const collect = (viewportRect) => {
+    const rect = space.toLocal(viewportRect);
+    if (!finiteRect(rect) || !overlaps(rect, viewport))
+      return true;
+    if (found.length >= limit)
+      return false;
+    found.push(rect);
+    return true;
+  };
+  let node;
+  try {
+    while (node = walker.nextNode()) {
+      if (!node.textContent?.length)
+        continue;
+      range.selectNodeContents(node);
+      for (const fragment2 of range.getClientRects()) {
+        if (!collect(fragment2))
+          return null;
+      }
+    }
+    const occupied = contentDOM.querySelectorAll(
+      "img,video,canvas,svg,iframe,object,embed,hr,table,input,textarea,button,select,[contenteditable='false'],.cm-widget,.cm-widgetBuffer"
+    );
+    for (const element2 of occupied) {
+      if (!collect(element2.getBoundingClientRect()))
+        return null;
+    }
+    return found;
+  } catch {
+    return null;
+  } finally {
+    range.detach?.();
+  }
+}
+
 // src/presence.ts
 var MAX_CURSOR_BYTES = 512;
 var MAX_SHARED_SELECTIONS = 32;
@@ -10058,6 +10201,15 @@ var CursorOverlay = class {
     view.dom.appendChild(this.roster);
     view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
     window.addEventListener("resize", this.scroll);
+    this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM ? new MutationObserver(this.scroll) : null;
+    this.contentMutation?.observe(view.contentDOM, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["style", "class"]
+    });
+    document.fonts?.addEventListener?.("loadingdone", this.scroll);
   }
   root;
   roster;
@@ -10065,11 +10217,13 @@ var CursorOverlay = class {
   rosterList;
   rosterFingerprint = "";
   nodes = /* @__PURE__ */ new Map();
+  lastBadgePositions = /* @__PURE__ */ new Map();
   peers = [];
   text = null;
   raf = 0;
   originalPosition;
   scroll = () => this.schedule();
+  contentMutation;
   set(text2, peers) {
     this.text = text2;
     this.peers = peers;
@@ -10133,6 +10287,7 @@ var CursorOverlay = class {
     for (const mark of record.marks)
       mark.remove();
     this.nodes.delete(id2);
+    this.lastBadgePositions.delete(id2);
   }
   clear() {
     if (this.raf)
@@ -10150,8 +10305,23 @@ var CursorOverlay = class {
     this.raf = 0;
     if (!this.text)
       return;
-    const bounds = this.view.dom.getBoundingClientRect();
+    const space = createOverlaySpace(this.view.dom);
+    if (!space) {
+      for (const item of this.nodes.values())
+        item.caret.style.display = "none";
+      return;
+    }
+    const bounds = space.bounds;
+    const scrollBounds = space.toLocal(this.view.scrollDOM.getBoundingClientRect());
+    const viewBounds = {
+      left: Math.max(0, scrollBounds.left),
+      top: Math.max(0, scrollBounds.top),
+      right: Math.min(bounds.right, scrollBounds.right),
+      bottom: Math.min(bounds.bottom, scrollBounds.bottom)
+    };
     const visible = /* @__PURE__ */ new Set();
+    const badgeItems = [];
+    const caretBlockers = [];
     let remainingMarks = 480;
     let highlightsLimited = false;
     for (const peer of this.peers) {
@@ -10179,8 +10349,8 @@ var CursorOverlay = class {
           Object.assign(label.style, {
             position: "absolute",
             left: "0",
-            bottom: "100%",
-            color: "#fff",
+            top: "0",
+            color: cursorLabelTextColor(peer.color),
             backgroundColor: peer.color,
             fontSize: "11px",
             fontWeight: "600",
@@ -10198,16 +10368,31 @@ var CursorOverlay = class {
         }
         record.label.textContent = peer.name;
         record.label.style.display = index === mainIndex ? "" : "none";
+        record.label.style.visibility = "hidden";
+        record.label.style.color = cursorLabelTextColor(peer.color);
         record.label.style.backgroundColor = peer.color;
         record.caret.style.backgroundColor = peer.color;
         const at = Math.min(this.view.state.doc.length, selection.head);
         const coords = this.view.coordsAtPos(at);
-        const onScreen = !!coords && coords.bottom >= bounds.top && coords.top <= bounds.bottom && coords.right >= bounds.left && coords.left <= bounds.right;
+        const local = coords ? space.toLocal(coords) : null;
+        const onScreen = !!local && local.bottom >= viewBounds.top && local.top <= viewBounds.bottom && local.right >= viewBounds.left && local.left <= viewBounds.right;
         record.caret.style.display = onScreen ? "" : "none";
-        if (coords && onScreen) {
-          record.caret.style.left = coords.left - bounds.left + "px";
-          record.caret.style.top = coords.top - bounds.top + "px";
-          record.caret.style.height = Math.max(1, coords.bottom - coords.top) + "px";
+        if (local && onScreen) {
+          const { left, top, bottom } = local;
+          record.caret.style.left = left + "px";
+          record.caret.style.top = top + "px";
+          record.caret.style.height = Math.max(1, bottom - top) + "px";
+          caretBlockers.push({ left: left - 1, top, right: left + 3, bottom });
+          if (index === mainIndex && peer.name) {
+            const measured = record.label.getBoundingClientRect();
+            badgeItems.push({
+              key,
+              caret: { left, top, bottom },
+              width: measured.width / space.scaleX,
+              height: measured.height / space.scaleY,
+              label: record.label
+            });
+          }
         }
         const from2 = Math.max(0, Math.min(selection.anchor, selection.head));
         const to = Math.min(
@@ -10226,11 +10411,13 @@ var CursorOverlay = class {
           const a = this.view.coordsAtPos(position);
           const b = this.view.coordsAtPos(stop);
           if (a && b) {
+            const first = space.toLocal(a);
+            const last2 = space.toLocal(b);
             marks.push({
-              left: a.left - bounds.left,
-              top: a.top - bounds.top,
-              width: Math.max(2, b.left - a.left),
-              height: Math.max(1, b.bottom - a.top)
+              left: first.left,
+              top: first.top,
+              width: Math.max(2, last2.left - first.left),
+              height: Math.max(1, last2.bottom - first.top)
             });
           }
           position = Math.max(position + 1, stop + 1);
@@ -10265,12 +10452,29 @@ var CursorOverlay = class {
       if (!visible.has(id2))
         this.discard(id2);
     }
+    const textRects = visibleContentObstacles(this.view.contentDOM, space, viewBounds);
+    const obstacles = textRects ? [...textRects, ...caretBlockers] : [];
+    if (!this.roster.hidden) {
+      obstacles.push(space.toLocal(this.roster.getBoundingClientRect()));
+    }
+    const placements = textRects ? layoutCursorLabels(badgeItems, obstacles, viewBounds, this.lastBadgePositions) : /* @__PURE__ */ new Map();
+    for (const item of badgeItems) {
+      const placement = placements.get(item.key);
+      if (!placement)
+        continue;
+      item.label.style.left = placement.left - item.caret.left + "px";
+      item.label.style.top = placement.top - item.caret.top + "px";
+      item.label.style.visibility = "visible";
+      this.lastBadgePositions.set(item.key, placement);
+    }
     this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + (highlightsLimited ? " \xB7 highlights limited" : " \xB7 show locations");
   }
   destroy() {
     this.clear();
     this.view.scrollDOM.removeEventListener("scroll", this.scroll);
     window.removeEventListener("resize", this.scroll);
+    this.contentMutation?.disconnect();
+    document.fonts?.removeEventListener?.("loadingdone", this.scroll);
     this.root.remove();
     this.roster.remove();
     this.view.dom.style.position = this.originalPosition;
@@ -12006,12 +12210,12 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         new import_obsidian.Notice("Configure Discovery URL and server Device ID first");
         return;
       }
-      const candidates = await discover(
+      const candidates2 = await discover(
         this.settings.discoveryUrl,
         this.settings.serverDeviceId
       );
       const pinned = validServerUrl(this.settings.serverUrl);
-      if (candidates.some((x) => validServerUrl(x) === pinned)) {
+      if (candidates2.some((x) => validServerUrl(x) === pinned)) {
         new import_obsidian.Notice("Syncthing Discovery confirms the configured HTTPS endpoint");
       } else {
         new import_obsidian.Notice("Discovery returned other addresses. Review and approve the origin manually; no token was sent.");

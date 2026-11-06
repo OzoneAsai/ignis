@@ -1,6 +1,10 @@
 // Ephemeral cursor awareness. The serialized positions point into Y.Text, so
 // insertions/deletions can rebase the remote caret without absolute offsets.
 import * as Y from "yjs";
+import {
+  createOverlaySpace, cursorLabelTextColor, layoutCursorLabels,
+  visibleContentObstacles,
+} from "./cursor-label-layout.js";
 
 export const MAX_SHARED_SELECTIONS = 32;
 
@@ -77,7 +81,7 @@ export function resolveCursorSelection(text, peer) {
   }
 }
 
-function selectionRects(cm, root, start, end, budget) {
+function selectionRects(cm, space, start, end, budget) {
   const rects = [];
   const doc = cm.state.doc;
   const visibleFrom = Math.max(start, cm.viewport?.from ?? 0);
@@ -92,11 +96,13 @@ function selectionRects(cm, root, start, end, budget) {
     const last = cm.coordsAtPos(lineEnd);
 
     if (first && last) {
+      const a = space.toLocal(first);
+      const b = space.toLocal(last);
       rects.push({
-        left: first.left - root.left,
-        top: first.top - root.top,
-        height: Math.max(1, last.bottom - first.top),
-        width: Math.max(2, last.left - first.left),
+        left: a.left,
+        top: a.top,
+        height: Math.max(1, b.bottom - a.top),
+        width: Math.max(2, b.left - a.left),
       });
     }
 
@@ -130,6 +136,7 @@ export function createCursorOverlay(session) {
   let raf = 0;
   let peers = [];
   const nodes = new Map();
+  const lastBadgePositions = new Map();
 
   function updateRoster() {
     roster.hidden = peers.length === 0;
@@ -183,6 +190,7 @@ export function createCursorOverlay(session) {
     }
 
     nodes.delete(id);
+    lastBadgePositions.delete(id);
   }
 
   function ensure(peer, key) {
@@ -205,8 +213,25 @@ export function createCursorOverlay(session) {
 
   function paint() {
     raf = 0;
-    const bounds = cm.dom.getBoundingClientRect();
+    const space = createOverlaySpace(cm.dom);
+    if (!space) {
+      for (const record of nodes.values()) {
+        record.caret.style.display = "none";
+      }
+      return;
+    }
+    const bounds = space.bounds;
+    const scroll = cm.scrollDOM?.getBoundingClientRect() || cm.dom.getBoundingClientRect();
+    const scrollBounds = space.toLocal(scroll);
+    const viewport = {
+      left: Math.max(0, scrollBounds.left),
+      top: Math.max(0, scrollBounds.top),
+      right: Math.min(bounds.right, scrollBounds.right),
+      bottom: Math.min(bounds.bottom, scrollBounds.bottom),
+    };
     const displayed = new Set();
+    const badgeItems = [];
+    const caretBlockers = [];
     // Carets remain visible for every participant, while long overlapping
     // selections share a bounded DOM budget rather than freezing mobile.
     let remainingMarks = 480;
@@ -223,12 +248,15 @@ export function createCursorOverlay(session) {
         displayed.add(key);
       const offset = Math.max(0, Math.min(cm.state.doc.length, selection.head));
       const caretCoords = cm.coordsAtPos(offset);
-      const visible = caretCoords && caretCoords.bottom >= bounds.top &&
-        caretCoords.top <= bounds.bottom;
+      const caretLocal = caretCoords ? space.toLocal(caretCoords) : null;
+      const visible = caretLocal && caretLocal.bottom >= viewport.top &&
+        caretLocal.top <= viewport.bottom && caretLocal.right >= viewport.left &&
+        caretLocal.left <= viewport.right;
       const color = /^#[0-9a-fA-F]{6}$/.test(peer.color) ? peer.color : "#59baf2";
       const record = ensure(peer, key);
       record.caret.style.display = visible ? "" : "none";
       record.caret.style.setProperty("--ignis-peer-color", color);
+      record.caret.style.setProperty("--ignis-peer-text", cursorLabelTextColor(color));
       const name = index === mainIndex ? peer.label || peer.name : "";
 
       if (record.label.textContent !== name) {
@@ -236,10 +264,24 @@ export function createCursorOverlay(session) {
       }
 
       record.label.style.display = index === mainIndex ? "" : "none";
+      record.label.style.visibility = "hidden";
       if (visible) {
-        record.caret.style.left = `${caretCoords.left - bounds.left}px`;
-        record.caret.style.top = `${caretCoords.top - bounds.top}px`;
-        record.caret.style.height = `${Math.max(1, caretCoords.bottom - caretCoords.top)}px`;
+        const { left, top, bottom } = caretLocal;
+        record.caret.style.left = `${left}px`;
+        record.caret.style.top = `${top}px`;
+        record.caret.style.height = `${Math.max(1, bottom - top)}px`;
+        caretBlockers.push({
+          left: left - 1, top, right: left + 3, bottom
+        });
+        if (index === mainIndex && name) {
+          const measured = record.label.getBoundingClientRect();
+          badgeItems.push({
+            key, caret: { left, top, bottom },
+            width: measured.width / space.scaleX,
+            height: measured.height / space.scaleY,
+            label: record.label
+          });
+        }
       }
 
       const from = Math.min(selection.anchor, selection.head);
@@ -247,7 +289,7 @@ export function createCursorOverlay(session) {
       const selectedInViewport = Math.max(from, cm.viewport?.from ?? 0) <
         Math.min(to, cm.viewport?.to ?? cm.state.doc.length);
       if (selectedInViewport && remainingMarks === 0) highlightsLimited = true;
-      const rects = selectionRects(cm, bounds, from, to, remainingMarks);
+      const rects = selectionRects(cm, space, from, to, remainingMarks);
       remainingMarks -= rects.length;
 
       for (let i = 0; i < rects.length; i++) {
@@ -278,6 +320,24 @@ export function createCursorOverlay(session) {
       if (!displayed.has(id)) {
         discard(id);
       }
+    }
+    const textRects = visibleContentObstacles(cm.contentDOM, space, viewport);
+    const obstacles = textRects ? [...textRects, ...caretBlockers] : [];
+    if (!roster.hidden) {
+      obstacles.push(space.toLocal(roster.getBoundingClientRect()));
+    }
+    // Never cover possibly unmeasured text. Keep all carets and the roster,
+    // and hide only the badges that cannot fit in genuinely empty space.
+    const placements = textRects
+      ? layoutCursorLabels(badgeItems, obstacles, viewport, lastBadgePositions)
+      : new Map();
+    for (const item of badgeItems) {
+      const placement = placements.get(item.key);
+      if (!placement) continue;
+      item.label.style.left = `${placement.left - item.caret.left}px`;
+      item.label.style.top = `${placement.top - item.caret.top}px`;
+      item.label.style.visibility = "visible";
+      lastBadgePositions.set(item.key, placement);
     }
     rosterTitle.textContent = peers.length + " other editor" +
       (peers.length === 1 ? "" : "s") +
@@ -312,6 +372,16 @@ export function createCursorOverlay(session) {
   const onScroll = () => render();
   cm.scrollDOM?.addEventListener("scroll", onScroll, { passive: true });
   window.addEventListener("resize", onScroll);
+  // Text reflow may move an anchor while the editor bounds remain unchanged.
+  // contentDOM never contains this overlay, so observing it cannot self-loop.
+  const mutationObserver = typeof MutationObserver !== "undefined" && cm.contentDOM
+    ? new MutationObserver(onScroll) : null;
+  mutationObserver?.observe(cm.contentDOM, {
+    subtree: true, childList: true, characterData: true,
+    attributes: true, attributeFilter: ["style", "class"],
+  });
+  const fonts = document.fonts;
+  fonts?.addEventListener?.("loadingdone", onScroll);
   let observer = null;
 
   if (typeof ResizeObserver !== "undefined") {
@@ -329,6 +399,8 @@ export function createCursorOverlay(session) {
       observer?.disconnect();
       cm.scrollDOM?.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", onScroll);
+      mutationObserver?.disconnect();
+      fonts?.removeEventListener?.("loadingdone", onScroll);
       root.remove();
       roster.remove();
     },
