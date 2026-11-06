@@ -66,6 +66,18 @@ export function cursorLabelTextColor(background) {
   return luminance >= Math.sqrt(0.0525) - 0.05 ? "#000000" : "#ffffff";
 }
 
+// The same translucent participant tint is applied by the native CM6 text
+// decorations and WebUI's measured glyph fragments. Untrusted peer colors
+// never enter a style string without RGB validation.
+export function cursorHighlightTint(color) {
+  if (!/^#[0-9a-f]{6}$/i.test(color || "")) {
+    return "rgba(89, 186, 242, 0.24)";
+  }
+  const channels = [1, 3, 5].map((i) =>
+    parseInt(color.slice(i, i + 2), 16));
+  return `rgba(${channels.join(", ")}, 0.24)`;
+}
+
 function candidates(item, previous) {
   const { caret, width, height } = item;
   const x = caret.left;

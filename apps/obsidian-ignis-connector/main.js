@@ -9884,6 +9884,95 @@ var yCollab = (ytext, awareness, { undoManager = new UndoManager(ytext) } = {}) 
   return plugins;
 };
 
+// ../../packages/server-core/src/collab-cursor-limits.json
+var collab_cursor_limits_default = {
+  maxEncodedCursorChars: 512,
+  maxDecodedCursorBytes: 384,
+  maxSelections: 32
+};
+
+// ../../packages/bridge/src/collab-cursor-protocol.js
+var MAX_SHARED_SELECTIONS = collab_cursor_limits_default.maxSelections;
+var MAX_CURSOR_ENCODED_CHARS = collab_cursor_limits_default.maxEncodedCursorChars;
+var BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+function encodeBytes(bytes) {
+  let raw = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  }
+  return btoa(raw);
+}
+function decodeCursorPosition(value) {
+  if (typeof value !== "string" || !value || value.length > MAX_CURSOR_ENCODED_CHARS || !BASE64.test(value))
+    return null;
+  try {
+    const raw = atob(value);
+    if (!raw || raw.length > collab_cursor_limits_default.maxDecodedCursorBytes)
+      return null;
+    const bytes = Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+    const canonical = encodeRelativePosition(decodeRelativePosition(bytes));
+    if (canonical.length !== bytes.length || canonical.some((byte, i) => byte !== bytes[i]))
+      return null;
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+function encodeCursorSelection(text2, anchor, head) {
+  const at = (index) => encodeBytes(encodeRelativePosition(
+    createRelativePositionFromTypeIndex(
+      text2,
+      Math.max(0, Math.min(text2.length, index))
+    )
+  ));
+  const result = { anchor: at(anchor), head: at(head) };
+  return decodeCursorPosition(result.anchor) && decodeCursorPosition(result.head) ? result : null;
+}
+function encodeCursorSelections(text2, ranges, mainIndex = 0) {
+  if (!Array.isArray(ranges) || ranges.length < 1 || ranges.length > MAX_SHARED_SELECTIONS || !Number.isSafeInteger(mainIndex) || mainIndex < 0 || mainIndex >= ranges.length)
+    return null;
+  const selections = [];
+  for (const selection of ranges) {
+    if (!selection || !Number.isSafeInteger(selection.anchor) || !Number.isSafeInteger(selection.head))
+      return null;
+    const encoded = encodeCursorSelection(text2, selection.anchor, selection.head);
+    if (!encoded)
+      return null;
+    selections.push(encoded);
+  }
+  return { selections, mainIndex, ...selections[mainIndex] };
+}
+function selectionEntries(peer) {
+  const entries = Array.isArray(peer?.selections) ? peer.selections : peer?.anchor != null && peer?.head != null ? [{ anchor: peer.anchor, head: peer.head }] : [];
+  if (entries.length > MAX_SHARED_SELECTIONS)
+    return [];
+  return entries.map((entry) => entry && decodeCursorPosition(entry.anchor) && decodeCursorPosition(entry.head) ? { anchor: entry.anchor, head: entry.head } : null);
+}
+function resolveCursorSelection(text2, entry) {
+  const start = decodeCursorPosition(entry?.anchor);
+  const end = decodeCursorPosition(entry?.head);
+  if (!start || !end || !text2?.doc)
+    return null;
+  try {
+    const a = createAbsolutePositionFromRelativePosition(
+      decodeRelativePosition(start),
+      text2.doc
+    );
+    const b = createAbsolutePositionFromRelativePosition(
+      decodeRelativePosition(end),
+      text2.doc
+    );
+    if (!a || !b || a.type !== text2 || b.type !== text2)
+      return null;
+    return { anchor: a.index, head: b.index };
+  } catch {
+    return null;
+  }
+}
+function resolveCursorSelections(text2, peer) {
+  return selectionEntries(peer).map((entry) => resolveCursorSelection(text2, entry));
+}
+
 // ../../packages/bridge/src/cursor-label-layout.js
 var GAP = 3;
 var MAX_BADGE_DISTANCE = 96;
@@ -9933,6 +10022,13 @@ function cursorLabelTextColor(background) {
   });
   const luminance = components[0] * 0.2126 + components[1] * 0.7152 + components[2] * 0.0722;
   return luminance >= Math.sqrt(0.0525) - 0.05 ? "#000000" : "#ffffff";
+}
+function cursorHighlightTint(color) {
+  if (!/^#[0-9a-f]{6}$/i.test(color || "")) {
+    return "rgba(89, 186, 242, 0.24)";
+  }
+  const channels = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
+  return `rgba(${channels.join(", ")}, 0.24)`;
 }
 function candidates(item, previous) {
   const { caret, width, height } = item;
@@ -10032,12 +10128,6 @@ var import_state = require("@codemirror/state");
 var import_view = require("@codemirror/view");
 var MAX_REMOTE_MARKS = 480;
 var replaceRemoteMarks = import_state.StateEffect.define();
-function cssTint(color) {
-  if (!/^#[0-9a-f]{6}$/i.test(color))
-    return "rgba(89, 186, 242, 0.24)";
-  const parts = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
-  return `rgba(${parts.join(", ")}, 0.24)`;
-}
 function makeMarkDecorations(marks, length2) {
   const ranges = [];
   for (const { from: from2, to, color } of marks.slice(0, MAX_REMOTE_MARKS)) {
@@ -10049,7 +10139,7 @@ function makeMarkDecorations(marks, length2) {
       continue;
     ranges.push(import_view.Decoration.mark({
       class: "ignis-native-remote-highlight",
-      attributes: { style: `background-color: ${cssTint(color)};` },
+      attributes: { style: `background-color: ${cursorHighlightTint(color)};` },
       inclusive: false
     }).range(start, end));
   }
@@ -10071,65 +10161,8 @@ var remoteSelectionField = import_state.StateField.define({
 var remoteSelectionExtension = remoteSelectionField;
 
 // src/presence.ts
-var MAX_CURSOR_BYTES = 512;
-var MAX_SHARED_SELECTIONS = 32;
-function encodeBytes(bytes) {
-  let raw = "";
-  for (const byte of bytes)
-    raw += String.fromCharCode(byte);
-  return btoa(raw);
-}
-function decodeBytes(value) {
-  if (typeof value !== "string" || value.length > 688 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value))
-    return null;
-  try {
-    const raw = atob(value);
-    if (!raw.length || raw.length > MAX_CURSOR_BYTES)
-      return null;
-    const bytes = Uint8Array.from(raw, (c) => c.charCodeAt(0));
-    const canonical = encodeRelativePosition(decodeRelativePosition(bytes));
-    if (canonical.byteLength !== bytes.byteLength || canonical.some((byte, index) => byte !== bytes[index]))
-      return null;
-    return bytes;
-  } catch {
-    return null;
-  }
-}
-function encodeSelection(text2, anchor, head) {
-  const at = (index) => encodeBytes(encodeRelativePosition(
-    createRelativePositionFromTypeIndex(
-      text2,
-      Math.max(0, Math.min(text2.length, index))
-    )
-  ));
-  const result = { anchor: at(anchor), head: at(head) };
-  if (result.anchor.length > 688 || result.head.length > 688)
-    return null;
-  return result;
-}
-function encodeSelections(text2, ranges, mainIndex = 0) {
-  if (!Array.isArray(ranges) || ranges.length === 0 || ranges.length > MAX_SHARED_SELECTIONS || !Number.isSafeInteger(mainIndex) || mainIndex < 0 || mainIndex >= ranges.length)
-    return null;
-  const selections = [];
-  for (const range of ranges) {
-    const encoded = encodeSelection(text2, range.anchor, range.head);
-    if (!encoded)
-      return null;
-    selections.push(encoded);
-  }
-  return { selections, mainIndex, ...selections[mainIndex] };
-}
-function selectionEntries(peer) {
-  if (Array.isArray(peer.selections)) {
-    if (peer.selections.length > MAX_SHARED_SELECTIONS)
-      return [];
-    return peer.selections;
-  }
-  return peer.anchor && peer.head ? [{ anchor: peer.anchor, head: peer.head }] : [];
-}
-function resolveSelections(text2, peer) {
-  return selectionEntries(peer).map((entry) => resolveSelection(text2, entry));
-}
+var encodeSelections = encodeCursorSelections;
+var resolveSelections = resolveCursorSelections;
 function safeSelections(item) {
   if (Array.isArray(item.selections)) {
     if (item.selections.length > MAX_SHARED_SELECTIONS)
@@ -10140,13 +10173,13 @@ function safeSelections(item) {
         return [];
       const anchor = entry.anchor;
       const head = entry.head;
-      if (!decodeBytes(anchor) || !decodeBytes(head))
+      if (!decodeCursorPosition(anchor) || !decodeCursorPosition(head))
         return [];
       selections.push({ anchor, head });
     }
     return selections;
   }
-  return decodeBytes(item.anchor) && decodeBytes(item.head) ? [{ anchor: item.anchor, head: item.head }] : [];
+  return decodeCursorPosition(item.anchor) && decodeCursorPosition(item.head) ? [{ anchor: item.anchor, head: item.head }] : [];
 }
 function sanitizeCursorMessage(item) {
   const data = item && typeof item === "object" ? item : {};
@@ -10160,27 +10193,6 @@ function sanitizeCursorMessage(item) {
     anchor: primary?.anchor || null,
     head: primary?.head || null
   };
-}
-function resolveSelection(text2, peer) {
-  const start = decodeBytes(peer.anchor);
-  const end = decodeBytes(peer.head);
-  if (!start || !end || !text2.doc)
-    return null;
-  try {
-    const anchor = createAbsolutePositionFromRelativePosition(
-      decodeRelativePosition(start),
-      text2.doc
-    );
-    const head = createAbsolutePositionFromRelativePosition(
-      decodeRelativePosition(end),
-      text2.doc
-    );
-    if (!anchor || !head || anchor.type !== text2 || head.type !== text2)
-      return null;
-    return { anchor: anchor.index, head: head.index };
-  } catch {
-    return null;
-  }
 }
 function sanitizePeers(input, selfId) {
   if (!Array.isArray(input))
@@ -10986,6 +10998,16 @@ var NativeYjs = class {
     const room = path && this.rooms.get(path);
     return room ? [...room.peers.values()].map(({ id: id2, name, color }) => ({ id: id2, name, color })) : [];
   }
+  saveState() {
+    const active = [...this.rooms.values()].filter((room) => room.views.size > 0);
+    return {
+      online: this.online,
+      active: active.length,
+      awaitingServer: active.filter((room) => room.sentSeq > room.savedSeq || room.pendingHandshake).length,
+      reconnecting: active.filter((room) => !room.joined && !room.blocked).length,
+      blocked: active.filter((room) => room.blocked).length
+    };
+  }
   jumpToParticipant(path, id2) {
     const room = this.rooms.get(path);
     const peer = room?.peers.get(id2);
@@ -11585,6 +11607,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   queued = false;
   quiet = /* @__PURE__ */ new Set();
   status = null;
+  collaborationRibbon = null;
+  statusText = "Not connected";
   timer = null;
   lastError = "";
   live;
@@ -11650,7 +11674,12 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       this.status = this.addStatusBarItem();
     this.showStatus("Not connected");
     this.addSettingTab(new ConnectorSettings(this.app, this));
-    this.addRibbonIcon("users", "Ignis collaborators and display name", () => this.openCollaborators());
+    this.collaborationRibbon = this.addRibbonIcon(
+      "users",
+      "Ignis collaborators and display name",
+      () => this.openCollaborators()
+    );
+    this.showStatus(this.statusText);
     this.addCommand({
       id: "show-collaborators",
       name: "Show collaborators and display name",
@@ -11686,11 +11715,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.addCommand({
       id: "show-sync-issues",
       name: "Review Ignis sync issues",
-      callback: () => new SyncIssuesModal(
-        this.app,
-        this.settings.syncIssues,
-        this.lastError
-      ).open()
+      callback: () => this.openSyncIssues()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof import_obsidian.TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
@@ -11759,6 +11784,12 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   }
   openCollaborators() {
     new CollaboratorsModal(this.app, this).open();
+  }
+  getCurrentStatus() {
+    return this.statusText;
+  }
+  openSyncIssues() {
+    new SyncIssuesModal(this.app, this.settings.syncIssues, this.lastError).open();
   }
   currentParticipants() {
     const path = this.app.workspace.getActiveFile()?.path || null;
@@ -11931,8 +11962,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     return !!(!this.authBlocked && !this.needsReload && this.matchesScope() && this.settings.vaultId && (this.settings.authMode === "tailnet" && !!this.settings.deviceId || /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token)));
   }
   showStatus(status) {
+    this.statusText = status;
     if (this.status)
       this.status.setText("Ignis: " + status);
+    this.collaborationRibbon?.setAttribute("aria-label", "Ignis: " + status + " \xB7 open collaborators and sync status");
+    this.collaborationRibbon?.setAttribute("title", "Ignis: " + status);
   }
   schedule() {
     if (this.timer !== null)
@@ -12382,7 +12416,18 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         this.showStatus(conflicts.length + " items need review");
       } else {
         this.settings.cursor = manifest.vaultSeq;
-        this.showStatus("Synced \xB7 server acknowledged");
+        const live = this.live.saveState();
+        if (live.blocked) {
+          this.showStatus("Files synced \xB7 " + live.blocked + " collaborative notes need review");
+        } else if (live.active && !live.online) {
+          this.showStatus("Files synced \xB7 live collaboration offline");
+        } else if (live.reconnecting) {
+          this.showStatus("Files synced \xB7 " + live.reconnecting + " collaborative notes reconnecting");
+        } else if (live.awaitingServer) {
+          this.showStatus("Files synced \xB7 " + live.awaitingServer + " collaborative notes await server save");
+        } else {
+          this.showStatus("Synced \xB7 server acknowledged");
+        }
       }
       this.settings.syncIssues = conflicts;
       await this.persistSettings();
@@ -12468,6 +12513,10 @@ var CollaboratorsModal = class extends import_obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h3", { text: "Ignis collaborators" });
+    new import_obsidian.Setting(contentEl).setName("Sync status").setDesc(this.plugin.getCurrentStatus()).addButton((b) => b.setButtonText("Review issues").onClick(() => {
+      this.close();
+      this.plugin.openSyncIssues();
+    }));
     new import_obsidian.Setting(contentEl).setName("Your display name").setDesc(this.plugin.getDisplayName()).addButton((b) => b.setButtonText("Change name").onClick(() => {
       this.close();
       this.plugin.openDisplayName();

@@ -305,9 +305,9 @@ describe("flush success", () => {
 
     expect(flushed).toEqual([]);
 
-    await sleep(SHORT_WINDOW_MS + 30);
-
-    expect(flushed).toEqual([filePath]);
+    await vi.waitFor(() => expect(flushed).toEqual([filePath]), {
+      timeout: 4000,
+    });
   });
 
   it("reports the path flushPending wrote", async () => {
@@ -404,8 +404,6 @@ describe("flush success", () => {
 });
 
 describe("flush give-up", () => {
-  const GIVE_UP_MS = SHORT_WINDOW_MS + RETRY_BACKOFF_MS * FLUSH_ATTEMPTS + 150;
-
   let givenUp;
 
   beforeEach(() => {
@@ -419,6 +417,15 @@ describe("flush give-up", () => {
       .mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
   }
 
+  // Each retry schedules the next timer only after its disk write settles.
+  // Under parallel test load, elapsed wall time cannot guarantee that the
+  // retry chain has finished. Wait for the observable terminal event instead.
+  async function waitForGiveUp(filePath) {
+    await vi.waitFor(() => expect(givenUp).toEqual([filePath]), {
+      timeout: 10_000,
+    });
+  }
+
   it("drops the buffer and reports the path after the attempt budget", async () => {
     const filePath = path.join(tmpDir, "file.txt");
 
@@ -426,13 +433,13 @@ describe("flush give-up", () => {
     const spy = failWrites();
     await coalescer.writeCoalesced(filePath, "second", "utf-8");
 
-    await sleep(GIVE_UP_MS);
+    await waitForGiveUp(filePath);
 
     expect(spy).toHaveBeenCalledTimes(FLUSH_ATTEMPTS);
     expect(givenUp).toEqual([filePath]);
     expect(coalescer.getPending(filePath)).toBeNull();
     expect(await fs.promises.readFile(filePath, "utf-8")).toBe("first");
-  });
+  }, 15_000);
 
   it("gives the attempt budget back to a newer write for the path", async () => {
     const filePath = path.join(tmpDir, "file.txt");
@@ -445,12 +452,12 @@ describe("flush give-up", () => {
     await expect(coalescer.flushPending(filePath)).rejects.toThrow();
     await coalescer.writeCoalesced(filePath, "third", "utf-8");
 
-    await sleep(GIVE_UP_MS);
+    await waitForGiveUp(filePath);
 
     expect(givenUp).toEqual([filePath]);
     expect(spy).toHaveBeenCalledTimes(FLUSH_ATTEMPTS + 1);
     expect(spy.mock.calls.at(-1)[1]).toBe("third");
-  });
+  }, 15_000);
 
   it("writes a newer write to a given-up path normally", async () => {
     const filePath = path.join(tmpDir, "file.txt");
@@ -459,7 +466,7 @@ describe("flush give-up", () => {
     const spy = failWrites();
     await coalescer.writeCoalesced(filePath, "second", "utf-8");
 
-    await sleep(GIVE_UP_MS);
+    await waitForGiveUp(filePath);
 
     expect(givenUp).toEqual([filePath]);
 
@@ -467,7 +474,7 @@ describe("flush give-up", () => {
     await coalescer.writeCoalesced(filePath, "third", "utf-8");
 
     expect(await fs.promises.readFile(filePath, "utf-8")).toBe("third");
-  });
+  }, 15_000);
 });
 
 describe("a flush already writing", () => {

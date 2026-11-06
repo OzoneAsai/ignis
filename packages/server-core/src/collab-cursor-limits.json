@@ -1,0 +1,5 @@
+{
+  "maxEncodedCursorChars": 512,
+  "maxDecodedCursorBytes": 384,
+  "maxSelections": 32
+}

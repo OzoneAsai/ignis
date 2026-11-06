@@ -20,6 +20,7 @@ export interface OverlaySpace {
 }
 export function createOverlaySpace(host: HTMLElement | null | undefined): OverlaySpace | null;
 export function cursorLabelTextColor(background: string): "#000000" | "#ffffff";
+export function cursorHighlightTint(color: string): string;
 export function layoutCursorLabels(
   items: LabelItem[],
   obstacles: LabelRect[],

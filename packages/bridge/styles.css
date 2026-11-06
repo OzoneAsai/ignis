@@ -418,8 +418,6 @@
 
 .ignis-collab-remote-selection {
   position: absolute;
-  background: var(--ignis-peer-color);
-  opacity: 0.24;
   border-radius: 2px;
   pointer-events: none;
 }
