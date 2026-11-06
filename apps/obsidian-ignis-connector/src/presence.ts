@@ -1,4 +1,15 @@
 import * as Y from "yjs";
+import {
+  MAX_SHARED_SELECTIONS, decodeCursorPosition,
+  encodeCursorSelection, encodeCursorSelections,
+  selectionEntries as commonSelectionEntries,
+  resolveCursorSelection, resolveCursorSelections
+} from "../../../packages/bridge/src/collab-cursor-protocol.js";
+export { MAX_SHARED_SELECTIONS };
+export const encodeSelection = encodeCursorSelection;
+export const encodeSelections = encodeCursorSelections;
+export const resolveSelection = resolveCursorSelection;
+export const resolveSelections = resolveCursorSelections;
 import type { EditorView } from "@codemirror/view";
 import {
   createOverlaySpace, cursorLabelTextColor, layoutCursorLabels,
@@ -15,8 +26,6 @@ import {
 // Ignis's /ws collab channel already carries ephemeral presence and Yjs
 // relative positions. Native Obsidian uses that same protocol; Yjs Awareness
 // from y-websocket would be a second, incompatible presence transport.
-const MAX_CURSOR_BYTES = 512;
-export const MAX_SHARED_SELECTIONS = 32;
 export type CursorSelection = { anchor: string; head: string };
 export type Peer = {
   id: string;
@@ -28,66 +37,10 @@ export type Peer = {
   mainIndex?: number;
 };
 
-function encodeBytes(bytes: Uint8Array): string {
-  let raw = "";
-  for (const byte of bytes) raw += String.fromCharCode(byte);
-  return btoa(raw);
-}
-
-function decodeBytes(value: unknown): Uint8Array | null {
-  if (typeof value !== "string" || value.length > 688 ||
-      !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
-  try {
-    const raw = atob(value);
-    if (!raw.length || raw.length > MAX_CURSOR_BYTES) return null;
-    const bytes = Uint8Array.from(raw, c => c.charCodeAt(0));
-    // A syntactically valid base64 string need not be a Yjs relative
-    // position. Reject corrupt cursor payloads before they reach the DOM.
-    const canonical = Y.encodeRelativePosition(Y.decodeRelativePosition(bytes));
-    if (canonical.byteLength !== bytes.byteLength ||
-        canonical.some((byte, index) => byte !== bytes[index])) return null;
-    return bytes;
-  } catch {
-    return null;
-  }
-}
-
-export function encodeSelection(text: Y.Text, anchor: number, head: number) {
-  const at = (index: number) => encodeBytes(Y.encodeRelativePosition(
-    Y.createRelativePositionFromTypeIndex(
-      text, Math.max(0, Math.min(text.length, index))
-    )
-  ));
-  const result = { anchor: at(anchor), head: at(head) };
-  if (result.anchor.length > 688 || result.head.length > 688) return null;
-  return result;
-}
-
-export function encodeSelections(text: Y.Text,
-  ranges: ReadonlyArray<{ anchor: number; head: number }>, mainIndex = 0) {
-  if (!Array.isArray(ranges) || ranges.length === 0 ||
-      ranges.length > MAX_SHARED_SELECTIONS ||
-      !Number.isSafeInteger(mainIndex) || mainIndex < 0 ||
-      mainIndex >= ranges.length) return null;
-  const selections: CursorSelection[] = [];
-  for (const range of ranges) {
-    const encoded = encodeSelection(text, range.anchor, range.head);
-    if (!encoded) return null;
-    selections.push(encoded);
-  }
-  return { selections, mainIndex, ...selections[mainIndex] };
-}
-
 export function selectionEntries(peer: Peer): CursorSelection[] {
-  if (Array.isArray(peer.selections)) {
-    if (peer.selections.length > MAX_SHARED_SELECTIONS) return [];
-    return peer.selections;
-  }
-  return peer.anchor && peer.head ? [{ anchor: peer.anchor, head: peer.head }] : [];
-}
-
-export function resolveSelections(text: Y.Text, peer: Peer) {
-  return selectionEntries(peer).map(entry => resolveSelection(text, entry));
+  return commonSelectionEntries(peer).filter(
+    (entry): entry is CursorSelection => entry !== null
+  );
 }
 
 function safeSelections(item: Record<string, unknown>): CursorSelection[] {
@@ -98,12 +51,12 @@ function safeSelections(item: Record<string, unknown>): CursorSelection[] {
       if (!entry || typeof entry !== "object") return [];
       const anchor = (entry as Record<string, unknown>).anchor;
       const head = (entry as Record<string, unknown>).head;
-      if (!decodeBytes(anchor) || !decodeBytes(head)) return [];
+      if (!decodeCursorPosition(anchor) || !decodeCursorPosition(head)) return [];
       selections.push({ anchor: anchor as string, head: head as string });
     }
     return selections;
   }
-  return decodeBytes(item.anchor) && decodeBytes(item.head)
+  return decodeCursorPosition(item.anchor) && decodeCursorPosition(item.head)
     ? [{ anchor: item.anchor as string, head: item.head as string }] : [];
 }
 
@@ -119,22 +72,6 @@ export function sanitizeCursorMessage(item: unknown): Pick<Peer,
   const primary = selections[mainIndex];
   return { selections, mainIndex,
     anchor: primary?.anchor || null, head: primary?.head || null };
-}
-
-export function resolveSelection(text: Y.Text, peer: Pick<Peer, "anchor" | "head">) {
-  const start = decodeBytes(peer.anchor);
-  const end = decodeBytes(peer.head);
-  if (!start || !end || !text.doc) return null;
-  try {
-    const anchor = Y.createAbsolutePositionFromRelativePosition(
-      Y.decodeRelativePosition(start), text.doc);
-    const head = Y.createAbsolutePositionFromRelativePosition(
-      Y.decodeRelativePosition(end), text.doc);
-    if (!anchor || !head || anchor.type !== text || head.type !== text) return null;
-    return { anchor: anchor.index, head: head.index };
-  } catch {
-    return null;
-  }
 }
 
 export function sanitizePeers(input: unknown, selfId: string | null): Peer[] {

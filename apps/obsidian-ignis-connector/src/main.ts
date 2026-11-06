@@ -134,6 +134,8 @@ export default class IgnisConnector extends Plugin {
   private queued = false;
   private quiet = new Set<string>();
   private status: HTMLElement | null = null;
+  private collaborationRibbon: HTMLElement | null = null;
+  private statusText = "Not connected";
   private timer: number | null = null;
   private lastError = "";
   private live!: NativeYjs;
@@ -205,8 +207,11 @@ export default class IgnisConnector extends Plugin {
     // Mobile ribbon entries appear in Obsidian's bottom navigation menu.
     // These commands are also accessible from the command palette when the
     // keyboard is open or a floating participants control is obstructed.
-    this.addRibbonIcon("users", "Ignis collaborators and display name", () =>
-      this.openCollaborators());
+    this.collaborationRibbon = this.addRibbonIcon(
+      "users", "Ignis collaborators and display name", () =>
+        this.openCollaborators()
+    );
+    this.showStatus(this.statusText);
     this.addCommand({
       id: "show-collaborators",
       name: "Show collaborators and display name",
@@ -241,9 +246,7 @@ export default class IgnisConnector extends Plugin {
     this.addCommand({
       id: "show-sync-issues",
       name: "Review Ignis sync issues",
-      callback: () => new SyncIssuesModal(
-        this.app, this.settings.syncIssues, this.lastError
-      ).open()
+      callback: () => this.openSyncIssues()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
@@ -317,6 +320,14 @@ export default class IgnisConnector extends Plugin {
 
   openCollaborators() {
     new CollaboratorsModal(this.app, this).open();
+  }
+
+  getCurrentStatus(): string {
+    return this.statusText;
+  }
+
+  openSyncIssues() {
+    new SyncIssuesModal(this.app, this.settings.syncIssues, this.lastError).open();
   }
 
   currentParticipants() {
@@ -503,7 +514,13 @@ export default class IgnisConnector extends Plugin {
        /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(this.token)));
   }
   private showStatus(status: string) {
+    this.statusText = status;
     if (this.status) this.status.setText("Ignis: " + status);
+    // Obsidian's custom status bar doesn't exist on mobile. This reflects
+    // the *actual* sync message, never treats a connected socket as a save ACK.
+    this.collaborationRibbon?.setAttribute("aria-label", "Ignis: " + status +
+      " · open collaborators and sync status");
+    this.collaborationRibbon?.setAttribute("title", "Ignis: " + status);
   }
   private schedule() {
     if (this.timer !== null) window.clearTimeout(this.timer);
@@ -951,7 +968,24 @@ export default class IgnisConnector extends Plugin {
         this.showStatus(conflicts.length + " items need review");
       } else {
         this.settings.cursor = manifest.vaultSeq;
-        this.showStatus("Synced · server acknowledged");
+        // REST journal synchronization and live Yjs persistence are two
+        // different durability planes. A successful manifest/operation sync
+        // cannot prove that every open Markdown collaboration is saved.
+        const live = this.live.saveState();
+        if (live.blocked) {
+          this.showStatus("Files synced · " + live.blocked +
+            " collaborative notes need review");
+        } else if (live.active && !live.online) {
+          this.showStatus("Files synced · live collaboration offline");
+        } else if (live.reconnecting) {
+          this.showStatus("Files synced · " + live.reconnecting +
+            " collaborative notes reconnecting");
+        } else if (live.awaitingServer) {
+          this.showStatus("Files synced · " + live.awaitingServer +
+            " collaborative notes await server save");
+        } else {
+          this.showStatus("Synced · server acknowledged");
+        }
       }
       this.settings.syncIssues = conflicts;
       await this.persistSettings();
@@ -1038,6 +1072,10 @@ export class CollaboratorsModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h3", { text: "Ignis collaborators" });
+    new Setting(contentEl).setName("Sync status")
+      .setDesc(this.plugin.getCurrentStatus())
+      .addButton((b) => b.setButtonText("Review issues")
+        .onClick(() => { this.close(); this.plugin.openSyncIssues(); }));
     new Setting(contentEl).setName("Your display name")
       .setDesc(this.plugin.getDisplayName())
       .addButton((b) => b.setButtonText("Change name")

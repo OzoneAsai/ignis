@@ -62,6 +62,26 @@ afterEach(async () => {
 });
 
 describe("Native Obsidian offline Yjs bridge", () => {
+  it("distinguishes local editor attachment, server ACK, reconnection and block state", async () => {
+    const s = harness();
+    expect(s.manager.saveState()).toMatchObject({
+      online: false, active: 1, reconnecting: 1, awaitingServer: 0, blocked: 0
+    });
+    s.manager.connected();
+    await s.manager.handle(serverInit("test.md", ID, "Initial"));
+    expect(s.manager.saveState()).toMatchObject({
+      online: true, active: 1, reconnecting: 0, awaitingServer: 1, blocked: 0
+    });
+    const room = s.manager.rooms.get("test.md");
+    await s.manager.handle({
+      channel: "collab", type: "saved", path: "test.md", seq: room.sentSeq
+    });
+    expect(s.manager.saveState().awaitingServer).toBe(0);
+    room.blocked = true;
+    expect(s.manager.saveState().blocked).toBe(1);
+    s.manager.disconnected();
+    expect(s.manager.saveState().online).toBe(false);
+  });
   it("broadcasts a display-name change through identity frames without rejoining or changing Yjs history", async () => {
     const sent = [];
     let name = "Obsidian Native";

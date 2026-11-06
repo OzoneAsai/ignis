@@ -224,6 +224,11 @@ resize). The ribbon and command palette open collaborators and display-name
 editing independently of that floating control. Obsidian's custom status-bar
 API is desktop-only. Display name is stored locally in plugin settings and
 published via the existing `collab.identity` frame without a reconnection.
+The mobile ribbon's accessible label and collaborator dialog also report the
+most recent Sync status, including offline state and errors. File-journal
+manifest success is reported separately from any active Yjs document still
+awaiting a server persistence ACK. Neither an open WebSocket nor an HTTP 200
+alone is represented as a confirmed collaborative save.
 Existing old single-caret clients remain compatible,
 and document-generation mismatches discard cursor/presence notifications.
 Sync and Yjs now share generation identity; fileId

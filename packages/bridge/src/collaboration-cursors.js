@@ -1,117 +1,15 @@
 // Ephemeral cursor awareness. The serialized positions point into Y.Text, so
 // insertions/deletions can rebase the remote caret without absolute offsets.
-import * as Y from "yjs";
+import { resolveCursorSelections } from "./collab-cursor-protocol.js";
+import { visibleSelectionGlyphRects, MAX_GLYPH_FRAGMENTS } from "./selection-glyphs.js";
+export {
+  MAX_SHARED_SELECTIONS, encodeCursorSelection, encodeCursorSelections,
+  selectionEntries, resolveCursorSelection, resolveCursorSelections
+} from "./collab-cursor-protocol.js";
 import {
-  createOverlaySpace, cursorLabelTextColor, layoutCursorLabels,
+  createOverlaySpace, cursorLabelTextColor, cursorHighlightTint, layoutCursorLabels,
   visibleContentObstacles,
 } from "./cursor-label-layout.js";
-
-export const MAX_SHARED_SELECTIONS = 32;
-
-function encode(bytes) {
-  let value = "";
-
-  for (let i = 0; i < bytes.length; i += 8192) {
-    value += String.fromCharCode(...bytes.subarray(i, i + 8192));
-  }
-
-  return btoa(value);
-}
-
-function decode(value) {
-  if (typeof value !== "string" || value.length > 512) {
-    return null;
-  }
-
-  const raw = atob(value);
-  return Uint8Array.from(raw, (character) => character.charCodeAt(0));
-}
-
-export function encodeCursorSelection(text, anchor, head) {
-  const size = text.length;
-  const at = (index) => encode(Y.encodeRelativePosition(
-    Y.createRelativePositionFromTypeIndex(text, Math.max(0, Math.min(size, index))),
-  ));
-
-  return { anchor: at(anchor), head: at(head) };
-}
-
-export function encodeCursorSelections(text, ranges, mainIndex = 0) {
-  if (!Array.isArray(ranges) || ranges.length === 0 ||
-      ranges.length > MAX_SHARED_SELECTIONS ||
-      !Number.isSafeInteger(mainIndex) || mainIndex < 0 ||
-      mainIndex >= ranges.length) return null;
-  const selections = ranges.map(({ anchor, head }) =>
-    encodeCursorSelection(text, anchor, head));
-  if (selections.some(({ anchor, head }) =>
-    anchor.length > 512 || head.length > 512)) return null;
-  return { selections, mainIndex, ...selections[mainIndex] };
-}
-
-export function selectionEntries(peer) {
-  if (Array.isArray(peer?.selections)) {
-    if (peer.selections.length > MAX_SHARED_SELECTIONS) return [];
-    return peer.selections;
-  }
-  return peer?.anchor && peer?.head
-    ? [{ anchor: peer.anchor, head: peer.head }] : [];
-}
-
-export function resolveCursorSelections(text, peer) {
-  return selectionEntries(peer).map((entry) =>
-    resolveCursorSelection(text, entry));
-}
-
-export function resolveCursorSelection(text, peer) {
-  try {
-    const start = Y.createAbsolutePositionFromRelativePosition(
-      Y.decodeRelativePosition(decode(peer.anchor)), text.doc,
-    );
-    const end = Y.createAbsolutePositionFromRelativePosition(
-      Y.decodeRelativePosition(decode(peer.head)), text.doc,
-    );
-
-    if (!start || !end || start.type !== text || end.type !== text) {
-      return null;
-    }
-
-    return { anchor: start.index, head: end.index };
-  } catch {
-    return null;
-  }
-}
-
-function selectionRects(cm, space, start, end, budget) {
-  const rects = [];
-  const doc = cm.state.doc;
-  const visibleFrom = Math.max(start, cm.viewport?.from ?? 0);
-  const visibleTo = Math.min(end, cm.viewport?.to ?? doc.length);
-  let count = 0;
-
-  for (let position = visibleFrom;
-    position < visibleTo && count < Math.min(250, budget);) {
-    const line = doc.lineAt(position);
-    const lineEnd = Math.min(line.to, visibleTo);
-    const first = cm.coordsAtPos(position);
-    const last = cm.coordsAtPos(lineEnd);
-
-    if (first && last) {
-      const a = space.toLocal(first);
-      const b = space.toLocal(last);
-      rects.push({
-        left: a.left,
-        top: a.top,
-        height: Math.max(1, b.bottom - a.top),
-        width: Math.max(2, b.left - a.left),
-      });
-    }
-
-    position = Math.max(position + 1, lineEnd + 1);
-    count++;
-  }
-
-  return rects;
-}
 
 export function createCursorOverlay(session) {
   const cm = session.editor?.cm;
@@ -234,7 +132,7 @@ export function createCursorOverlay(session) {
     const caretBlockers = [];
     // Carets remain visible for every participant, while long overlapping
     // selections share a bounded DOM budget rather than freezing mobile.
-    let remainingMarks = 480;
+    let remainingMarks = MAX_GLYPH_FRAGMENTS;
     let highlightsLimited = false;
 
     for (const peer of peers) {
@@ -286,11 +184,13 @@ export function createCursorOverlay(session) {
 
       const from = Math.min(selection.anchor, selection.head);
       const to = Math.max(selection.anchor, selection.head);
-      const selectedInViewport = Math.max(from, cm.viewport?.from ?? 0) <
-        Math.min(to, cm.viewport?.to ?? cm.state.doc.length);
-      if (selectedInViewport && remainingMarks === 0) highlightsLimited = true;
-      const rects = selectionRects(cm, space, from, to, remainingMarks);
+      // Use DOM Range glyph fragments, not a rectangle spanning each line.
+      // This matches native CM6 Decoration.mark across soft-wrap, inline
+      // syntax, mixed text directions and partial line selections.
+      const measured = visibleSelectionGlyphRects(cm, space, from, to, remainingMarks);
+      const rects = measured.rects;
       remainingMarks -= rects.length;
+      highlightsLimited ||= measured.limited;
 
       for (let i = 0; i < rects.length; i++) {
         let mark = record.marks[i];
@@ -298,11 +198,13 @@ export function createCursorOverlay(session) {
         if (!mark) {
           mark = document.createElement("span");
           mark.className = "ignis-collab-remote-selection";
+          mark.dataset.collabPeer = peer.id;
+          mark.dataset.collabSelection = key;
           root.appendChild(mark);
           record.marks.push(mark);
         }
 
-        mark.style.setProperty("--ignis-peer-color", color);
+        mark.style.backgroundColor = cursorHighlightTint(color);
         const rect = rects[i];
         mark.style.left = `${rect.left}px`;
         mark.style.top = `${rect.top}px`;

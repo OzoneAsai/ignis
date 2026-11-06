@@ -44,7 +44,13 @@ function fixture({ optIn = true, localText = text, changes = journal } = {}) {
   };
   plugin.token = "ignis_dev_" + "a".repeat(43);
   plugin.status = { setText: vi.fn() };
-  plugin.live = { isManaged: vi.fn(() => false) };
+  plugin.live = {
+    isManaged: vi.fn(() => false),
+    saveState: vi.fn(() => ({
+      online: true, active: 0, awaitingServer: 0,
+      reconnecting: 0, blocked: 0
+    }))
+  };
   plugin.app = {
     workspace: { getLeavesOfType: () => [] },
     vault: {
@@ -75,6 +81,29 @@ describe("native Vault deletion requires explicit journal proof and opt-in", () 
     expect(plugin.app.vault.trash).toHaveBeenCalledWith(file, false);
     expect(plugin.settings.baselines).toEqual({});
     expect(plugin.settings.cursor).toBe(2);
+    expect(plugin.status.setText)
+      .toHaveBeenCalledWith("Ignis: Synced · server acknowledged");
+  });
+  it("does not label file-journal success a complete sync while Yjs is unacknowledged", async () => {
+    const { plugin } = fixture();
+    plugin.live.saveState = () => ({
+      online: true, active: 1, awaitingServer: 1,
+      reconnecting: 0, blocked: 0
+    });
+    await plugin.syncNow();
+    expect(plugin.settings.cursor).toBe(2);
+    expect(plugin.status.setText).toHaveBeenCalledWith(
+      "Ignis: Files synced · 1 collaborative notes await server save");
+  });
+  it("reports the live collaboration plane offline even when REST files synced", async () => {
+    const { plugin } = fixture();
+    plugin.live.saveState = () => ({
+      online: false, active: 1, awaitingServer: 0,
+      reconnecting: 1, blocked: 0
+    });
+    await plugin.syncNow();
+    expect(plugin.status.setText).toHaveBeenCalledWith(
+      "Ignis: Files synced · live collaboration offline");
   });
   it("keeps a locally modified file when the server deleted its baseline", async () => {
     const { plugin } = fixture({ localText: "new local content" });

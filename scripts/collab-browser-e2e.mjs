@@ -2,6 +2,8 @@
 // Usage: BASE_URL=http://127.0.0.1:3191 node scripts/collab-browser-e2e.mjs
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import * as esbuild from "esbuild";
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -288,6 +290,95 @@ try {
     })()`);
   }
   console.log("PASS: CSS transformed editor coordinates avoid text at 75% and 125%");
+
+  // A single logical selection may span multiple visual rows when the text
+  // wraps. Highlight the selected glyph fragments, never a tall rectangle
+  // from the first line's caret to the last line's caret.
+  const wrapText = "Wrap check: " +
+    "日本語 mixed-direction ABC arabic مرحبا and long text ".repeat(8);
+  await cdp.evaluate(a, `(() => {
+    const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.replaceRange(${JSON.stringify(wrapText + "\n")}, {line: 2, ch: 0});
+    return true;
+  })()`);
+  await poll(async () => (await read(b)).includes(wrapText), 15000);
+  await cdp.evaluate(b, `(() => {
+    const cm = window.app.workspace.activeLeaf.view.editor.cm;
+    cm.dom.style.width = '260px';
+    for (const line of cm.contentDOM.querySelectorAll('.cm-line')) {
+      line.style.whiteSpace = 'pre-wrap';
+      line.style.overflowWrap = 'anywhere';
+    }
+    return true;
+  })()`);
+  // Verify our actual bundled browser adapter against Chrome glyph geometry.
+  // Transport/presence are checked separately above and in the third-peer test.
+  const glyphSource = path.join(path.dirname(fileURLToPath(import.meta.url)),
+    '../packages/bridge/src/selection-glyphs.js');
+  const glyphBundle = await esbuild.build({
+    entryPoints:[glyphSource], bundle:true, write:false,
+    platform:'browser',format:'iife',globalName:'__ignisGlyphTest'
+  });
+  await cdp.evaluate(b, glyphBundle.outputFiles[0].text + ';true');
+  const glyphHighlights = await cdp.evaluate(b, `(() => {
+    const cm = window.app.workspace.activeLeaf.view.editor.cm;
+    const start = cm.state.doc.line(3).from + 2;
+    const end = start + 143;
+    const a = cm.domAtPos(start), b = cm.domAtPos(end);
+    const range = document.createRange();
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, b.offset);
+    const expected = [...range.getClientRects()].filter(r=>r.width>.25&&r.height>.5);
+    const space = {toLocal:r=>({left:r.left,top:r.top,right:r.right,bottom:r.bottom})};
+    const {rects,limited} = __ignisGlyphTest.visibleSelectionGlyphRects(
+      cm,space,start,end,480);
+    // A text node split by syntax/bidi markup may subdivide one DOM Range
+    // rect into multiple exact glyph fragments. Compare their union, not
+    // their fragment counts or one-to-one rectangle identities.
+    const union = (parts) => {
+      const rows = new Map();
+      for (const r of parts) {
+        const key = Math.round(r.top / 3);
+        if (!rows.has(key)) rows.set(key, []);
+        rows.get(key).push([r.left, r.left+r.width]);
+      }
+      return [...rows.entries()].sort((a,b)=>a[0]-b[0]).flatMap(([key,spans]) => {
+        spans.sort((a,b)=>a[0]-b[0]);
+        const merged = [];
+        for (const span of spans) {
+          const last = merged.at(-1);
+          if (last && span[0]<=last[1]+0.5) last[1]=Math.max(last[1],span[1]);
+          else merged.push([...span]);
+        }
+        return merged.map(([from,to])=>[key,from,to]);
+      });
+    };
+    const actualUnion = union(rects);
+    const expectedUnion = union(expected);
+    const same = actualUnion.length===expectedUnion.length &&
+      actualUnion.every((item,i)=>item.every((v,k)=>
+        Math.abs(v-expectedUnion[i][k])<2));
+    return {
+      ok: !limited && rects.length>=2 &&
+        new Set(rects.map(r=>Math.round(r.top/5))).size>=2 && same,
+      expected:expected.length, actual:rects.length,
+      rows:new Set(rects.map(r=>Math.round(r.top/5))).size,
+      samples:rects.slice(0,4), actualUnion, expectedUnion
+    };
+  })()`);
+  if (!glyphHighlights.ok) throw new Error(
+    'Wrapped multilingual glyph geometry mismatch: '+JSON.stringify(glyphHighlights));
+  await cdp.evaluate(b, `(() => {
+    const cm = window.app.workspace.activeLeaf.view.editor.cm;
+    cm.dom.style.width = '';
+    for (const line of cm.contentDOM.querySelectorAll('.cm-line')) {
+      line.style.whiteSpace = '';
+      line.style.overflowWrap = '';
+    }
+    return true;
+  })()`);
+  console.log("PASS: WebUI computes exact wrapped multilingual glyph fragments:",
+    JSON.stringify({fragments:glyphHighlights.actual,rows:glyphHighlights.rows}));
 
   // A third online collaborator publishes three independent Yjs-relative
   // selections. WebUI must draw all three, keep the other editor in its

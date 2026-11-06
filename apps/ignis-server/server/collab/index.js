@@ -10,10 +10,11 @@ const CHANNEL = "collab";
 const MAX_UPDATE_BYTES = 1024 * 1024;
 const MAX_NOTE_BYTES = 4 * 1024 * 1024;
 const SAVE_DELAY_MS = 120;
-const MAX_CURSOR_BYTES = 512;
+const CURSOR_LIMITS = require("../../../../packages/server-core/src/collab-cursor-limits.json");
+const MAX_CURSOR_BYTES = CURSOR_LIMITS.maxEncodedCursorChars;
 // Bound per-message work and WebSocket payload size. If an editor exceeds
 // this limit it receives an explicit error; no selection is silently dropped.
-const MAX_SELECTIONS = 32;
+const MAX_SELECTIONS = CURSOR_LIMITS.maxSelections;
 const DOCUMENT_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const CURSOR_COLORS = [
   "#ee6b72", "#59baf2", "#e3ad54", "#ac8cf2",
@@ -713,11 +714,17 @@ function createCollaborationManager({
     if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return null;
     const bytes = Buffer.from(encoded, "base64");
 
-    if (!bytes.length || bytes.length > MAX_CURSOR_BYTES) {
+    if (!bytes.length ||
+        bytes.length > CURSOR_LIMITS.maxDecodedCursorBytes ||
+        bytes.toString("base64") !== encoded) {
       return null;
     }
 
     const relative = Y.decodeRelativePosition(bytes);
+    // The native and browser adapters require the same canonical Yjs wire
+    // representation. Never broadcast a cursor only one client can decode.
+    const canonical = Y.encodeRelativePosition(relative);
+    if (!Buffer.from(canonical).equals(bytes)) return null;
     const absolute = Y.createAbsolutePositionFromRelativePosition(relative, room.doc);
     return absolute && absolute.type === room.text ? encoded : null;
   }
