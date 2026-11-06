@@ -74,17 +74,61 @@ vi.mock("obsidian", () => {
     addButton(fn) { fn(new Button(this.el)); return this; }
     addToggle(fn) { fn(new Toggle()); return this; }
   }
+  class MockModal {
+    constructor() { this.contentEl = document.createElement("div"); }
+    open() { this.onOpen(); }
+    close() { this.closed = true; }
+  }
+  class MockPlugin {
+    constructor() {
+      this.app = {
+        vault: { on: () => ({}) },
+        workspace: {
+          on: () => ({}), getActiveFile: () => null
+        }
+      };
+      this.manifest = { id: "ignis-connector" };
+      this.commands = [];
+      this.ribbon = [];
+      this.statusBarCalls = 0;
+    }
+    async loadData() { return null; }
+    registerEditorExtension() {}
+    addSettingTab() {}
+    registerObsidianProtocolHandler() {}
+    registerEvent() {}
+    addRibbonIcon(icon, title, callback) {
+      this.ribbon.push({icon, title, callback});
+      return document.createElement("button");
+    }
+    addCommand(command) { this.commands.push(command); return command; }
+    addStatusBarItem() {
+      this.statusBarCalls++;
+      return document.createElement("span");
+    }
+    registerInterval(id) { clearInterval(id); }
+    registerDomEvent() {}
+  }
   return {
-    Plugin: class {},
+    Plugin: MockPlugin,
     PluginSettingTab: class {
       constructor() { this.containerEl = document.createElement("div"); }
     },
-    Setting, Modal: class {}, Notice: class {}, TFile: class {},
+    Setting, Modal: MockModal, Notice: class {}, TFile: class {},
+    Platform: { isMobile: true },
     editorInfoField: null, requestUrl: vi.fn()
   };
 });
-vi.mock("./live", () => ({ NativeYjs: class {} }));
-import { ConnectorSettings } from "./main.ts";
+vi.mock("./live", () => ({
+  NativeYjs: class {
+    extension() { return []; }
+    participants() { return []; }
+    updateDisplayName() {}
+  }
+}));
+import IgnisConnector, {
+  ConnectorSettings, DisplayNameModal, CollaboratorsModal
+} from "./main.ts";
 
 const validToken = "ignis_dev_" + "a".repeat(43);
 const flush = async () => {
@@ -96,9 +140,12 @@ function setup() {
   const plugin = {
     settings: {
       serverUrl: "https://mac.example:8451",
-      vaultId: "",
+      vaultId: "", displayName: "",
       deviceId: ""
     },
+    getDisplayName: () => "Obsidian Native",
+    openDisplayName: vi.fn(),
+    currentParticipants: () => ({path: "demo.md", peers: []}),
     takeIncomingLink: () => "",
     connectionSummary: () => ({ ready: false, vaultId: "", deviceId: "" }),
     connectToServer: vi.fn(),
@@ -120,6 +167,76 @@ function setup() {
 }
 
 describe("native Obsidian one-button onboarding UI", () => {
+  it("registers an iOS ribbon entry and commands without relying on unsupported status bar", async () => {
+    const plugin = new IgnisConnector();
+    await plugin.onload();
+    expect(plugin.statusBarCalls).toBe(0);
+    expect(plugin.ribbon).toHaveLength(1);
+    expect(plugin.ribbon[0].icon).toBe("users");
+    expect(plugin.commands.map(x => x.id)).toContain("show-collaborators");
+    expect(plugin.commands.map(x => x.id)).toContain("change-display-name");
+    plugin.commands.find(x => x.id === "change-display-name").callback();
+    // Obsidian's modal is available even when no collaborative note is open.
+    expect(plugin.getDisplayName()).toMatch(/^Obsidian /);
+  });
+  it("keeps a mobile-accessible display-name entry above connection setup", () => {
+    const { plugin, containerEl } = setup();
+    expect(containerEl.firstElementChild.textContent).toContain("Your display name");
+    const button = [...containerEl.querySelectorAll("button")]
+      .find(el => el.textContent === "Change name");
+    expect(button).not.toBeNull();
+    button.click();
+    expect(plugin.openDisplayName).toHaveBeenCalledTimes(1);
+  });
+
+  it("edits a name in a standalone touch-friendly modal and saves only on request", async () => {
+    const { plugin } = setup();
+    plugin.setDisplayName = vi.fn(async () => {});
+    const modal = new DisplayNameModal({}, plugin);
+    modal.open();
+    const input = modal.contentEl.querySelector("input");
+    expect(input.maxLength).toBe(40);
+    expect(input.getAttribute("aria-label")).toBe("Your Ignis display name");
+    input.value = "Yui";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(plugin.setDisplayName).not.toHaveBeenCalled();
+    const save = [...modal.contentEl.querySelectorAll("button")]
+      .find(element => element.textContent === "Save name");
+    save.click();
+    await flush();
+    expect(plugin.setDisplayName).toHaveBeenCalledWith("Yui");
+    expect(modal.closed).toBe(true);
+  });
+
+  it("provides a collaborators modal with an always-available name editor", () => {
+    const { plugin } = setup();
+    plugin.currentParticipants = () => ({ path: "demo.md", peers: [
+      { id: "peer-a", name: "Alice", color: "#59baf2" }
+    ] });
+    plugin.jumpToParticipant = vi.fn(() => true);
+    const modal = new CollaboratorsModal({}, plugin);
+    modal.open();
+    const change = [...modal.contentEl.querySelectorAll("button")]
+      .find(element => element.textContent === "Change name");
+    change.click();
+    expect(plugin.openDisplayName).toHaveBeenCalledOnce();
+    expect(modal.closed).toBe(true);
+  });
+
+  it("persists sanitized names and broadcasts a live identity without reconnecting", async () => {
+    const plugin = new IgnisConnector();
+    plugin.settings = { displayName: "", deviceId: "abc123456" };
+    plugin.persistSettings = vi.fn(async () => {});
+    plugin.live = { updateDisplayName: vi.fn() };
+    expect(plugin.getDisplayName()).toBe("Obsidian abc123");
+    await plugin.setDisplayName("  Yui\u202e 👋  ");
+    expect(plugin.settings.displayName).toBe("Yui 👋");
+    expect(plugin.getDisplayName()).toBe("Yui 👋");
+    expect(plugin.persistSettings).toHaveBeenCalledOnce();
+    expect(plugin.live.updateDisplayName).toHaveBeenCalledOnce();
+    await plugin.setDisplayName("Yui 👋");
+    expect(plugin.persistSettings).toHaveBeenCalledOnce();
+  });
   it("accepts a single pasted invite without requiring token or Vault typing", async () => {
     const { plugin, inputs, type, connect, sync } = setup();
     type(inputs[0], "https://mac.example:8451/join/IOSLab");

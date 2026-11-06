@@ -62,6 +62,35 @@ afterEach(async () => {
 });
 
 describe("Native Obsidian offline Yjs bridge", () => {
+  it("broadcasts a display-name change through identity frames without rejoining or changing Yjs history", async () => {
+    const sent = [];
+    let name = "Obsidian Native";
+    const manager = new NativeYjs({
+      vaultId: () => "lab",
+      origin: () => "https://example.test/" + crypto.randomUUID(),
+      pathForView: () => "test.md",
+      knownId: () => null,
+      rememberId: async () => {},
+      displayName: () => name,
+      send: frame => sent.push(frame),
+      notify: () => {}
+    });
+    const view = makeView("test.md", "Initial");
+    manager.observe(view.view);
+    testInstances.push(manager);
+    manager.connected();
+    await manager.handle(serverInit("test.md", ID, "Initial"));
+    const oldDoc = manager.rooms.get("test.md").doc;
+    const joinCount = sent.filter(x => x.type === "join").length;
+    name = "Yui 👋";
+    manager.updateDisplayName();
+    expect(sent.at(-1)).toMatchObject({
+      channel: "collab", type: "identity", path: "test.md",
+      documentId: ID, name: "Yui 👋"
+    });
+    expect(sent.filter(x => x.type === "join")).toHaveLength(joinCount);
+    expect(manager.rooms.get("test.md").doc).toBe(oldDoc);
+  });
   it("joins with the server identity, sends full state and local operations", async () => {
     const s = harness();
     s.manager.connected();
