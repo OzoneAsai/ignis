@@ -209,14 +209,22 @@ The deferred IME update queue is capped at 4 MiB: exceeding that limit
 blocks the room and preserves the native draft rather than exhausting
 mobile WebView memory or applying a partial remote history.
 
-The native CodeMirror 6 binding now has the same multi-caret remote-selection
-overlay and accessible per-note participant roster as Ignis WebUI. Both clients
+The native CodeMirror 6 binding has glyph-accurate remote selection marks,
+multi-caret presence, and a per-note participant roster. Both clients
 use the same `collab` WebSocket channel: each online participant advertises
 up to 32 Yjs-relative selections in one message, and the participant list
 includes off-screen positions and people without an active caret. A collapsed
 roster can jump to the selected peer's primary caret without changing the
-local selection; highlight rectangles have a shared 480-per-frame budget
-for mobile performance. Existing old single-caret clients remain compatible,
+local selection. Native Obsidian uses CodeMirror's `Decoration.mark` to
+highlight selected text through wrapping, Japanese glyphs and embedded
+syntax; 480 logical selection marks are the shared budget, instead of
+480 approximate rectangular overlays. On iOS the participant button is a
+44px touch target near the bottom of the visual viewport (and follows keyboard
+resize). The ribbon and command palette open collaborators and display-name
+editing independently of that floating control. Obsidian's custom status-bar
+API is desktop-only. Display name is stored locally in plugin settings and
+published via the existing `collab.identity` frame without a reconnection.
+Existing old single-caret clients remain compatible,
 and document-generation mismatches discard cursor/presence notifications.
 Sync and Yjs now share generation identity; fileId
 remains the stable entity ID across moves. An actively joined collaborative

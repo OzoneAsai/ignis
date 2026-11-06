@@ -7,6 +7,7 @@ import { EditorState, EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { NativeYjs, encodeYjs, decodeYjs } from "./live.ts";
+import { remoteSelectionField } from "./selection-decorations.ts";
 
 globalThis.ResizeObserver ||= class {
   observe() {}
@@ -255,6 +256,31 @@ describe("real CodeMirror 6 native binding", () => {
       path: "test.md", documentId: ID, id: "other",
       selections: [], anchor: null, head: null, mainIndex: 0 });
     expect(room.peers.get("other").selections).toEqual([]);
+    server.destroy();
+  });
+  it("projects remote Yjs positions into native CM6 marks and removes them on away", async () => {
+    const { manager, editor, server } = await mount();
+    const room = manager.rooms.get("test.md");
+    await manager.handle({channel:"collab", type:"presence",
+      path:"test.md", documentId:ID,
+      people:[{id:"peer", name:"Alice", color:"#59baf2", selections:[]}]
+    });
+    const from = 1, to = 5;
+    const selections = (await import("./presence.ts")).encodeSelection(room.text, from, to);
+    await manager.handle({channel:"collab", type:"cursor", path:"test.md",
+      documentId:ID, id:"peer", selections:[selections], mainIndex:0});
+    await tick();
+    const positions = [];
+    editor.state.field(remoteSelectionField).between(0,editor.state.doc.length,
+      (a,b)=>positions.push([a,b]));
+    expect(positions).toEqual([[from,to]]);
+    expect(editor.dom.querySelector(".ignis-native-remote-highlight")?.textContent)
+      .toBe("niti");
+    expect(editor.dom.querySelector(".ignis-native-remote-selection")).toBeNull();
+    await manager.handle({channel:"collab", type:"cursor", path:"test.md",
+      documentId:ID, id:"peer", selections:[], anchor:null, head:null,mainIndex:0});
+    await tick();
+    expect(editor.dom.querySelector(".ignis-native-remote-highlight")).toBeNull();
     server.destroy();
   });
 

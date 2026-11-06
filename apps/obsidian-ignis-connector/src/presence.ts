@@ -7,6 +7,10 @@ import {
   "../../../packages/bridge/src/cursor-label-layout.js";
 import type { LabelItem, LabelPlacement, LabelRect } from
   "../../../packages/bridge/src/cursor-label-layout.js";
+import {
+  MAX_REMOTE_MARKS, remoteSelectionField, replaceRemoteMarks,
+  type RemoteMark
+} from "./selection-decorations";
 
 // Ignis's /ws collab channel already carries ephemeral presence and Yjs
 // relative positions. Native Obsidian uses that same protocol; Yjs Awareness
@@ -160,7 +164,7 @@ export class CursorOverlay {
   private readonly rosterList: HTMLDivElement;
   private rosterFingerprint = "";
   private readonly nodes = new Map<string, {
-    caret: HTMLDivElement; label: HTMLSpanElement; marks: HTMLSpanElement[];
+    caret: HTMLDivElement; label: HTMLSpanElement;
   }>();
   private readonly lastBadgePositions = new Map<string, LabelPlacement>();
   private peers: Peer[] = [];
@@ -169,8 +173,15 @@ export class CursorOverlay {
   private readonly originalPosition: string;
   private readonly scroll = () => this.schedule();
   private readonly contentMutation: MutationObserver | null;
+  private readonly mobileViewportChange = () => {
+    this.positionMobileRoster();
+    this.schedule();
+  };
+  private highlightFingerprint = "";
+  private highlightEpoch = 0;
+  private highlightsLimited = false;
 
-  constructor(private readonly view: EditorView) {
+  constructor(private readonly view: EditorView, private readonly mobile = false) {
     this.root = document.createElement("div");
     this.root.className = "ignis-native-cursors";
     this.root.setAttribute("aria-hidden", "true");
@@ -186,7 +197,10 @@ export class CursorOverlay {
     this.roster = document.createElement("details");
     this.roster.className = "ignis-native-people-roster";
     Object.assign(this.roster.style, {
-      position: "absolute", top: "5px", right: "6px",
+      position: mobile ? "fixed" : "absolute",
+      top: mobile ? "auto" : "5px",
+      right: mobile ? "auto" : "6px",
+      left: mobile ? "max(12px, env(safe-area-inset-left, 0px))" : "auto",
       maxWidth: "min(65vw, 250px)", maxHeight: "42vh",
       overflow: "auto", zIndex: "9", pointerEvents: "auto",
       background: "var(--background-primary, #202127)",
@@ -196,14 +210,45 @@ export class CursorOverlay {
     });
     this.rosterTitle = document.createElement("summary");
     this.rosterTitle.style.cursor = "pointer";
+    this.rosterTitle.setAttribute("aria-label", "Open Ignis collaborators");
+    if (mobile) {
+      Object.assign(this.roster.style, {
+        zIndex: "1000", overflow: "visible", padding: "0",
+        borderRadius: "12px", boxShadow: "0 3px 18px #0006"
+      });
+      Object.assign(this.rosterTitle.style, {
+        display: "flex", alignItems: "center", minHeight: "44px",
+        padding: "0 14px", fontSize: "13px", fontWeight: "600",
+        touchAction: "manipulation", whiteSpace: "nowrap"
+      });
+    }
     this.roster.appendChild(this.rosterTitle);
     this.rosterList = document.createElement("div");
     this.rosterList.style.maxHeight = "35vh";
     this.rosterList.style.overflowY = "auto";
+    if (mobile) {
+      Object.assign(this.rosterList.style, {
+        position: "absolute", bottom: "calc(100% + 8px)", left: "0",
+        minWidth: "min(78vw, 240px)", maxWidth: "min(86vw, 300px)",
+        padding: "8px", borderRadius: "10px",
+        background: "var(--background-primary, #202127)",
+        boxShadow: "0 4px 18px #0006"
+      });
+    }
     this.roster.appendChild(this.rosterList);
-    view.dom.appendChild(this.roster);
+    // CM6's scrolling editor can clip the old top-right popup on iOS.
+    // A mobile floating action lives in the visual viewport, not the editor.
+    if (mobile) {
+      document.body.appendChild(this.roster);
+      this.positionMobileRoster();
+      window.visualViewport?.addEventListener("resize", this.mobileViewportChange);
+      window.visualViewport?.addEventListener("scroll", this.mobileViewportChange);
+    } else {
+      view.dom.appendChild(this.roster);
+    }
     view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
     window.addEventListener("resize", this.scroll);
+    if (mobile) window.addEventListener("resize", this.mobileViewportChange);
     this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM
       ? new MutationObserver(this.scroll) : null;
     this.contentMutation?.observe(view.contentDOM, {
@@ -213,9 +258,24 @@ export class CursorOverlay {
     document.fonts?.addEventListener?.("loadingdone", this.scroll);
   }
 
+  private positionMobileRoster() {
+    if (!this.mobile) return;
+    const viewport = window.visualViewport;
+    const height = viewport?.height ?? window.innerHeight;
+    // Keep the 44px touch target ABOVE Obsidian's mobile toolbar and the
+    // software keyboard, even when iOS changes the visual viewport without
+    // changing window.innerHeight.
+    const y = (viewport?.offsetTop ?? 0) + height - 104;
+    this.roster.style.top = Math.max(12, Math.min(
+      window.innerHeight - 56, y
+    )) + "px";
+    this.rosterList.style.maxHeight = Math.max(88, height - 180) + "px";
+  }
+
   set(text: Y.Text | null, peers: Peer[]) {
     this.text = text;
     this.peers = peers;
+    this.syncHighlights();
     this.updateRoster();
     if (!text || peers.length === 0) {
       this.clear();
@@ -228,6 +288,7 @@ export class CursorOverlay {
     this.roster.hidden = this.peers.length === 0;
     this.rosterTitle.textContent = this.peers.length + " other editor" +
       (this.peers.length === 1 ? "" : "s") + " · show locations";
+    this.rosterTitle.setAttribute("aria-label", this.rosterTitle.textContent);
     const fingerprint = this.peers.map(peer =>
       [peer.id, peer.name, peer.color].join(":")).join("|");
     if (fingerprint === this.rosterFingerprint) return;
@@ -245,7 +306,8 @@ export class CursorOverlay {
         color: "var(--text-normal, #fff)",
         background: "transparent", border: "0",
         borderLeft: "3px solid " + peer.color,
-        padding: "4px", cursor: "pointer"
+        padding: this.mobile ? "12px 8px" : "4px",
+        minHeight: this.mobile ? "44px" : "auto", cursor: "pointer"
       });
       button.addEventListener("click", () => {
         const current = this.peers.find(entry => entry.id === peer.id);
@@ -267,7 +329,6 @@ export class CursorOverlay {
     const record = this.nodes.get(id);
     if (!record) return;
     record.caret.remove();
-    for (const mark of record.marks) mark.remove();
     this.nodes.delete(id);
     this.lastBadgePositions.delete(id);
   }
@@ -276,6 +337,47 @@ export class CursorOverlay {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
     for (const id of [...this.nodes.keys()]) this.discard(id);
+    this.publishHighlights([]);
+  }
+
+  private publishHighlights(marks: RemoteMark[]) {
+    const fingerprint = JSON.stringify(marks);
+    if (fingerprint === this.highlightFingerprint) return;
+    this.highlightFingerprint = fingerprint;
+    const epoch = ++this.highlightEpoch;
+    // Never dispatch a CM6 transaction while its ViewPlugin is updating.
+    queueMicrotask(() => {
+      if (epoch !== this.highlightEpoch || !this.view.dom.isConnected ||
+          !this.view.dispatch || !this.view.state?.field) return;
+      try {
+        if (this.view.state.field(remoteSelectionField, false) === undefined) return;
+        this.view.dispatch({ effects: replaceRemoteMarks.of(marks) });
+      } catch {
+        // An editor can close between scheduling and the next microtask.
+      }
+    });
+  }
+
+  private syncHighlights() {
+    const marks: RemoteMark[] = [];
+    this.highlightsLimited = false;
+    if (this.text) {
+      const length = this.view.state.doc.length;
+      for (const peer of this.peers) {
+        for (const selection of resolveSelections(this.text, peer)) {
+          if (!selection) continue;
+          const from = Math.max(0, Math.min(length, selection.anchor, selection.head));
+          const to = Math.min(length, Math.max(selection.anchor, selection.head));
+          if (from >= to) continue;
+          if (marks.length < MAX_REMOTE_MARKS) {
+            marks.push({ from, to, color: peer.color });
+          } else {
+            this.highlightsLimited = true;
+          }
+        }
+      }
+    }
+    this.publishHighlights(marks);
   }
 
   private schedule() {
@@ -303,10 +405,6 @@ export class CursorOverlay {
     const visible = new Set<string>();
     const badgeItems: (LabelItem & { label: HTMLSpanElement })[] = [];
     const caretBlockers: LabelRect[] = [];
-    // A single bounded highlight budget protects iOS when many participants
-    // select long documents. All cursors and roster entries still render.
-    let remainingMarks = 480;
-    let highlightsLimited = false;
     for (const peer of this.peers) {
       const selections = resolveSelections(this.text, peer);
       const mainIndex = Number.isSafeInteger(peer.mainIndex) &&
@@ -337,7 +435,7 @@ export class CursorOverlay {
         });
         caret.appendChild(label);
         this.root.appendChild(caret);
-        record = { caret, label, marks: [] };
+        record = { caret, label };
         this.nodes.set(key, record);
       }
       record.label.textContent = peer.name;
@@ -366,51 +464,6 @@ export class CursorOverlay {
             height: measured.height / space.scaleY, label: record.label });
         }
       }
-      const from = Math.max(0, Math.min(selection.anchor, selection.head));
-      const to = Math.min(this.view.state.doc.length,
-        Math.max(selection.anchor, selection.head));
-      const marks: { left: number; top: number; width: number; height: number }[] = [];
-      // Visible lines only, bounded to protect large selections on mobile.
-      const viewport = this.view.viewport;
-      let position = Math.max(from, viewport.from);
-      const end = Math.min(to, viewport.to);
-      if (position < end && remainingMarks === 0) highlightsLimited = true;
-      while (position < end &&
-        marks.length < Math.min(120, remainingMarks)) {
-        const line = this.view.state.doc.lineAt(position);
-        const stop = Math.min(end, line.to);
-        const a = this.view.coordsAtPos(position);
-        const b = this.view.coordsAtPos(stop);
-        if (a && b) {
-          const first = space.toLocal(a);
-          const last = space.toLocal(b);
-          marks.push({
-            left: first.left,
-            top: first.top,
-            width: Math.max(2, last.left - first.left),
-            height: Math.max(1, last.bottom - first.top)
-          });
-        }
-        position = Math.max(position + 1, stop + 1);
-      }
-      remainingMarks -= marks.length;
-      for (let i = 0; i < marks.length; i++) {
-        let mark = record.marks[i];
-        if (!mark) {
-          mark = document.createElement("span");
-          mark.className = "ignis-native-remote-selection";
-          Object.assign(mark.style, { position: "absolute", pointerEvents: "none",
-            opacity: "0.22" });
-          this.root.appendChild(mark);
-          record.marks.push(mark);
-        }
-        Object.assign(mark.style, {
-          backgroundColor: peer.color, left: marks[i].left + "px",
-          top: marks[i].top + "px", width: marks[i].width + "px",
-          height: marks[i].height + "px"
-        });
-      }
-      while (record.marks.length > marks.length) record.marks.pop()!.remove();
       }
     }
     for (const id of [...this.nodes.keys()]) {
@@ -434,7 +487,8 @@ export class CursorOverlay {
     }
     this.rosterTitle.textContent = this.peers.length + " other editor" +
       (this.peers.length === 1 ? "" : "s") +
-      (highlightsLimited ? " · highlights limited" : " · show locations");
+      (this.highlightsLimited ? " · highlights limited" : " · show locations");
+    this.rosterTitle.setAttribute("aria-label", this.rosterTitle.textContent);
   }
 
   destroy() {
@@ -443,6 +497,11 @@ export class CursorOverlay {
     window.removeEventListener("resize", this.scroll);
     this.contentMutation?.disconnect();
     document.fonts?.removeEventListener?.("loadingdone", this.scroll);
+    if (this.mobile) {
+      window.visualViewport?.removeEventListener("resize", this.mobileViewportChange);
+      window.visualViewport?.removeEventListener("scroll", this.mobileViewportChange);
+      window.removeEventListener("resize", this.mobileViewportChange);
+    }
     this.root.remove();
     this.roster.remove();
     this.view.dom.style.position = this.originalPosition;

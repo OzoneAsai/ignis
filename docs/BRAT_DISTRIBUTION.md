@@ -36,6 +36,22 @@ not list a beta release, check the Releases page before retrying.
 Obsidian and BRAT have their own minimum-app-version requirements; update
 Obsidian if the installed BRAT version is incompatible.
 
+## iPhone / iPad collaborator controls (beta.5+)
+
+When a note has other active editors, the compact **N other editors** button
+appears near the bottom of the screen, above the mobile toolbar or keyboard.
+Tap it to navigate to a collaborator's cursor. The same collaborator list is
+available from **Ignis collaborators and display name** in the mobile ribbon
+menu (bottom-right menu icon) or through the **Show collaborators and display
+name** command in Obsidian's command palette. Mobile does not support
+third-party status-bar items.
+
+To rename yourself, open **Ignis Connector → Your display name → Change name**,
+or run **Change my Ignis display name** from the command palette. Saving
+updates other online editors without reconnecting or restarting your Vault.
+Selected text from remote editors uses CodeMirror mark decorations instead
+of rectangular overlays; long wrapped lines and Japanese text are supported.
+
 ## Manual installation
 
 Download `main.js` and `manifest.json` from the **same** Ignis Connector
