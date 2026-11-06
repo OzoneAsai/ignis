@@ -39,6 +39,12 @@ function isIgnoredPath(p) {
     return false;
   }
 
+  // A CRDT snapshot is atomically projected into the vault via a short-lived
+  // private file. Never surface that internal write transaction as a note.
+  if (path.basename(rel).startsWith(".ignis-collab-tmp-")) {
+    return true;
+  }
+
   try {
     return ignoreList.ignores(rel);
   } catch {

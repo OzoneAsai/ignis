@@ -131,3 +131,49 @@ describe("closeVaultSockets", () => {
     await freshClosed;
   });
 });
+
+describe("Tailnet WebSocket authorization", () => {
+  it("permits a verified Vault principal to collaborate before native Sync journal registration", async () => {
+    const temp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "ws-tailnet-test-"));
+    await fs.promises.mkdir(path.join(temp, "lab"));
+    const server = http.createServer();
+    const wss = setupWebSocket(server, {
+      getVaultPath: (vaultId) => vaultId === "lab" ? path.join(temp, "lab") : null,
+      authorizeConnection: (req, vaultId) =>
+        req.headers["x-test-principal"] === "allow" && vaultId === "lab"
+          ? { login: "member@example.test", deviceId: "verified-device" } : false,
+    });
+    wss.channel("probe").on("check", (_msg, ws) => {
+      ws.send(JSON.stringify({ channel: "probe", type: "result",
+        authorized: ws.ignisSyncAuthorized === true,
+        login: ws.ignisTailnetLogin, device: ws.ignisTailnetDevice }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `ws://127.0.0.1:${server.address().port}/ws?vault=lab`;
+    try {
+      const ws = new WebSocket(url, { headers: { "X-Test-Principal": "allow" } });
+      await new Promise((resolve, reject) => {
+        ws.once("open", resolve);
+        ws.once("error", reject);
+      });
+      const result = new Promise((resolve) => {
+        ws.once("message", (raw) => resolve(JSON.parse(raw.toString())));
+      });
+      ws.send(JSON.stringify({ channel: "probe", type: "check" }));
+      expect(await result).toEqual({ channel: "probe", type: "result",
+        authorized: true, login: "member@example.test", device: "verified-device" });
+      const close = new Promise((resolve) => ws.once("close", resolve));
+      ws.close();
+      await close;
+
+      const denied = new WebSocket(url);
+      const deniedCode = new Promise((resolve) => denied.once("close", resolve));
+      expect(await deniedCode).toBe(4003);
+    } finally {
+      wss.close();
+      await new Promise((resolve) => server.close(resolve));
+      await watcher._reset();
+      await fs.promises.rm(temp, { recursive: true, force: true });
+    }
+  });
+});

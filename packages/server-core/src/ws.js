@@ -24,7 +24,7 @@ function heartbeatSweep(clients) {
 }
 
 function setupWebSocket(server, opts = {}) {
-  const { getVaultPath, originAllowlist } = opts;
+  const { getVaultPath, originAllowlist, filterFileEvent, authorizeConnection } = opts;
 
   if (typeof getVaultPath !== "function") {
     throw new Error("setupWebSocket: opts.getVaultPath is required");
@@ -151,7 +151,28 @@ function setupWebSocket(server, opts = {}) {
       return;
     }
 
+    // A gateway may explicitly mark an entire connection as Tailnet-only.
+    // Reject it BEFORE registering file watchers, broadcasts or CRDT handlers.
+    if (typeof authorizeConnection === "function") {
+      const principal = authorizeConnection(req, vaultId);
+      if (principal === false) {
+        ws.close(4003, "Tailnet identity not authorized");
+        return;
+      }
+      if (principal && typeof principal === "object") {
+        ws.ignisTailnetLogin = principal.login;
+        ws.ignisTailnetDevice = principal.deviceId;
+        // authorizeConnection has already validated the revocable, Vault-scoped
+        // Tailnet principal. Browser collaboration can therefore join without
+        // the native Connector's separate Sync journal registration frame.
+        // Native clients still send sync.auth to enable journal resume.
+        ws.ignisSyncAuthorized = true;
+      }
+    }
+
     const vaultPath = getVaultPath(vaultId);
+    // Trusted vault association for channel handlers; never trust a message-supplied vault.
+    ws.ignisVaultId = vaultId;
     console.log(`[ws] Client connected to vault: ${vaultId}`);
 
     // isAlive is reset by each pong; the heartbeat sweep terminates sockets that miss one.
@@ -171,7 +192,7 @@ function setupWebSocket(server, opts = {}) {
 
     // Per-client listener that forwards file events over WebSocket
     const listener = (event) => {
-      if (ws.readyState === ws.OPEN) {
+      if (ws.readyState === ws.OPEN && filterFileEvent?.(vaultId, event) !== false) {
         ws.send(JSON.stringify(event));
       }
     };

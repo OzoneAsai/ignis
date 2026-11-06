@@ -347,3 +347,98 @@
   font-size: var(--font-ui-smaller);
   padding: var(--size-4-3) 0;
 }
+.ignis-collab-cursors {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 45;
+}
+
+.ignis-collab-people-roster {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  z-index: 46;
+  max-width: min(240px, 65%);
+  max-height: 42%;
+  overflow: auto;
+  padding: 3px 6px;
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+.ignis-collab-people-roster summary {
+  cursor: pointer;
+}
+
+.ignis-collab-people-roster-list {
+  max-height: 34vh;
+  overflow-y: auto;
+}
+
+.ignis-collab-people-jump {
+  display: block;
+  width: 100%;
+  padding: 4px;
+  text-align: left;
+  border: 0;
+  border-left: 3px solid;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.ignis-collab-remote-caret {
+  position: absolute;
+  width: 0;
+  border-left: 2px solid var(--ignis-peer-color);
+  pointer-events: none;
+}
+
+.ignis-collab-remote-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  padding: 1px 5px;
+  border-radius: 4px 4px 4px 0;
+  background: var(--ignis-peer-color);
+  color: var(--ignis-peer-text, #141414);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  line-height: 16px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ignis-collab-remote-selection {
+  position: absolute;
+  background: var(--ignis-peer-color);
+  opacity: 0.24;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.ignis-collaboration-status {
+  cursor: pointer;
+}
+
+.ignis-collab-person {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+
+.ignis-collab-person-color {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 11px;
+  border-radius: 50%;
+  background: var(--ignis-peer-color);
+}
