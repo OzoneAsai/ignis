@@ -7,6 +7,17 @@ name: Publish Ignis Connector BRAT beta
     paths:
       - ".github/workflows/ignis-connector-brat.yml"
       - "apps/obsidian-ignis-connector/manifest.json"
+  pull_request:
+    branches:
+      - brat-preview
+    paths:
+      - ".github/workflows/ignis-connector-brat.yml"
+      - "apps/obsidian-ignis-connector/**"
+      - "apps/ignis-server/server/sync/**"
+      - "packages/sync-policy/**"
+      - "packages/bridge/src/**"
+      - "release/brat/**"
+      - "package-lock.json"
 
 permissions:
   contents: write
@@ -48,6 +59,7 @@ jobs:
         run: node scripts/validate-brat-release.mjs
 
       - name: Publish immutable GitHub prerelease with BRAT assets
+        if: github.event_name == 'push' && github.ref == 'refs/heads/brat-preview'
         uses: actions/github-script@v7
         with:
           script: |
