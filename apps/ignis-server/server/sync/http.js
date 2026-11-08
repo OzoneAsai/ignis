@@ -3,6 +3,9 @@
 const crypto = require("node:crypto");
 const express = require("express");
 const { tailnetPrincipal, authorizedVaults } = require("./tailnet-auth");
+const {
+  normalizeMediaBypassExtensions,
+} = require("../../../../packages/sync-policy/src/media-bypass");
 
 function secureEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
@@ -22,7 +25,16 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
   });
   router.get("/capabilities", (_req, res) => {
     res.json({ protocol: "ignis-sync/1", transport: ["https", "wss"],
-      supported: ["manifest", "changes", "conditional-text", "conditional-binary-4MiB", "file-identity"],
+      supported: ["manifest", "changes", "conditional-text",
+        ...(store.contentScope.mode === "all" ||
+          (store.db.prepare(
+            "SELECT COUNT(*) AS count FROM vault_sync_media_bypass WHERE extensions_json <> '[]'"
+          ).get().count > 0) ||
+          [...store.contentScopeOverrides.values()].some((scope) => scope.mode === "all")
+          ? ["conditional-binary-4MiB"] : []),
+        "file-identity"],
+      contentScope: store.contentScope.mode,
+      scopedByVault: store.contentScopeOverrides.size > 0,
       auth: tailnetAccess.size ? ["scoped-device-token", "tailscale-serve"] :
         ["scoped-device-token"],
       experimental: true });
@@ -70,6 +82,83 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
     }
     res.status(204).end();
   }));
+  router.get("/admin/vaults/:vaultId/content-scope", adminOnly, route((req, res) => {
+    const desired = req.query.mode;
+    if (desired !== undefined && !["all", "markdown-only"].includes(desired)) {
+      return res.status(400).json({
+        code: "INVALID_CONTENT_SCOPE",
+        error: "Preview mode must be all or markdown-only",
+      });
+    }
+    res.json(store.previewContentScope(req.params.vaultId, desired || null));
+  }));
+  router.get("/admin/vaults/:vaultId/media-bypass", adminOnly, route((req, res) => {
+    const raw = req.query.extensions;
+    let proposed = null;
+    if (raw !== undefined) {
+      if (typeof raw !== "string" || raw.length > 300) {
+        return res.status(400).json({
+          code: "INVALID_BYPASS_EXTENSIONS", error: "Invalid preview extension list",
+        });
+      }
+      try { proposed = normalizeMediaBypassExtensions(
+        raw ? raw.split(",") : []
+      ); } catch {
+        return res.status(400).json({
+          code: "INVALID_BYPASS_EXTENSIONS",
+          error: "Choose supported media extensions",
+        });
+      }
+    }
+    res.json(store.previewMediaBypass(req.params.vaultId, proposed));
+  }));
+  router.put("/admin/vaults/:vaultId/media-bypass", adminOnly, route(async (req, res) => {
+    let requested, expected;
+    try {
+      requested = normalizeMediaBypassExtensions(req.body?.extensions);
+      expected = normalizeMediaBypassExtensions(req.body?.expectedExtensions);
+    } catch {
+      return res.status(400).json({
+        code: "INVALID_BYPASS_EXTENSIONS",
+        error: "Choose supported document/media extensions",
+      });
+    }
+    res.json(await store.setMediaBypass(req.params.vaultId, requested, expected));
+  }));
+  router.put("/admin/vaults/:vaultId/content-scope", adminOnly, route(async (req, res) => {
+    const { contentScope, expectedScope } = req.body || {};
+    if (!["all", "markdown-only"].includes(contentScope) ||
+        !["all", "markdown-only"].includes(expectedScope)) {
+      return res.status(400).json({
+        code: "INVALID_CONTENT_SCOPE",
+        error: "Provide contentScope and expectedScope: all or markdown-only",
+      });
+    }
+    res.json(await store.setContentScope(req.params.vaultId,
+      contentScope, expectedScope));
+  }));
+  router.get("/admin/vaults/:vaultId/media-preflight", adminOnly, route(async (req, res) => {
+    const requested = req.query.root;
+    const roots = typeof requested === "string" ? [requested] :
+      Array.isArray(requested) && requested.every((x) => typeof x === "string")
+        ? requested : [];
+    if (!roots.length || roots.length > 8) {
+      return res.status(400).json({
+        code: "INVALID_MEDIA_ROOTS", error: "Supply one to eight media root paths",
+      });
+    }
+    try {
+      const report = await store.preflightMediaOwnership(req.params.vaultId, roots);
+      res.json(report);
+    } catch (error) {
+      if (error instanceof Error && /Invalid|root|Overlapping|path/.test(error.message)) {
+        return res.status(400).json({
+          code: "INVALID_MEDIA_ROOTS", error: "Invalid media synchronization roots",
+        });
+      }
+      throw error;
+    }
+  }));
 
   router.use("/vaults/:vaultId", (req, res, next) => {
     const match = /^Bearer (ignis_dev_[A-Za-z0-9_-]{43})$/.exec(
@@ -89,7 +178,9 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
   router.get("/vaults/:vaultId/session", (req, res) => {
     const device = req.ignisSyncDevice;
     res.json({ deviceId: device.deviceId, vaultId: device.vaultId,
-      label: device.label, auth: req.ignisSyncAuth });
+      label: device.label, auth: req.ignisSyncAuth,
+      contentScope: store.contentScopeFor(device.vaultId),
+      mediaBypassExtensions: store.mediaBypassFor(device.vaultId) });
   });
   router.get("/vaults/:vaultId/manifest", route(async (req, res) => {
     res.json(await store.scan(req.params.vaultId));

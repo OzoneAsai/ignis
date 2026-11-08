@@ -136,6 +136,9 @@ const syncStore = syncToken ? new VaultSyncStore({
   getVaultPath: config.getVaultPath,
   collaboration,
   writeCoalescer,
+  contentScope: process.env.IGNIS_SYNC_CONTENT_SCOPE || "all",
+  contentScopes: process.env.IGNIS_SYNC_CONTENT_SCOPES ?
+    JSON.parse(process.env.IGNIS_SYNC_CONTENT_SCOPES) : {},
 }) : null;
 if (syncStore) {
   app.use("/api/sync/v1", createSyncRouter({
@@ -246,7 +249,9 @@ app.get(["/", "/index.html"], (req, res) => {
 });
 
 app.get("/favicon.png", (req, res) => {
-  res.sendFile(path.join(REPO_ROOT, "images", "favicon.png"));
+  // The boot logo must be part of the deployed server, not an optional
+  // repository-root image directory (excluded from release packages).
+  res.sendFile(path.join(__dirname, "assets", "ignis-splash.png"));
 });
 
 app.get("/manifest.webmanifest", (req, res) => {

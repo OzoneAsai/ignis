@@ -2,6 +2,9 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 beforeAll(() => {
+  // Node 25 may expose an incomplete localStorage object without jsdom's
+  // Storage methods. Provide the Obsidian preference as a deterministic stub.
+  vi.stubGlobal("localStorage", { getItem: key => key === "language" ? "ja" : null });
   HTMLElement.prototype.empty = function () {
     this.replaceChildren();
     return this;
@@ -50,8 +53,23 @@ vi.mock("obsidian", () => {
     onClick(fn) { this.el.addEventListener("click", fn); return this; }
   }
   class Toggle {
-    setValue() { return this; }
-    onChange() { return this; }
+    constructor(parent) {
+      this.el = parent.ownerDocument.createElement("button");
+      this.el.type = "button";
+      this.el.setAttribute("role", "switch");
+      this.el.setAttribute("aria-label", "Keep attachments on this device");
+      parent.append(this.el);
+      this.el.addEventListener("click", () => {
+        this.setValue(!this.value);
+        this.change?.(this.value);
+      });
+    }
+    setValue(value) {
+      this.value = value;
+      this.el.setAttribute("aria-checked", String(value));
+      return this;
+    }
+    onChange(fn) { this.change = fn; return this; }
   }
   class Setting {
     constructor(parent) {
@@ -72,7 +90,7 @@ vi.mock("obsidian", () => {
     }
     addText(fn) { fn(new TextInput(this.el)); return this; }
     addButton(fn) { fn(new Button(this.el)); return this; }
-    addToggle(fn) { fn(new Toggle()); return this; }
+    addToggle(fn) { fn(new Toggle(this.el)); return this; }
   }
   class MockModal {
     constructor() { this.contentEl = document.createElement("div"); }
@@ -115,6 +133,7 @@ vi.mock("obsidian", () => {
       constructor() { this.containerEl = document.createElement("div"); }
     },
     Setting, Modal: MockModal, Notice: class {}, TFile: class {},
+    setIcon: (element, icon) => { element.dataset.icon = icon; },
     Platform: { isMobile: true },
     editorInfoField: null, requestUrl: vi.fn()
   };
@@ -136,12 +155,14 @@ const flush = async () => {
   await Promise.resolve();
   await new Promise(resolve => setTimeout(resolve, 0));
 };
-function setup() {
+function setup({ ready = false } = {}) {
   const plugin = {
     settings: {
       serverUrl: "https://mac.example:8451",
       vaultId: "", displayName: "",
-      deviceId: ""
+      deviceId: "", contentScope: "all",
+      deviceContentScope: "follow-server",
+      serverMediaBypassExtensions: [], deviceMediaBypassExtensions: [],
     },
     getDisplayName: () => "Obsidian Native",
     openDisplayName: vi.fn(),
@@ -149,10 +170,28 @@ function setup() {
     openSyncIssues: vi.fn(),
     currentParticipants: () => ({path: "demo.md", peers: []}),
     takeIncomingLink: () => "",
-    connectionSummary: () => ({ ready: false, vaultId: "", deviceId: "" }),
+    connectionSummary: () => ({ ready, vaultId: ready ? "MarkdownLab" : "",
+      deviceId: ready ? "device-sls" : "" }),
     connectToServer: vi.fn(),
     saveSettings: vi.fn(),
-    syncNow: vi.fn()
+    syncNow: vi.fn(),
+    getSharingDetails: vi.fn(() => ({
+      sharedFiles: 3, localOnlyFiles: 2, pendingOperations: 0,
+      localOnlyBytes: 5120, blockedQueued: 0, oversizedFiles: 0,
+    })),
+    getServerMediaBypassExtensions: () => plugin.settings.serverMediaBypassExtensions,
+    getDeviceMediaBypassExtensions: () => plugin.settings.deviceMediaBypassExtensions,
+    setDeviceMediaBypassExtensions: vi.fn(async (value) => {
+      plugin.settings.deviceMediaBypassExtensions = [...value];
+      return { ok: true, message: "Media bypass selection saved" };
+    }),
+    setDeviceContentScope: vi.fn(async (value) => {
+      plugin.settings.deviceContentScope = value;
+      return { ok: true, message: "Device preference saved" };
+    }),
+    recheckSharingScope: vi.fn(async () => ({
+      ok: true, message: "Server: Markdown only.",
+    })),
   };
   const ui = new ConnectorSettings({}, plugin);
   ui.display();
@@ -169,23 +208,136 @@ function setup() {
 }
 
 describe("native Obsidian one-button onboarding UI", () => {
+  it("offers PDF/media bypass in the same mobile-compatible Connector UI", () => {
+    const { containerEl } = setup();
+    const region = containerEl.querySelector(".ignis-media-bypass-details");
+    expect(region.querySelector("summary").textContent)
+      .toBe("PDFs and media Bypass");
+    expect(region.textContent).toContain("PowerPoint");
+    expect(region.textContent).toContain("4 MiB");
+  });
+  it("explains how to recover an existing device-token connection after a restart", () => {
+    const { plugin, containerEl } = setup();
+    plugin.settings.vaultId = "SLS-TextClone";
+    plugin.settings.serverUrl = "http://127.0.0.1:3196";
+    plugin.settings.authMode = "device";
+    plugin.connectionSummary = () => ({
+      ready: false, vaultId: "SLS-TextClone", deviceId: "test-device",
+    });
+    const tab = new ConnectorSettings({}, plugin);
+    tab.display();
+    const message = tab.containerEl.querySelector(".ignis-connection-feedback").textContent;
+    expect(message).toContain("needs its verified token again");
+    expect(message).toContain("local notes are retained");
+    expect(containerEl).toBeTruthy();
+  });
+  it("shows a meaningful local media switch with file counts and accessible feedback", async () => {
+    const { containerEl, plugin } = setup();
+    expect(containerEl.querySelector(".ignis-sharing-summary").textContent)
+      .toContain("3 file(s) eligible");
+    expect(containerEl.querySelector(".ignis-sharing-summary").textContent)
+      .toContain("5.0 KiB");
+    expect(containerEl.textContent).toContain("Keep attachments on this device");
+    const switchEl = containerEl.querySelector('[role="switch"]');
+    expect(switchEl.getAttribute("aria-checked")).toBe("false");
+    switchEl.click();
+    await flush();
+    expect(plugin.setDeviceContentScope)
+      .toHaveBeenCalledWith("markdown-only");
+    expect(switchEl.getAttribute("aria-checked")).toBe("true");
+    expect(containerEl.querySelector(".ignis-sharing-feedback").textContent)
+      .toContain("Device preference saved");
+    const review = [...containerEl.querySelectorAll("button")]
+      .find((button) => button.textContent === "Review");
+    review.click();
+    expect(plugin.openSyncIssues).toHaveBeenCalledOnce();
+  });
+
+  it("reverts a rejected local preference without silently changing its UI state", async () => {
+    const { containerEl, plugin } = setup();
+    plugin.setDeviceContentScope.mockResolvedValueOnce({
+      ok: false, message: "2 unsent media operations require review",
+    });
+    const switchEl = containerEl.querySelector('[role="switch"]');
+    switchEl.click();
+    await flush();
+    expect(switchEl.getAttribute("aria-checked")).toBe("false");
+    expect(containerEl.querySelector(".ignis-sharing-feedback").textContent)
+      .toContain("unsent media");
+  });
+
+  it("rechecks server scope after a verified connection without asking for a token", async () => {
+    const { containerEl, plugin } = setup({ ready: true });
+    const check = [...containerEl.querySelectorAll("button")]
+      .find((button) => button.textContent === "Recheck");
+    expect(check).toBeTruthy();
+    expect(check.disabled).toBe(false);
+    check.click();
+    await flush();
+    expect(plugin.recheckSharingScope).toHaveBeenCalledOnce();
+    expect(containerEl.querySelector(".ignis-sharing-feedback").textContent)
+      .toContain("Server: Markdown only");
+    expect(check.disabled).toBe(false);
+  });
   it("registers an iOS ribbon entry and commands without relying on unsupported status bar", async () => {
+    document.body.innerHTML = '<nav class="mobile-navbar"><div class="mobile-navbar-actions"><button>戻る</button></div></nav>';
     const plugin = new IgnisConnector();
     await plugin.onload();
     expect(plugin.statusBarCalls).toBe(0);
-    expect(plugin.ribbon).toHaveLength(1);
+    expect(plugin.ribbon).toHaveLength(2);
     expect(plugin.ribbon[0].icon).toBe("users");
+    expect(plugin.ribbon[1].icon).toBe("upload");
     expect(plugin.commands.map(x => x.id)).toContain("show-collaborators");
     expect(plugin.commands.map(x => x.id)).toContain("change-display-name");
+    expect(plugin.commands.map(x => x.id)).toContain("import-files-to-vault");
     expect(plugin.collaborationRibbon.getAttribute("aria-label"))
       .toContain("Not connected");
     plugin.showStatus("Offline · local Vault retained");
     expect(plugin.collaborationRibbon.getAttribute("aria-label"))
       .toContain("Offline · local Vault retained");
     expect(plugin.getCurrentStatus()).toBe("Offline · local Vault retained");
+    const action = plugin.mobileActions;
+    expect(action.closest(".mobile-navbar-actions")).not.toBeNull();
+    expect(action.querySelectorAll("button")).toHaveLength(1);
+    expect(document.querySelectorAll(".ignis-native-mobile-actions")).toHaveLength(0);
+    expect(action.dataset.connection).toBe("offline");
+    expect(action.querySelector("button").dataset.icon).toBe("flame");
+    expect(document.querySelector(".mobile-navbar-actions").textContent).toContain("戻る");
+    action.querySelector("button").click();
+    expect(plugin.mobileMenu.contentEl.textContent).toContain("ファイル追加");
+    expect(plugin.mobileMenu.contentEl.textContent).toContain("参加者・表示名");
     plugin.commands.find(x => x.id === "change-display-name").callback();
     // Obsidian's modal is available even when no collaborative note is open.
     expect(plugin.getDisplayName()).toMatch(/^Obsidian /);
+  });
+  it("imports a native iOS File selection without clobbering existing Vault data", async () => {
+    const plugin = new IgnisConnector();
+    await plugin.onload();
+    const paths = new Set(["photo.heic"]);
+    plugin.app.vault.getRoot = () => ({ path: "/" });
+    plugin.app.vault.getAbstractFileByPath = path => paths.has(path) ? {} : null;
+    plugin.app.vault.createBinary = vi.fn(async path => {
+      paths.add(path);
+      return { path };
+    });
+    plugin.mobileConnection.click();
+    const upload = [...plugin.mobileMenu.contentEl.querySelectorAll("button")]
+      .find(button => button.textContent === "ファイルを選ぶ");
+    upload.click();
+    const input = document.querySelector(".ignis-native-upload-input");
+    expect(input?.type).toBe("file");
+    expect(input?.multiple).toBe(true);
+    expect(input.style.display).not.toBe("none");
+    const bytes = new Uint8Array([4, 2, 1]);
+    const picked = { name: "photo.heic", size: bytes.byteLength,
+      arrayBuffer: async () => bytes.buffer };
+    Object.defineProperty(input, "files", { configurable: true, value: [picked] });
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(plugin.app.vault.createBinary).toHaveBeenCalledWith(
+      "photo (1).heic", bytes.buffer
+    );
+    expect(document.querySelector(".ignis-native-upload-input")).toBeNull();
   });
   it("keeps a mobile-accessible display-name entry above connection setup", () => {
     const { plugin, containerEl } = setup();

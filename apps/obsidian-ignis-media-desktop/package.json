@@ -1,0 +1,14 @@
+{
+  "name": "@ignis/obsidian-media-desktop",
+  "version": "0.3.2",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "obsidian": "^1.14.4",
+    "typescript": "^5.9.3",
+    "@types/node": "^22.15.0"
+  }
+}

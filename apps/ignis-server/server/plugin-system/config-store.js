@@ -27,4 +27,18 @@ function setEnabledVaults(config, pluginId, vaultIds) {
   config[pluginId].enabledVaults = vaultIds;
 }
 
-module.exports = { load, save, getEnabledVaults, setEnabledVaults };
+function isServerEnabled(config, pluginId) {
+  return config[pluginId]?.enabled === true;
+}
+
+function setServerEnabled(config, pluginId, enabled) {
+  if (!config[pluginId]) {
+    config[pluginId] = {};
+  }
+  config[pluginId].enabled = enabled === true;
+}
+
+module.exports = {
+  load, save, getEnabledVaults, setEnabledVaults,
+  isServerEnabled, setServerEnabled,
+};

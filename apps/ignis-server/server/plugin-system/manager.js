@@ -4,10 +4,12 @@ const express = require("express");
 const { discoverPlugins } = require("./discovery");
 const configStore = require("./config-store");
 const { getVersion } = require("../version");
+const { SidecarSupervisor } = require("./sidecar-supervisor");
 
 let discoveredPlugins = new Map();
 const loadedPlugins = new Map();
 const pluginRouters = new Map();
+const activatingServerPlugins = new Map();
 let pluginConfig = {};
 let configPath = "";
 let serverCtx = null;
@@ -26,11 +28,20 @@ async function initPlugins(ctx) {
     }
   });
 
-  const pluginsDir = path.join(__dirname, "..", "plugins");
+  const pluginsDir = ctx.pluginsDir || path.join(__dirname, "..", "plugins");
   discoveredPlugins = discoverPlugins(pluginsDir);
   pluginConfig = await configStore.load(configPath);
 
-  for (const [pluginId] of discoveredPlugins) {
+  for (const [pluginId, discovered] of discoveredPlugins) {
+    if (discovered.scope === "server") {
+      if (!configStore.isServerEnabled(pluginConfig, pluginId)) continue;
+      try {
+        await activateServerPlugin(pluginId);
+      } catch (e) {
+        console.error(`[plugins] Failed to activate ${pluginId}: ${e.message}`);
+      }
+      continue;
+    }
     const enabledVaults = configStore.getEnabledVaults(pluginConfig, pluginId);
 
     if (enabledVaults.length === 0) {
@@ -95,11 +106,24 @@ async function loadPlugin(pluginId) {
   if (!discovered) {
     throw new Error(`Plugin not found: ${pluginId}`);
   }
-
-  const plugin = discovered.module;
   const dataDir = getPluginDataDir(serverCtx.config.dataRoot, pluginId);
 
   await fs.promises.mkdir(dataDir, { recursive: true });
+
+  if (discovered.runtime === "sidecar") {
+    const sidecar = new SidecarSupervisor({
+      id: pluginId, entry: discovered.entry, dataDir,
+    });
+    await sidecar.start();
+    loadedPlugins.set(pluginId, {
+      id: pluginId, name: discovered.name, module: null,
+      ctx: { dataDir }, sidecar, shutdown: () => sidecar.stop(),
+    });
+    console.log(`[plugins] Sidecar running: ${discovered.name}`);
+    return;
+  }
+
+  const plugin = discovered.module;
 
   const router = express.Router();
 
@@ -114,7 +138,18 @@ async function loadPlugin(pluginId) {
       configStore.getEnabledVaults(pluginConfig, pluginId),
   };
 
-  await plugin.register(pluginCtx);
+  try {
+    await plugin.register(pluginCtx);
+  } catch (e) {
+    // An incomplete registration must not leave timers or subprocesses behind.
+    if (typeof plugin.shutdown === "function") {
+      try { await plugin.shutdown(); }
+      catch (cleanupError) {
+        console.error(`[plugins] Cleanup failed for ${pluginId}: ${cleanupError.message}`);
+      }
+    }
+    throw e;
+  }
 
   pluginRouters.set(pluginId, router);
 
@@ -136,14 +171,96 @@ async function unloadPlugin(pluginId) {
     return;
   }
 
-  if (loaded.shutdown) {
-    console.log(`[plugins] Shutting down: ${loaded.name}`);
-    await loaded.shutdown();
+  try {
+    if (loaded.shutdown) {
+      console.log(`[plugins] Shutting down: ${loaded.name}`);
+      await loaded.shutdown();
+    }
+  } finally {
+    pluginRouters.delete(pluginId);
+    loadedPlugins.delete(pluginId);
   }
-
-  pluginRouters.delete(pluginId);
-  loadedPlugins.delete(pluginId);
   console.log(`[plugins] Unloaded: ${loaded.name}`);
+}
+
+async function activateServerPlugin(pluginId) {
+  const discovered = discoveredPlugins.get(pluginId);
+  if (!discovered || discovered.scope !== "server") {
+    throw new Error(`Not a server plugin: ${pluginId}`);
+  }
+  if (activatingServerPlugins.has(pluginId)) {
+    return activatingServerPlugins.get(pluginId);
+  }
+  const existing = loadedPlugins.get(pluginId);
+  if (existing) {
+    if (existing.sidecar && existing.sidecar.status().state !== "running") {
+      await existing.sidecar.start();
+    }
+    return;
+  }
+  const activation = startServerPlugin(pluginId, discovered);
+  activatingServerPlugins.set(pluginId, activation);
+  try {
+    await activation;
+  } finally {
+    activatingServerPlugins.delete(pluginId);
+  }
+}
+
+async function startServerPlugin(pluginId, discovered) {
+  await loadPlugin(pluginId);
+  try {
+    await discovered.module?.onEnable?.(loadedPlugins.get(pluginId).ctx);
+  } catch (e) {
+    try { await unloadPlugin(pluginId); }
+    catch (cleanupError) {
+      console.error(`[plugins] Cleanup failed for ${pluginId}: ${cleanupError.message}`);
+      pluginRouters.delete(pluginId);
+      loadedPlugins.delete(pluginId);
+    }
+    throw e;
+  }
+}
+
+// Trusted server-side control only. The current public plugin routes do not
+// authenticate server administrators and must not expose these operations.
+async function enablePluginForServer(pluginId) {
+  const discovered = discoveredPlugins.get(pluginId);
+  if (!discovered || discovered.scope !== "server") {
+    throw new Error(`Not a server plugin: ${pluginId}`);
+  }
+  await activateServerPlugin(pluginId);
+  configStore.setServerEnabled(pluginConfig, pluginId, true);
+  await configStore.save(configPath, pluginConfig);
+}
+
+async function disablePluginForServer(pluginId) {
+  const discovered = discoveredPlugins.get(pluginId);
+  if (!discovered || discovered.scope !== "server") {
+    throw new Error(`Not a server plugin: ${pluginId}`);
+  }
+  if (activatingServerPlugins.has(pluginId)) {
+    await activatingServerPlugins.get(pluginId);
+  }
+  const loaded = loadedPlugins.get(pluginId);
+  if (loaded) {
+    await loaded.module?.onDisable?.(loaded.ctx);
+    await unloadPlugin(pluginId);
+  }
+  configStore.setServerEnabled(pluginConfig, pluginId, false);
+  await configStore.save(configPath, pluginConfig);
+}
+
+// Only internal trusted backend callers may issue management RPC. Never expose
+// this directly through the existing unauthenticated /api/plugins routes.
+async function invokeServerSidecar(pluginId, method, params = {}) {
+  const discovered = discoveredPlugins.get(pluginId);
+  const loaded = loadedPlugins.get(pluginId);
+  if (discovered?.scope !== "server" || discovered?.runtime !== "sidecar" ||
+      !loaded?.sidecar) {
+    throw new Error(`Sidecar unavailable: ${pluginId}`);
+  }
+  return loaded.sidecar.request(method, params);
 }
 
 async function enablePluginForVault(pluginId, vaultId) {
@@ -151,6 +268,9 @@ async function enablePluginForVault(pluginId, vaultId) {
 
   if (!discovered) {
     throw new Error(`Plugin not found: ${pluginId}`);
+  }
+  if (discovered.scope !== "vault") {
+    throw new Error(`Cannot enable server plugin for a vault: ${pluginId}`);
   }
 
   const vaultPath = serverCtx.config.getVaultPath(vaultId);
@@ -200,6 +320,9 @@ async function disablePluginForVault(pluginId, vaultId) {
 
   if (!discovered) {
     throw new Error(`Plugin not found: ${pluginId}`);
+  }
+  if (discovered.scope !== "vault") {
+    throw new Error(`Cannot disable server plugin for a vault: ${pluginId}`);
   }
 
   const vaultPath = serverCtx.config.getVaultPath(vaultId);
@@ -256,9 +379,11 @@ function getVirtualPluginsForVault(vaultId, version) {
       continue;
     }
 
-    const enabledVaults = configStore.getEnabledVaults(pluginConfig, pluginId);
+    const enabled = discovered.scope === "server"
+      ? configStore.isServerEnabled(pluginConfig, pluginId) && loadedPlugins.has(pluginId)
+      : configStore.getEnabledVaults(pluginConfig, pluginId).includes(vaultId);
 
-    if (!enabledVaults.includes(vaultId)) {
+    if (!enabled) {
       continue;
     }
 
@@ -280,11 +405,17 @@ function getDiscoveredPlugins() {
     result.push({
       id: discovered.id,
       name: discovered.name,
+      scope: discovered.scope,
+      runtime: discovered.runtime,
       description: discovered.description,
       hasBundledPlugin: !!discovered.obsidianPlugin,
       bundledPluginId: discovered.bundledPluginId,
       enabledVaults: configStore.getEnabledVaults(pluginConfig, pluginId),
-      loaded: loadedPlugins.has(pluginId),
+      serverEnabled: discovered.scope === "server" && configStore.isServerEnabled(pluginConfig, pluginId),
+      loaded: loadedPlugins.has(pluginId) &&
+        (loadedPlugins.get(pluginId).sidecar === undefined ||
+          loadedPlugins.get(pluginId).sidecar.status().state === "running"),
+      sidecarStatus: loadedPlugins.get(pluginId)?.sidecar?.status() ?? null,
     });
   }
 
@@ -297,6 +428,9 @@ module.exports = {
   getPluginDataDir,
   enablePluginForVault,
   disablePluginForVault,
+  enablePluginForServer,
+  disablePluginForServer,
+  invokeServerSidecar,
   getDiscoveredPlugins,
   getBundledPluginDirs,
   getVirtualPluginsForVault,

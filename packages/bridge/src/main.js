@@ -1,6 +1,7 @@
 import { Plugin, TFile, TFolder } from "obsidian";
 import {
   showFilePicker,
+  showFileRename,
   addFileMenuItems,
   addFolderMenuItems,
 } from "./file-actions.js";
@@ -22,6 +23,8 @@ import { initWriteGiveupNotice } from "./notices/write-giveup-notice.js";
 import { initImageRetry } from "./image-retry.js";
 import { installReadingLock } from "./reading-lock.js";
 import { initCollaboration } from "./collaboration.js";
+import { installMobileToolbarPlacement } from "../../server-core/src/mobile-toolbar-preference.js";
+import { showPdfPreview } from "./pdf-preview.js";
 
 class IgnisBridgePlugin extends Plugin {
   async onload() {
@@ -29,6 +32,7 @@ class IgnisBridgePlugin extends Plugin {
 
     await pluginRegistry.refresh();
     patchSettingsModal(this);
+    this._toolbarPlacementUnsub = installMobileToolbarPlacement(this.app);
     refreshIgnisSettings();
     this._pluginTogglesUnsub = watchPluginToggles();
 
@@ -57,13 +61,33 @@ class IgnisBridgePlugin extends Plugin {
     this.addRibbonIcon("upload", "Upload file", () => {
       showFilePicker(this.app);
     });
+    this.addCommand({
+      id: "upload-files-to-vault",
+      name: "ファイルをVaultに追加",
+      callback: () => showFilePicker(this.app),
+    });
+    this.addCommand({
+      id: "rename-vault-file",
+      name: "ファイル名を変更（画像・PDF・ノート）",
+      callback: () => showFileRename(this.app, this.app.workspace.getActiveFile?.() || null),
+    });
+    this.addCommand({
+      id: "open-pdf-preview",
+      name: "PDFをブラウザー内で表示",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile?.();
+        if (!file?.path?.toLowerCase().endsWith(".pdf")) return false;
+        if (!checking) showPdfPreview(this.app, file);
+        return true;
+      },
+    });
 
     registerCommands(this);
 
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
         if (file instanceof TFile) {
-          addFileMenuItems(menu, file);
+          addFileMenuItems(menu, file, this.app);
         } else if (file instanceof TFolder) {
           addFolderMenuItems(menu, file, this.app);
         }
@@ -109,6 +133,7 @@ class IgnisBridgePlugin extends Plugin {
     }
 
     unpatchSettingsModal(this);
+    this._toolbarPlacementUnsub?.();
     console.log("[ignis-bridge] Plugin unloaded");
   }
 }

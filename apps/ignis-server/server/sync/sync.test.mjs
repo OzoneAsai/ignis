@@ -10,7 +10,7 @@ const { secureEqual, createSyncRouter } = require("./http");
 const { base32, luhn32, deviceIdFromCert, parseDiscoverySettings } = require("./discovery");
 
 const active = [];
-function testStore() {
+function testStore(contentScope = "all") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ignis-sync-test-"));
   const vault = path.join(root, "vault");
   fs.mkdirSync(vault);
@@ -25,6 +25,7 @@ function testStore() {
   const store = new VaultSyncStore({
     dataRoot: root,
     getVaultPath: (id) => id === "vault" ? vault : null,
+    contentScope,
     collaboration: collab,
     writeCoalescer: { flushPending: async () => {} }
   });
@@ -39,6 +40,163 @@ afterEach(() => {
 });
 
 describe("one durable Vault change journal", () => {
+  it("shares only Markdown with Syncthing absent, preserving media on disk", async () => {
+    const { store, vault } = testStore("markdown-only");
+    fs.mkdirSync(path.join(vault, "Media"));
+    fs.mkdirSync(path.join(vault, "Notes"));
+    fs.writeFileSync(path.join(vault, "Notes", "hello.md"), "# Hello from Mac");
+    fs.writeFileSync(path.join(vault, "Media", "photo.png"), Buffer.from("local-png"));
+    fs.writeFileSync(path.join(vault, "Media", "movie.mp4"), Buffer.from("local-video"));
+    fs.writeFileSync(path.join(vault, "Media", "captions.MD"), "CAPTIONS");
+    const initial = await store.scan("vault");
+    expect(store.contentScopeFor("vault")).toBe("markdown-only");
+    expect(initial.files.map((file) => file.path)).toEqual([
+      "Media/captions.MD", "Notes/hello.md",
+    ]);
+    expect(store.changes("vault", 0).changes.map((change) => change.path))
+      .toEqual(["Media/captions.MD", "Notes/hello.md"]);
+    expect(await store.read("vault", initial.files[1].fileId))
+      .toMatchObject({ bytes: Buffer.from("# Hello from Mac") });
+
+    for (const path of ["Media/photo.png", "Media/movie.mp4"]) {
+      await expect(store.apply("vault", {
+        type: "create", path, contentBase64: Buffer.from("new").toString("base64"),
+        opId: "excluded-" + path.split("/").pop().replace(".", "-") + "-1",
+      })).rejects.toMatchObject({ code: "OUT_OF_SCOPE", status: 409 });
+    }
+    const created = await store.apply("vault", {
+      type: "create", path: "Notes/from-sls.md",
+      content: "# SLS saved this", opId: "test-sls-md-create-1",
+    });
+    expect(created.path).toBe("Notes/from-sls.md");
+    expect(fs.readFileSync(path.join(vault, "Notes", "from-sls.md"), "utf8"))
+      .toBe("# SLS saved this");
+    const note = initial.files[1];
+    await expect(store.apply("vault", {
+      type: "rename", path: note.path, toPath: "Media/secret.jpg",
+      fileId: note.fileId, generationId: note.generationId,
+      baseHash: note.hash, opId: "excluded-rename-123",
+    })).rejects.toMatchObject({ code: "OUT_OF_SCOPE" });
+    fs.writeFileSync(path.join(vault, "Media", "photo.png"), "edited locally");
+    fs.unlinkSync(path.join(vault, "Media", "movie.mp4"));
+    const after = await store.scan("vault");
+    expect(after.files.map((file) => file.path)).toEqual([
+      "Media/captions.MD", "Notes/from-sls.md", "Notes/hello.md",
+    ]);
+    expect(store.changes("vault", 0).changes).toHaveLength(3);
+    expect(fs.readFileSync(path.join(vault, "Media", "photo.png"), "utf8"))
+      .toBe("edited locally");
+    expect(store.head("vault")).toBe(3);
+  });
+
+  it("persists content scope across restart and rejects implicit legacy migration", async () => {
+    const { store, vault, root, collab } = testStore("markdown-only");
+    fs.writeFileSync(path.join(vault, "a.md"), "hello");
+    const before = await store.scan("vault");
+    store.close();
+    active.pop();
+    const opts = {
+      dataRoot: root, getVaultPath: (id) => id === "vault" ? vault : null,
+      collaboration: collab, writeCoalescer: { flushPending: async () => {} },
+    };
+    const reopening = new VaultSyncStore({ ...opts, contentScope: "markdown-only" });
+    active.push({ store: reopening, root });
+    expect((await reopening.scan("vault")).files).toEqual(before.files);
+    const wrong = new VaultSyncStore({ ...opts, contentScope: "all" });
+    expect(() => wrong.manifest("vault")).toThrow("content-scope migration");
+    wrong.close();
+  });
+
+  it("blocks changing a previously active binary journal into markdown-only", async () => {
+    const { store, vault, root, collab } = testStore();
+    fs.writeFileSync(path.join(vault, "image.png"), "existing binary");
+    await store.scan("vault");
+    const md = new VaultSyncStore({
+      dataRoot: root, getVaultPath: (id) => id === "vault" ? vault : null,
+      collaboration: collab, writeCoalescer: { flushPending: async () => {} },
+      contentScope: "markdown-only",
+    });
+    try {
+      expect(() => md.manifest("vault")).toThrow("content-scope migration");
+      expect(fs.readFileSync(path.join(vault, "image.png"), "utf8"))
+        .toBe("existing binary");
+    } finally { md.close(); }
+  });
+
+  it("lets an empty enrolled-free Vault select Markdown-only before any sync history", async () => {
+    const { store, vault, root, collab } = testStore("all");
+    expect(store.contentScopeFor("vault")).toBe("all");
+    // No device, file or journal record was created by displaying the Vault.
+    const alternate = new VaultSyncStore({
+      dataRoot: root,
+      getVaultPath: (id) => id === "vault" ? vault : null,
+      collaboration: collab,
+      writeCoalescer: { flushPending: async () => {} },
+      contentScope: "markdown-only",
+    });
+    try {
+      expect(alternate.contentScopeFor("vault")).toBe("markdown-only");
+      fs.writeFileSync(path.join(vault, "local.jpg"), "only on this machine");
+      fs.writeFileSync(path.join(vault, "first.md"), "# Welcome");
+      expect((await alternate.scan("vault")).files.map((f) => f.path))
+        .toEqual(["first.md"]);
+    } finally { alternate.close(); }
+  });
+
+  it("can share only Markdown from one Vault while preserving another Vault's full scope", async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "ignis-mixed-content-scopes-"));
+    const markdown = path.join(parent, "MarkdownLab");
+    const general = path.join(parent, "GeneralVault");
+    fs.mkdirSync(markdown);
+    fs.mkdirSync(general);
+    const store = new VaultSyncStore({
+      dataRoot: parent,
+      contentScope: "all",
+      contentScopes: { MarkdownLab: "markdown-only" },
+      getVaultPath: (id) => ({ MarkdownLab: markdown, GeneralVault: general })[id],
+      collaboration: { getActive: () => null, peekDocumentId: () => null },
+      writeCoalescer: { flushPending: async () => {} },
+    });
+    active.push({ store, root: parent });
+    for (const root of [markdown, general]) {
+      fs.writeFileSync(path.join(root, "note.md"), "# Shared note");
+      fs.writeFileSync(path.join(root, "attachment.jpg"), "sample attachment");
+    }
+    expect(store.contentScopeFor("MarkdownLab")).toBe("markdown-only");
+    expect(store.contentScopeFor("GeneralVault")).toBe("all");
+    expect((await store.scan("MarkdownLab")).files.map((file) => file.path))
+      .toEqual(["note.md"]);
+    expect((await store.scan("GeneralVault")).files.map((file) => file.path))
+      .toEqual(["attachment.jpg", "note.md"]);
+  });
+
+  it("previews media ownership without mutating history or creating tombstones", async () => {
+    const { store, vault } = testStore();
+    fs.mkdirSync(path.join(vault, "Media"));
+    const initial = await store.preflightMediaOwnership("vault", ["Media"]);
+    expect(initial.safeForEmptyPilot).toBe(true);
+    expect(initial.activationAvailable).toBe(false);
+    expect(store.head("vault")).toBe(0);
+
+    fs.writeFileSync(path.join(vault, "Media", "video.mp4"), "original");
+    const [file] = (await store.scan("vault")).files;
+    expect(file.path).toBe("Media/video.mp4");
+    fs.unlinkSync(path.join(vault, "Media", "video.mp4"));
+    const seq = store.head("vault");
+    const review = await store.preflightMediaOwnership("vault", ["Media"]);
+    expect(review.safeForEmptyPilot).toBe(false);
+    expect(review.issues.some((issue) => issue.code === "IGNIS_JOURNAL_HISTORY")).toBe(true);
+    expect(store.head("vault")).toBe(seq);
+    expect(store.fileByPath("vault", file.path)?.deleted).toBe(0);
+  });
+  it("blocks media ownership migration while an enrolled Connector may be offline", async () => {
+    const { store, vault } = testStore();
+    fs.mkdirSync(path.join(vault, "Media"));
+    store.enrollDevice("vault", "SLS");
+    const report = await store.preflightMediaOwnership("vault", ["Media"]);
+    expect(report).toMatchObject({ safeForEmptyPilot: false, activeDeviceCount: 1 });
+    expect(report.issues.some((issue) => issue.code === "DEVICES_NOT_QUIESCED")).toBe(true);
+  });
   it("preserves file identity during a case-only rename on case-insensitive macOS volumes", async () => {
     const { store, vault } = testStore();
     const source = path.join(vault, "CaseNote.md");
