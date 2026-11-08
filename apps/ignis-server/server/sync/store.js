@@ -5,6 +5,11 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { resolveVaultPath } = require("@ignis/server-core");
+const { preflightMediaOwnership } = require("../../../../packages/sync-policy/src/preflight");
+const { createContentScope } = require("../../../../packages/sync-policy/src/content-scope");
+const {
+  normalizeMediaBypassExtensions,
+} = require("../../../../packages/sync-policy/src/media-bypass");
 
 const MAX_TEXT_BYTES = 4 * 1024 * 1024;
 const MAX_BINARY_BYTES = 4 * 1024 * 1024;
@@ -168,7 +173,23 @@ async function durableWrite(target, contents, exclusive = false) {
 }
 
 class VaultSyncStore {
-  constructor({ dataRoot, getVaultPath, collaboration, writeCoalescer }) {
+  constructor({ dataRoot, getVaultPath, collaboration, writeCoalescer,
+    contentScope = "all", contentScopes = {} }) {
+    const baseScope = createContentScope(contentScope);
+    if (!contentScopes || typeof contentScopes !== "object" ||
+        Array.isArray(contentScopes)) {
+      throw new Error("Invalid per-Vault content scopes");
+    }
+    const overrides = new Map(Object.entries(contentScopes).map(
+      ([vaultId, scope]) => {
+        if (!vaultId || vaultId.length > 200 ||
+            [...vaultId].some((char) => char.charCodeAt(0) < 32 ||
+              char.charCodeAt(0) === 127)) {
+          throw new Error("Invalid content-scope Vault ID");
+        }
+        return [vaultId, createContentScope(scope)];
+      }
+    ));
     fs.mkdirSync(path.join(dataRoot, "sync"), { recursive: true });
     this.db = new DatabaseSync(path.join(dataRoot, "sync", "vault.sqlite"));
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
@@ -182,7 +203,16 @@ class VaultSyncStore {
       "CREATE TABLE IF NOT EXISTS operations (vault_id TEXT NOT NULL, op_id TEXT NOT NULL, request_hash TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(vault_id, op_id));",
       "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, revoked_at INTEGER);",
       "CREATE INDEX IF NOT EXISTS devices_by_vault ON devices(vault_id, revoked_at);",
+      "CREATE TABLE IF NOT EXISTS vault_content_scopes (vault_id TEXT PRIMARY KEY, scope TEXT NOT NULL);",
+      // Admin-selected choices are the durable override; environment values
+      // remain defaults for Vaults with no explicit owner preference.
+      "CREATE TABLE IF NOT EXISTS vault_sync_preferences (vault_id TEXT PRIMARY KEY, content_scope TEXT NOT NULL);",
+      // Kept separate from the historical two-valued scope for a non-breaking
+      // upgrade. Server authorization is the upper bound for every device.
+      "CREATE TABLE IF NOT EXISTS vault_sync_media_bypass (vault_id TEXT PRIMARY KEY, extensions_json TEXT NOT NULL);",
     ].join("\n"));
+    this.contentScope = baseScope;
+    this.contentScopeOverrides = overrides;
     this.getVaultPath = getVaultPath;
     this.collaboration = collaboration;
     this.writeCoalescer = writeCoalescer;
@@ -311,22 +341,223 @@ class VaultSyncStore {
       e.status = 404;
       throw e;
     }
+    // Scope belongs to the durable Vault journal, not to an optional binary
+    // transport's process status. Never reinterpret previous binary history
+    // as a deletion when starting a Markdown-only server.
+    const scope = this.db.prepare(
+      "SELECT scope FROM vault_content_scopes WHERE vault_id=?"
+    ).get(vaultId);
+    const desired = this.desiredContentScope(vaultId);
+    if (scope?.scope !== desired.mode) {
+      // Before the first file or device enrollment, selecting another mode
+      // is safe and should not force a migration wizard. After history exists,
+      // scope changes require a coordinated handover across all devices.
+      const activity = this.db.prepare(
+        "SELECT (SELECT COUNT(*) FROM files WHERE vault_id=?)+" +
+        "(SELECT COUNT(*) FROM changes WHERE vault_id=?)+" +
+        "(SELECT COUNT(*) FROM devices WHERE vault_id=?) AS count"
+      ).get(vaultId, vaultId, vaultId);
+      if (activity.count && (scope || desired.mode === "markdown-only")) {
+        throw conflict("SCOPE_MIGRATION_REQUIRED",
+          "An active Vault journal requires an explicit content-scope migration");
+      }
+    }
+    if (!scope) {
+      this.db.prepare(
+        "INSERT OR IGNORE INTO vault_content_scopes(vault_id,scope) VALUES (?,?)"
+      ).run(vaultId, desired.mode);
+    } else if (scope.scope !== desired.mode) {
+      this.db.prepare(
+        "UPDATE vault_content_scopes SET scope=? WHERE vault_id=?"
+      ).run(desired.mode, vaultId);
+    }
     return root;
+  }
+  contentScopeFor(vaultId) {
+    this.root(vaultId);
+    return this.desiredContentScope(vaultId).mode;
+  }
+  mediaBypassFor(vaultId) {
+    if (!this.getVaultPath(vaultId)) {
+      const e = new Error("Vault not found");
+      e.status = 404;
+      throw e;
+    }
+    const row = this.db.prepare(
+      "SELECT extensions_json FROM vault_sync_media_bypass WHERE vault_id=?"
+    ).get(vaultId);
+    return row ? normalizeMediaBypassExtensions(JSON.parse(row.extensions_json)) :
+      normalizeMediaBypassExtensions();
+  }
+  desiredContentScope(vaultId) {
+    const bypass = this.mediaBypassFor(vaultId);
+    const preference = this.db.prepare(
+      "SELECT content_scope FROM vault_sync_preferences WHERE vault_id=?"
+    ).get(vaultId);
+    const mode = preference?.content_scope ||
+      this.contentScopeOverrides.get(vaultId)?.mode || this.contentScope.mode;
+    return createContentScope(mode, bypass);
+  }
+  permits(vaultId, rel) {
+    return this.desiredContentScope(vaultId).allowsPath(rel);
+  }
+  // Bypass expansion is additive. Reducing it on a Vault with registered
+  // devices or history needs a coordinated barrier: otherwise _scan would
+  // interpret a previously tracked document as deleted.
+  previewMediaBypass(vaultId, requested = null) {
+    const current = this.mediaBypassFor(vaultId);
+    const next = requested === null ? current :
+      normalizeMediaBypassExtensions(requested);
+    const removing = current.filter((extension) => !next.includes(extension));
+    const activity = this.db.prepare(
+      "SELECT (SELECT COUNT(*) FROM files WHERE vault_id=?) AS files," +
+      "(SELECT COUNT(*) FROM changes WHERE vault_id=?) AS events," +
+      "(SELECT COUNT(*) FROM devices WHERE vault_id=?) AS devices"
+    ).get(vaultId, vaultId, vaultId);
+    const canApply = removing.length === 0 ||
+      !(activity.files || activity.events || activity.devices);
+    return {
+      vaultId, extensions: current, requestedExtensions: next,
+      removedExtensions: removing,
+      canApply, reason: canApply ? null : "BYPASS_MIGRATION_REQUIRED",
+      trackedFiles: activity.files, journalEvents: activity.events,
+      registeredDevices: activity.devices,
+    };
+  }
+  setMediaBypass(vaultId, requested, expected) {
+    return this.locked(vaultId, () => {
+      const normalized = normalizeMediaBypassExtensions(requested);
+      const previous = normalizeMediaBypassExtensions(expected);
+      const current = this.mediaBypassFor(vaultId);
+      if (JSON.stringify(current) !== JSON.stringify(previous)) {
+        throw conflict("BYPASS_CHANGED", "Media bypass configuration changed; refresh");
+      }
+      const preview = this.previewMediaBypass(vaultId, normalized);
+      if (!preview.canApply) {
+        throw conflict("BYPASS_MIGRATION_REQUIRED",
+          "Removing existing bypass rules requires coordinated journal migration");
+      }
+      if (JSON.stringify(normalized) === JSON.stringify(current)) {
+        return { ...preview, applied: false };
+      }
+      this.db.prepare(
+        "INSERT INTO vault_sync_media_bypass(vault_id,extensions_json) VALUES(?,?)" +
+        " ON CONFLICT(vault_id) DO UPDATE SET extensions_json=excluded.extensions_json"
+      ).run(vaultId, JSON.stringify(normalized));
+      return { ...this.previewMediaBypass(vaultId), applied: true };
+    });
+  }
+  // Inspect without scanning the filesystem, assigning identities, touching
+  // the journal, or enabling Syncthing. Read-only and safe on existing Vaults.
+  previewContentScope(vaultId, requestedScope = null) {
+    if (!this.getVaultPath(vaultId)) {
+      const e = new Error("Vault not found");
+      e.status = 404;
+      throw e;
+    }
+    const requested = requestedScope === null ? null : createContentScope(requestedScope);
+    const persisted = this.db.prepare(
+      "SELECT scope FROM vault_content_scopes WHERE vault_id=?"
+    ).get(vaultId);
+    const preference = this.db.prepare(
+      "SELECT content_scope FROM vault_sync_preferences WHERE vault_id=?"
+    ).get(vaultId);
+    const active = this.db.prepare(
+      "SELECT (SELECT COUNT(*) FROM files WHERE vault_id=?) AS trackedFiles," +
+      "(SELECT COUNT(*) FROM changes WHERE vault_id=?) AS journalEvents," +
+      "(SELECT COUNT(*) FROM devices WHERE vault_id=?) AS registeredDevices"
+    ).get(vaultId, vaultId, vaultId);
+    const currentScope = persisted?.scope || this.desiredContentScope(vaultId).mode;
+    const changed = !!requested && requested.mode !== currentScope;
+    const historyExists = active.trackedFiles !== 0 ||
+      active.journalEvents !== 0 || active.registeredDevices !== 0;
+    const configured = this.desiredContentScope(vaultId).mode;
+    const configurationMismatch = !!persisted &&
+      persisted.scope !== configured && historyExists;
+    return {
+      vaultId, contentScope: currentScope,
+      source: preference ? "owner" : persisted ? "startup" : "not-enrolled",
+      trackedFiles: active.trackedFiles,
+      journalEvents: active.journalEvents,
+      registeredDevices: active.registeredDevices,
+      locked: historyExists,
+      canApply: !configurationMismatch && (!changed || !historyExists),
+      configurationMismatch,
+      requestedScope: requested?.mode || null,
+      reason: configurationMismatch ? "CONFIGURATION_MISMATCH" :
+        changed && historyExists ? "SCOPE_MIGRATION_REQUIRED" : null,
+    };
+  }
+  setContentScope(vaultId, requestedScope, expectedScope) {
+    return this.locked(vaultId, () => {
+      const requested = createContentScope(requestedScope);
+      createContentScope(expectedScope);
+      const preview = this.previewContentScope(vaultId, requested.mode);
+      if (preview.contentScope !== expectedScope) {
+        throw conflict("SCOPE_CHANGED", "Vault scope changed; refresh before saving");
+      }
+      if (!preview.canApply) {
+        throw conflict(preview.reason || "SCOPE_MIGRATION_REQUIRED",
+          "Vault scope requires review of existing history and devices");
+      }
+      if (preview.source === "owner" && preview.contentScope === requested.mode) {
+        return { ...preview, applied: false };
+      }
+      // Both values commit together; a restart must never momentarily adopt
+      // an old environment default or erase an earlier file history.
+      withTransaction(this.db, () => {
+        this.db.prepare(
+          "INSERT INTO vault_sync_preferences(vault_id,content_scope) VALUES(?,?)" +
+          " ON CONFLICT(vault_id) DO UPDATE SET content_scope=excluded.content_scope"
+        ).run(vaultId, requested.mode);
+        this.db.prepare(
+          "INSERT INTO vault_content_scopes(vault_id,scope) VALUES(?,?)" +
+          " ON CONFLICT(vault_id) DO UPDATE SET scope=excluded.scope"
+        ).run(vaultId, requested.mode);
+      });
+      return { ...this.previewContentScope(vaultId, requested.mode), applied: true };
+    });
+  }
+  // Read-only preview. A history-aware barrier is mandatory before the Vault
+  // scanner may ever stop tracking a subtree, or it could generate tombstones.
+  preflightMediaOwnership(vaultId, roots) {
+    return this.locked(vaultId, () => {
+      const activeDeviceCount = this.db.prepare(
+        "SELECT COUNT(*) AS count FROM devices WHERE vault_id=? AND revoked_at IS NULL"
+      ).get(vaultId).count;
+      const self = this;
+      function* journalPaths() {
+        for (const row of self.db.prepare(
+          "SELECT path FROM files WHERE vault_id=?"
+        ).iterate(vaultId)) yield row;
+        for (const row of self.db.prepare(
+          "SELECT path, to_path AS toPath FROM changes WHERE vault_id=?"
+        ).iterate(vaultId)) yield row;
+      }
+      return preflightMediaOwnership({
+        vaultRoot: this.root(vaultId), roots,
+        journalPaths: journalPaths(), activeDeviceCount,
+      });
+    });
   }
   head(vaultId) {
     return this.db.prepare("SELECT seq FROM vaults WHERE vault_id=?").get(vaultId)?.seq || 0;
   }
   fileByPath(vaultId, rel) {
+    if (!this.permits(vaultId, rel)) return null;
     return this.db.prepare("SELECT * FROM files WHERE vault_id=? AND path=? AND deleted=0").get(vaultId, rel);
   }
   fileById(vaultId, id) {
-    return this.db.prepare("SELECT * FROM files WHERE vault_id=? AND file_id=? AND deleted=0").get(vaultId, id);
+    const row = this.db.prepare(
+      "SELECT * FROM files WHERE vault_id=? AND file_id=? AND deleted=0"
+    ).get(vaultId, id);
+    return row && this.permits(vaultId, row.path) ? row : null;
   }
   manifest(vaultId) {
     this.root(vaultId);
     return { vaultId, vaultSeq: this.head(vaultId), files: this.db.prepare(
       "SELECT file_id AS fileId, generation_id AS generationId, path, revision, hash, size FROM files WHERE vault_id=? AND deleted=0 ORDER BY path"
-    ).all(vaultId) };
+    ).all(vaultId).filter((file) => this.permits(vaultId, file.path)) };
   }
   changes(vaultId, since, limit = 200) {
     this.root(vaultId);
@@ -384,32 +615,56 @@ class VaultSyncStore {
     this.notify(event);
     return event;
   }
-  async _filesOnDisk(root) {
+  async _filesOnDisk(root, vaultId) {
     const result = new Map();
+    const oversizedBypass = new Set();
+    // Resolve the persisted policy once per scan. A Vault can hold hundreds
+    // of thousands of media entries; an SQLite preference lookup for every
+    // child would make the Markdown-only preview unnecessarily expensive.
+    const contentScope = this.desiredContentScope(vaultId);
     const visit = async (rel) => {
       const dir = path.join(root, rel);
       for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
         const child = rel ? rel + "/" + entry.name : entry.name;
         if (!permittedPath(child) || entry.isSymbolicLink()) continue;
         if (entry.isDirectory()) await visit(child);
-        else if (entry.isFile()) {
+        else if (entry.isFile() && contentScope.allowsPath(child)) {
           const absolute = path.join(root, child);
           // The old Ignis shim can acknowledge a coalesced write before
           // its delayed disk flush. Drain it before hashing the canonical
           // on-disk source; never journal a known stale snapshot.
           await this.writeCoalescer.flushPending(absolute);
+          if (contentScope.mode === "markdown-only" &&
+              !child.toLowerCase().endsWith(".md")) {
+            // A bypass is only a route for mobile-safe small files, never a
+            // way to start hashing/advertising a multi-gigabyte media file.
+            // Keep oversized entries distinct from missing files: otherwise
+            // an existing journal row would be mistaken for a deletion.
+            const stat = await fs.promises.lstat(absolute).catch((error) => {
+              if (error.code === "ENOENT") return null;
+              throw error;
+            });
+            if (stat && stat.isFile() && stat.size > MAX_BINARY_BYTES) {
+              oversizedBypass.add(child);
+              continue;
+            }
+          }
           const snapshot = await inspectFile(absolute);
           if (snapshot) result.set(child, snapshot);
         }
       }
     };
     await visit("");
-    return result;
+    return { disk: result, oversizedBypass };
   }
   async _scan(vaultId) {
     const root = this.root(vaultId);
-    const disk = await this._filesOnDisk(root);
+    const { disk, oversizedBypass } = await this._filesOnDisk(root, vaultId);
     const known = this.db.prepare("SELECT * FROM files WHERE vault_id=? AND deleted=0").all(vaultId);
+    if (known.some((file) => oversizedBypass.has(file.path))) {
+      throw conflict("OVERSIZE_MEDIA_BYPASS",
+        "A tracked bypass file exceeds the 4 MiB limit; the journal was left unchanged");
+    }
     const knownPaths = new Set(known.map((f) => f.path));
     const histories = new Map();
     const newByIdentity = new Map();
@@ -585,6 +840,10 @@ class VaultSyncStore {
         const e = new Error("Invalid operation");
         e.status = 400;
         throw e;
+      }
+      if (!this.permits(vaultId, input.path) ||
+          (input.type === "rename" && !this.permits(vaultId, input.toPath))) {
+        throw conflict("OUT_OF_SCOPE", "File type is excluded from this Vault's sync");
       }
       const requestHash = hash(Buffer.from(JSON.stringify(input)));
       const previous = this.db.prepare(

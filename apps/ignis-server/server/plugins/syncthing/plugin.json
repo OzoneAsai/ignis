@@ -1,0 +1,8 @@
+{
+  "id": "syncthing",
+  "name": "Syncthing",
+  "description": "Optional process-isolated controller for Syncthing media replication",
+  "scope": "server",
+  "runtime": "sidecar",
+  "entry": "./worker.js"
+}

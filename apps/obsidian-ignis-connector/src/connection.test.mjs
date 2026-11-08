@@ -129,6 +129,34 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     expect(socket.sent).toEqual([{ channel: "sync", type: "auth" }]);
   });
 
+  it("adopts the server's Markdown-only scope without requiring Syncthing", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const plugin = connector();
+    plugin.app = { secretStorage: null };
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    plugin.live.resetForConnection = vi.fn().mockResolvedValue(undefined);
+    plugin.settings.pendingWrites = [];
+    plugin.settings.syncIssues = [];
+    plugin.settings.archivedScopes = [];
+    plugin.settings.cursor = 0;
+    plugin.settings.contentScope = "all";
+    mockRequest.mockResolvedValueOnce({
+      status: 200, json: {
+        auth: "tailnet", vaultId: "MarkdownTest", deviceId: "sls-test",
+        contentScope: "markdown-only",
+      },
+    });
+    const response = await plugin.connectToServer({
+      serverUrl: "https://mac.example:8452/join/MarkdownTest",
+      vaultId: "", token: "",
+    });
+    expect(response.ok).toBe(true);
+    expect(response.message).toContain("Markdown-only sharing");
+    expect(plugin.settings.contentScope).toBe("markdown-only");
+    expect(plugin.fileScope.allowsPath("Notes/sls.md")).toBe(true);
+    expect(plugin.fileScope.allowsPath("Media/photo.jpg")).toBe(false);
+  });
+
   it("does not forward stale collaboration frames after replacing a socket", () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const plugin = connector();

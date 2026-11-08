@@ -1,6 +1,6 @@
 // Browser Markdown collaboration: bind the existing Obsidian Editor to Y.Text.
 // The shared Ignis WebSocket transports Yjs updates, not whole-file snapshots.
-import { MarkdownView, Modal } from "obsidian";
+import { MarkdownView, Modal, setIcon } from "obsidian";
 import * as Y from "yjs";
 import { createOfflineDocument, CROSS_TAB_ORIGIN } from "./collaboration-offline.js";
 import { saveOfflineNote } from "../../shim/src/offline-boot.js";
@@ -13,24 +13,95 @@ import {
   reconcileEditor as reconcileEditorState,
 } from "./collaboration-editor.js";
 import {
+  beginComposition, publishComposition, commitComposition
+} from "./composition-rebase.js";
+import {
+  preferredDisplayName, saveDisplayName
+} from "./collaboration-identity.js";
+import { mobileConnectionState } from "./mobile-connection-state.js";
+import { showFilePicker, showFileRename } from "./file-actions.js";
+import { mountMobileNavbarAction } from "../../server-core/src/mobile-navbar.ts";
+import { mobileUiCopy, mobileUiLanguage } from "../../server-core/src/mobile-ui-copy.ts";
+import {
   createCursorOverlay,
   encodeCursorSelections,
 } from "./collaboration-cursors.js";
 
 const REMOTE = "remote";
 const LOCAL = "local";
-const NAME_KEY = "ignis-collab-display-name";
 const TAB_KEY = "ignis-collab-tab-id";
 
+class MobileIgnisActionsModal extends Modal {
+  constructor(app, getStatus, onUpload, onRename, onPeople) {
+    super(app);
+    this.getStatus = getStatus;
+    this.onUpload = onUpload;
+    this.onRename = onRename;
+    this.onPeople = onPeople;
+  }
+
+  onOpen() {
+    const t = mobileUiCopy();
+    const root = this.contentEl;
+    root.addClass("ignis-mobile-action-menu");
+    root.createEl("h3", { text: "Ignis" });
+    this.connectionLabel = root.createEl("p", { cls: "ignis-mobile-action-state" });
+    this.noteLabel = root.createEl("p", { cls: "ignis-mobile-action-detail" });
+    this.refreshStatus();
+    const addAction = (text, callback) => {
+      const button = root.createEl("button", { text });
+      button.type = "button";
+      button.addEventListener("click", () => {
+        this.close();
+        callback();
+      });
+    };
+    addAction(t.upload, this.onUpload);
+    addAction(t.rename, this.onRename);
+    addAction(t.people, this.onPeople);
+  }
+
+  refreshStatus() {
+    if (!this.connectionLabel) return;
+    const { connection, detail } = this.getStatus();
+    this.connectionLabel.setText(`${mobileUiCopy().status}: ${connection}`);
+    this.noteLabel.setText(detail);
+  }
+
+  onClose() {
+    this.connectionLabel = null;
+    this.noteLabel = null;
+  }
+}
+
+function availableStorage(key) {
+  try {
+    return window[key];
+  } catch {
+    return null;
+  }
+}
+
 function ownDisplayName() {
-  let tabId = sessionStorage.getItem(TAB_KEY);
+  const tabStorage = availableStorage("sessionStorage");
+  let tabId;
+  try {
+    tabId = tabStorage?.getItem(TAB_KEY);
+  } catch {
+    // Private PWA contexts may deny storage access.
+  }
 
   if (!tabId) {
     tabId = crypto.randomUUID();
-    sessionStorage.setItem(TAB_KEY, tabId);
+    try {
+      tabStorage?.setItem(TAB_KEY, tabId);
+    } catch {
+      // The session still has an ephemeral guest label.
+    }
   }
 
-  return sessionStorage.getItem(NAME_KEY) || `Guest ${tabId.slice(0, 4)}`;
+  return preferredDisplayName(availableStorage("localStorage"), tabStorage) ||
+    `Guest ${tabId.slice(0, 4)}`;
 }
 
 class PeopleModal extends Modal {
@@ -228,6 +299,8 @@ export function initCollaboration(plugin) {
   const channel = ws.channel("collab");
   const status = plugin.addStatusBarItem();
   status.addClass("ignis-collaboration-status");
+  const writes = window.__ignis.writes;
+  let transportState = ws.isOpen() ? "open" : "connecting";
 
   let session = null;
   const sessions = new Map();
@@ -253,15 +326,12 @@ export function initCollaboration(plugin) {
   function showPeople() {
     peopleModal?.close();
     peopleModal = new PeopleModal(plugin.app, people, ownDisplayName, (value) => {
-      // eslint-disable-next-line no-control-regex
-      const clean = value.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
-        .trim().slice(0, 40);
+      const clean = saveDisplayName(value,
+        availableStorage("localStorage"), availableStorage("sessionStorage"));
 
       if (!clean) {
         return;
       }
-
-      sessionStorage.setItem(NAME_KEY, clean);
 
       if (session?.self) {
         session.self.name = clean;
@@ -325,6 +395,50 @@ export function initCollaboration(plugin) {
     }
   });
 
+  // One icon in Obsidian's own bottom navbar. A separate fixed dock would
+  // cover notes and collide with iOS Safari's navigation controls.
+  const navbarAction = document.createElement("div");
+  navbarAction.className = "mobile-navbar-action ignis-navbar-action";
+  const navbarButton = document.createElement("button");
+  navbarButton.type = "button";
+  navbarButton.className = "ignis-navbar-trigger";
+  navbarButton.setAttribute("aria-haspopup", "dialog");
+  navbarButton.setAttribute("aria-label", "Ignis: " + mobileUiCopy().openActions);
+  setIcon(navbarButton, "flame");
+  const connectionDot = document.createElement("span");
+  connectionDot.className = "ignis-navbar-connection-dot";
+  connectionDot.setAttribute("aria-hidden", "true");
+  navbarButton.appendChild(connectionDot);
+  navbarAction.appendChild(navbarButton);
+  let mobileMenu = null;
+  const openMobileMenu = () => {
+    mobileMenu?.close();
+    mobileMenu = new MobileIgnisActionsModal(plugin.app, () => {
+      const projection = mobileConnectionState(
+        session, transportState, writes?.getState?.() || "clean",
+        writes?.listFailed?.().length || 0, mobileUiLanguage(),
+      );
+      return {
+        connection: projection.label,
+        detail: collaborationStatus(session, ws.isOpen()) || mobileUiCopy().noNote,
+      };
+    }, () => showFilePicker(plugin.app), () => showFileRename(plugin.app), showPeople);
+    mobileMenu.open();
+  };
+  navbarButton.addEventListener("click", openMobileMenu);
+  const unmountNavbarAction = mountMobileNavbarAction(navbarAction);
+
+  plugin.addCommand({
+    id: "show-collaboration-people-and-name",
+    name: "共同編集: 参加者と表示名を変更",
+    callback: showPeople,
+  });
+  plugin.addCommand({
+    id: "open-mobile-ignis-actions",
+    name: "Ignis: 接続状態・ファイル追加・ファイル名変更・参加者",
+    callback: openMobileMenu,
+  });
+
   function renderPeers(current) {
     const members = [...current.people.values()];
     const counts = new Map();
@@ -353,6 +467,15 @@ export function initCollaboration(plugin) {
     if (status.textContent !== label) {
       status.setText(label);
     }
+    const connection = mobileConnectionState(
+      session, transportState, writes?.getState?.() || "clean",
+      writes?.listFailed?.().length || 0, mobileUiLanguage(),
+    );
+    navbarAction.dataset.connection = connection.kind;
+    navbarButton.setAttribute("aria-label",
+      `Ignis: ${connection.label} · ${mobileUiCopy().openActions}`);
+    navbarButton.setAttribute("title", `Ignis: ${connection.label}`);
+    mobileMenu?.refreshStatus();
   }
 
   function sendJoin(current) {
@@ -434,7 +557,8 @@ export function initCollaboration(plugin) {
   }
 
   function sendSelection(current) {
-    if (!current || !current.initialized || !current.joined || !ws.isOpen() || current.suppress) {
+    if (!current || !current.initialized || !current.joined || !ws.isOpen() ||
+        current.suppress || current.composing) {
       return;
     }
 
@@ -493,29 +617,38 @@ export function initCollaboration(plugin) {
       return;
     }
 
-    // Keep the original Y.Doc fixed during native IME composition. A remote
-    // update received mid-composition must not rewrite the composing DOM.
-    // Apply the author's completed change first, then merge buffered remote
-    // CRDT operations. This preserves both inputs and CodeMirror's IME state.
+    // The composing browser DOM stays at its frozen baseline, while remote
+    // Yjs edits and interim IME text have remained live for other panes and
+    // tabs. Commit the final input from that frozen CRDT history.
     const editor = current.composingEditor || current.editor;
+    let committed = false;
     current.sourceEditor = editor;
     try {
-      applyLocalChange(current.text, editor.getValue());
+      commitComposition(current.doc, current.imeSnapshot, editor.getValue(), LOCAL);
+      committed = true;
+    } catch (error) {
+      // Never replace uncommitted user input with a remote snapshot on error.
+      current.pendingConflict = editor.getValue();
+      current.protocolError = "IME draft could not be merged · recoverable text retained";
+      console.error("[collab] IME commit failed:", error);
     } finally {
       current.sourceEditor = null;
+      current.composing = false;
+      current.composingEditor = null;
+      current.imeSnapshot = null;
     }
-    current.composing = false;
-    current.composingEditor = null;
-
-    // The same origin may receive edits over BroadcastChannel, bypassing the
-    // WebSocket update handler. Apply both transports only after IME commits.
     current.local.flushPeerUpdates();
-
-    for (const update of current.pendingRemote.splice(0)) {
-      Y.applyUpdate(current.doc, update, REMOTE);
+    if (committed) {
+      current.suppress = true;
+      try {
+        reconcileEditorState(editor, current.text.toString());
+      } finally {
+        current.suppress = false;
+      }
+      renderPeers(current);
+      scheduleSelection(current);
     }
-
-    scheduleSelection(current);
+    render();
   }
 
   function bindEditor(current, editor) {
@@ -599,9 +732,16 @@ export function initCollaboration(plugin) {
     }
 
     const onCompositionStart = () => {
-      if (current.initialized) {
+      if (current.initialized && !current.composing) {
+        current.imeSnapshot = beginComposition(current.doc);
         current.composing = true;
         current.composingEditor = editor;
+        if (current === session) {
+          // Uncommitted IME glyphs are not represented in shared Y.Text.
+          // Publishing their apparent editor offsets would misplace a remote
+          // cursor (particularly with Firefox's composition line boxes).
+          clearSelection(current);
+        }
       }
     };
     const onCompositionEnd = () => {
@@ -720,8 +860,8 @@ export function initCollaboration(plugin) {
       sourceEditor: null,
       composing: false,
       composingEditor: null,
+      imeSnapshot: null,
       compositionTimer: null,
-      pendingRemote: [],
     };
 
     const local = createOfflineDocument(window.__currentVaultId, file.path, (storage) => {
@@ -730,7 +870,7 @@ export function initCollaboration(plugin) {
         next.storageError = storage.error;
         render();
       }
-    }, () => next.composing || Boolean(next.generationMismatch));
+    }, () => Boolean(next.generationMismatch));
     const { doc, text } = local;
     next.doc = doc;
     next.text = text;
@@ -762,7 +902,8 @@ export function initCollaboration(plugin) {
 
         try {
           for (const binding of next.bindings.values()) {
-            if (binding.editor !== next.sourceEditor) {
+            if (binding.editor !== next.sourceEditor &&
+                !(next.composing && binding.editor === next.composingEditor)) {
               if (!patchEditor(binding.editor, next.text, event.delta)) {
                 reconcileEditorState(binding.editor, next.text.toString());
               }
@@ -999,11 +1140,9 @@ export function initCollaboration(plugin) {
       try {
         const bytes = decodeUpdate(msg.update);
 
-        if (current.composing) {
-          current.pendingRemote.push(bytes);
-        } else {
-          Y.applyUpdate(current.doc, bytes, REMOTE);
-        }
+        // Remote state is always live. Only the composing DOM is deferred,
+        // so another pane can display changes without disturbing IME input.
+        Y.applyUpdate(current.doc, bytes, REMOTE);
       } catch (error) {
         console.error("[collab] Invalid remote update:", error);
       }
@@ -1084,6 +1223,7 @@ export function initCollaboration(plugin) {
       }
     }),
     ws.onStateChange((state) => {
+      transportState = state;
       for (const current of sessions.values()) {
         current.joined = false;
 
@@ -1099,6 +1239,11 @@ export function initCollaboration(plugin) {
       render();
     }),
   ];
+  if (writes?.onStateChange) {
+    unsubscribe.push(writes.onStateChange(() => render()));
+    unsubscribe.push(writes.onFailure(() => render()));
+    unsubscribe.push(writes.onFailureChange(() => render()));
+  }
 
   plugin.registerEvent(plugin.app.workspace.on("active-leaf-change", scheduleActive));
   plugin.registerEvent(plugin.app.workspace.on("file-open", scheduleActive));
@@ -1106,14 +1251,22 @@ export function initCollaboration(plugin) {
   plugin.registerEvent(plugin.app.workspace.on("editor-change", (editor) => {
     for (const current of sessions.values()) {
       if (!current.bindings.has(editor) || !current.initialized ||
-          current.suppress || current.composing || current.generationMismatch) {
+          current.suppress ||
+          current.generationMismatch) {
         continue;
       }
 
       current.sourceEditor = editor;
 
       try {
-        applyLocalChange(current.text, editor.getValue());
+        if (current.composing && current.composingEditor === editor) {
+          // Publish provisional phonetic/converted text to other clients on
+          // each editor transaction, while never reconciling the composing
+          // CodeMirror view against remote Yjs changes.
+          publishComposition(current.doc, current.imeSnapshot, editor.getValue(), LOCAL);
+        } else {
+          applyLocalChange(current.text, editor.getValue());
+        }
       } finally {
         current.sourceEditor = null;
       }
@@ -1133,6 +1286,7 @@ export function initCollaboration(plugin) {
   return () => {
     clearTimeout(activeTimer);
     peopleModal?.close();
+    mobileMenu?.close();
 
     for (const current of sessions.values()) {
       dispose(current);
@@ -1143,6 +1297,7 @@ export function initCollaboration(plugin) {
     }
 
     status.remove();
+    unmountNavbarAction();
     delete window.__ignis.collaboration;
   };
 }

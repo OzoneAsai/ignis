@@ -2,6 +2,7 @@
 // insertions/deletions can rebase the remote caret without absolute offsets.
 import { resolveCursorSelections } from "./collab-cursor-protocol.js";
 import { visibleSelectionGlyphRects, MAX_GLYPH_FRAGMENTS } from "./selection-glyphs.js";
+import { observeCursorViewport } from "../../server-core/src/cursor-viewport.ts";
 export {
   MAX_SHARED_SELECTIONS, encodeCursorSelection, encodeCursorSelections,
   selectionEntries, resolveCursorSelection, resolveCursorSelections
@@ -272,8 +273,7 @@ export function createCursorOverlay(session) {
   }
 
   const onScroll = () => render();
-  cm.scrollDOM?.addEventListener("scroll", onScroll, { passive: true });
-  window.addEventListener("resize", onScroll);
+  const detachGeometry = observeCursorViewport(cm.dom, cm.scrollDOM, onScroll);
   // Text reflow may move an anchor while the editor bounds remain unchanged.
   // contentDOM never contains this overlay, so observing it cannot self-loop.
   const mutationObserver = typeof MutationObserver !== "undefined" && cm.contentDOM
@@ -299,8 +299,7 @@ export function createCursorOverlay(session) {
       }
 
       observer?.disconnect();
-      cm.scrollDOM?.removeEventListener("scroll", onScroll);
-      window.removeEventListener("resize", onScroll);
+      detachGeometry();
       mutationObserver?.disconnect();
       fonts?.removeEventListener?.("loadingdone", onScroll);
       root.remove();

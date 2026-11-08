@@ -5,6 +5,7 @@ import * as serverPluginsTab from "./server-plugins-tab.js";
 import * as serverSettings from "./server-settings.js";
 import * as pluginList from "./plugin-list.js";
 import { IgnisSettingTab, createNavEl, createGroup } from "./settings-ui.js";
+import { patchNativeMobileToolbarSettings } from "./mobile-toolbar-setting.js";
 import {
   allIgnisNavEls,
   setupPluginTabs,
@@ -169,6 +170,7 @@ function patchSettingsModal(plugin) {
   const setting = plugin.app.setting;
   const original = setting.onOpen;
   plugin._originalOnOpen = original;
+  plugin._unpatchToolbarPage = patchNativeMobileToolbarSettings(plugin.app);
 
   ignisTabs = createIgnisTabs(plugin.app);
 
@@ -196,6 +198,7 @@ function patchSettingsModal(plugin) {
 
 function unpatchSettingsModal(plugin) {
   const setting = plugin.app.setting;
+  plugin._unpatchToolbarPage?.();
 
   if (plugin._originalOnOpen) {
     setting.onOpen = plugin._originalOnOpen;

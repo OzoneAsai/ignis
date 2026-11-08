@@ -1,4 +1,4 @@
-/* Ignis Connector v0.1.0-beta.6 */
+/* Ignis Connector v0.1.5-beta.1 */
 "use strict";
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -6,6 +6,9 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __commonJS = (cb, mod) => function __require() {
+  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
 var __export = (target, all2) => {
   for (var name in all2)
     __defProp(target, name, { get: all2[name], enumerable: true });
@@ -27,6 +30,161 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// ../../packages/sync-policy/src/index.js
+var require_src = __commonJS({
+  "../../packages/sync-policy/src/index.js"(exports, module2) {
+    var RESERVED = /* @__PURE__ */ new Set([".obsidian", ".git", ".trash", ".ignis-connector"]);
+    function canonicalPath(relative) {
+      if (typeof relative !== "string" || !relative || relative.length > 2048 || relative.includes("\\") || relative.includes("\0") || relative.startsWith("/") || /[\r\n]/u.test(relative)) {
+        throw new Error("Invalid relative Vault path");
+      }
+      const parts = relative.normalize("NFC").split("/");
+      if (parts.some((part) => !part || part === "." || part === "..")) {
+        throw new Error("Invalid Vault path segment");
+      }
+      return parts.join("/");
+    }
+    function excluded(relative) {
+      return relative.split("/").some((part) => {
+        const lower = part.toLocaleLowerCase("en-US");
+        return RESERVED.has(lower) || lower.startsWith(".ignis-sync-tmp-") || lower.startsWith(".ignis-collab-tmp-");
+      });
+    }
+    function comparisonKey(relative) {
+      return canonicalPath(relative).toLocaleLowerCase("en-US");
+    }
+    function isInside(root, relative) {
+      return relative === root || relative.startsWith(root + "/");
+    }
+    function createSyncPolicy({ enabled = false, roots = [] } = {}) {
+      if (typeof enabled !== "boolean" || !Array.isArray(roots)) {
+        throw new Error("Invalid synchronization policy");
+      }
+      const canonRoots = roots.map((raw) => {
+        const normalized = canonicalPath(raw);
+        if (excluded(normalized) || normalized.toLowerCase().endsWith(".md")) {
+          throw new Error("Syncthing root must be an ordinary folder");
+        }
+        return comparisonKey(normalized);
+      });
+      for (let i = 0; i < canonRoots.length; i += 1) {
+        for (let j = i + 1; j < canonRoots.length; j += 1) {
+          if (isInside(canonRoots[i], canonRoots[j]) || isInside(canonRoots[j], canonRoots[i])) {
+            throw new Error("Overlapping Syncthing roots");
+          }
+        }
+      }
+      const rootSet = Object.freeze(canonRoots);
+      function ownerFor(relative) {
+        let normalized;
+        try {
+          normalized = canonicalPath(relative);
+        } catch {
+          return "internal";
+        }
+        if (excluded(normalized))
+          return "internal";
+        if (!enabled)
+          return "ignis";
+        const lower = comparisonKey(normalized);
+        const managed = rootSet.some((root) => isInside(root, lower));
+        if (!managed)
+          return "ignis";
+        return lower.endsWith(".md") ? "conflict" : "syncthing";
+      }
+      return Object.freeze({ enabled, roots: rootSet, ownerFor });
+    }
+    module2.exports = { createSyncPolicy, canonicalPath };
+  }
+});
+
+// ../../packages/sync-policy/src/media-bypass.js
+var require_media_bypass = __commonJS({
+  "../../packages/sync-policy/src/media-bypass.js"(exports, module2) {
+    var MEDIA_BYPASS_TYPES2 = Object.freeze([
+      "pdf",
+      "docx",
+      "xlsx",
+      "pptx",
+      "doc",
+      "xls",
+      "ppt",
+      "odt",
+      "ods",
+      "odp",
+      "epub",
+      "png",
+      "jpg",
+      "jpeg",
+      "gif",
+      "webp",
+      "heic",
+      "mp3",
+      "m4a",
+      "wav",
+      "mp4",
+      "mov"
+    ]);
+    var KNOWN = new Set(MEDIA_BYPASS_TYPES2);
+    function normalizeMediaBypassExtensions3(value = []) {
+      if (!Array.isArray(value) || value.length > MEDIA_BYPASS_TYPES2.length) {
+        throw new Error("Invalid media bypass extension list");
+      }
+      const extensions = value.map((raw) => {
+        if (typeof raw !== "string" || !/^[a-zA-Z0-9]{2,6}$/.test(raw)) {
+          throw new Error("Invalid media bypass extension");
+        }
+        const extension = raw.toLowerCase();
+        if (!KNOWN.has(extension)) {
+          throw new Error("Unsupported media bypass extension");
+        }
+        return extension;
+      });
+      return Object.freeze([...new Set(extensions)].sort());
+    }
+    function bypassesPath(relative, extensions) {
+      if (typeof relative !== "string")
+        return false;
+      const name = relative.split("/").at(-1);
+      const dot = name?.lastIndexOf(".") ?? -1;
+      if (dot <= 0 || dot === name.length - 1)
+        return false;
+      return extensions.includes(name.slice(dot + 1).toLowerCase());
+    }
+    module2.exports = {
+      MEDIA_BYPASS_TYPES: MEDIA_BYPASS_TYPES2,
+      normalizeMediaBypassExtensions: normalizeMediaBypassExtensions3,
+      bypassesPath
+    };
+  }
+});
+
+// ../../packages/sync-policy/src/content-scope.js
+var require_content_scope = __commonJS({
+  "../../packages/sync-policy/src/content-scope.js"(exports, module2) {
+    var { createSyncPolicy } = require_src();
+    var {
+      normalizeMediaBypassExtensions: normalizeMediaBypassExtensions3,
+      bypassesPath
+    } = require_media_bypass();
+    var CONTENT_SCOPES = Object.freeze(["all", "markdown-only"]);
+    function createContentScope3(mode = "all", bypassExtensions = []) {
+      if (!CONTENT_SCOPES.includes(mode)) {
+        throw new Error("Unknown IGNIS sync content scope");
+      }
+      const base = createSyncPolicy();
+      const bypass = normalizeMediaBypassExtensions3(bypassExtensions);
+      function allowsPath(relative) {
+        if (base.ownerFor(relative) !== "ignis")
+          return false;
+        return mode !== "markdown-only" || relative.toLowerCase().endsWith(".md") || bypassesPath(relative, bypass);
+      }
+      return Object.freeze({ mode, bypassExtensions: bypass, allowsPath });
+    }
+    module2.exports = { CONTENT_SCOPES, createContentScope: createContentScope3 };
+  }
+});
 
 // src/main.ts
 var main_exports = {};
@@ -10123,6 +10281,53 @@ function visibleContentObstacles(contentDOM, space, viewport, limit = 1500) {
   }
 }
 
+// ../../packages/server-core/src/cursor-viewport.ts
+function observeCursorViewport(host, scrollDOM, repaint, viewportChange = repaint) {
+  const owner = host.ownerDocument.defaultView || window;
+  const originalPosition = host.style.getPropertyValue("position");
+  const originalPriority = host.style.getPropertyPriority("position");
+  let adjusted = false;
+  const ensureContainingBlock = () => {
+    if (owner.getComputedStyle(host).position === "static") {
+      host.style.setProperty("position", "relative", "important");
+      adjusted = true;
+    }
+  };
+  const onGeometryChange = () => {
+    ensureContainingBlock();
+    repaint();
+  };
+  const onCapturedScroll = (event) => {
+    const target = event.target;
+    if (!(target instanceof Node) || host.contains(target) || target.contains(host))
+      onGeometryChange();
+  };
+  const onViewportChange = () => {
+    ensureContainingBlock();
+    viewportChange();
+  };
+  ensureContainingBlock();
+  owner.addEventListener("scroll", onCapturedScroll, { capture: true, passive: true });
+  scrollDOM.addEventListener("scroll", onGeometryChange, { passive: true });
+  owner.addEventListener("resize", onViewportChange);
+  owner.visualViewport?.addEventListener("resize", onViewportChange);
+  owner.visualViewport?.addEventListener("scroll", onViewportChange);
+  return () => {
+    owner.removeEventListener("scroll", onCapturedScroll, true);
+    scrollDOM.removeEventListener("scroll", onGeometryChange);
+    owner.removeEventListener("resize", onViewportChange);
+    owner.visualViewport?.removeEventListener("resize", onViewportChange);
+    owner.visualViewport?.removeEventListener("scroll", onViewportChange);
+    if (adjusted && host.style.getPropertyValue("position") === "relative") {
+      if (originalPosition) {
+        host.style.setProperty("position", originalPosition, originalPriority);
+      } else {
+        host.style.removeProperty("position");
+      }
+    }
+  };
+}
+
 // src/selection-decorations.ts
 var import_state = require("@codemirror/state");
 var import_view = require("@codemirror/view");
@@ -10226,10 +10431,12 @@ var CursorOverlay = class {
       pointerEvents: "none",
       zIndex: "8"
     });
-    this.originalPosition = view.dom.style.position;
-    if (getComputedStyle(view.dom).position === "static") {
-      view.dom.style.position = "relative";
-    }
+    this.detachGeometry = observeCursorViewport(
+      view.dom,
+      view.scrollDOM,
+      this.scroll,
+      this.mobile ? this.mobileViewportChange : this.scroll
+    );
     view.dom.appendChild(this.root);
     this.roster = document.createElement("details");
     this.roster.className = "ignis-native-people-roster";
@@ -10293,15 +10500,9 @@ var CursorOverlay = class {
     if (mobile) {
       document.body.appendChild(this.roster);
       this.positionMobileRoster();
-      window.visualViewport?.addEventListener("resize", this.mobileViewportChange);
-      window.visualViewport?.addEventListener("scroll", this.mobileViewportChange);
     } else {
       view.dom.appendChild(this.roster);
     }
-    view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
-    window.addEventListener("resize", this.scroll);
-    if (mobile)
-      window.addEventListener("resize", this.mobileViewportChange);
     this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM ? new MutationObserver(this.scroll) : null;
     this.contentMutation?.observe(view.contentDOM, {
       subtree: true,
@@ -10322,7 +10523,7 @@ var CursorOverlay = class {
   peers = [];
   text = null;
   raf = 0;
-  originalPosition;
+  detachGeometry;
   scroll = () => this.schedule();
   contentMutation;
   mobileViewportChange = () => {
@@ -10580,18 +10781,11 @@ var CursorOverlay = class {
   }
   destroy() {
     this.clear();
-    this.view.scrollDOM.removeEventListener("scroll", this.scroll);
-    window.removeEventListener("resize", this.scroll);
+    this.detachGeometry();
     this.contentMutation?.disconnect();
     document.fonts?.removeEventListener?.("loadingdone", this.scroll);
-    if (this.mobile) {
-      window.visualViewport?.removeEventListener("resize", this.mobileViewportChange);
-      window.visualViewport?.removeEventListener("scroll", this.mobileViewportChange);
-      window.removeEventListener("resize", this.mobileViewportChange);
-    }
     this.root.remove();
     this.roster.remove();
-    this.view.dom.style.position = this.originalPosition;
   }
 };
 
@@ -11531,6 +11725,241 @@ function sessionError(status, body, expectedVaultId) {
   return null;
 }
 
+// ../../packages/server-core/src/vault-upload-path.ts
+function uniqueUploadPath(vault, folderPath, fileName) {
+  const name = String(fileName || "").split(/[\\/]/).pop();
+  if (!name || name === "." || name === "..") {
+    throw new Error("Invalid upload filename");
+  }
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  const normalizedFolder = String(folderPath || "").replace(/^\/+|\/+$/g, "");
+  const pathFor = (candidate) => normalizedFolder ? `${normalizedFolder}/${candidate}` : candidate;
+  const initial = pathFor(name);
+  if (!vault.getAbstractFileByPath(initial))
+    return initial;
+  for (let i = 1; i <= 9999; i++) {
+    const candidate = pathFor(`${stem} (${i})${ext}`);
+    if (!vault.getAbstractFileByPath(candidate))
+      return candidate;
+  }
+  throw new Error("No available filename for this upload");
+}
+
+// ../../packages/server-core/src/mobile-ui-copy.ts
+function mobileUiLanguage(storage = typeof localStorage === "undefined" ? null : localStorage, systemLanguage = typeof navigator === "undefined" ? "en" : navigator.language) {
+  let configured = null;
+  try {
+    configured = storage?.getItem("language") || null;
+  } catch {
+  }
+  return /^ja(?:-|$)/i.test(configured || systemLanguage || "en") ? "ja" : "en";
+}
+var strings = {
+  ja: {
+    status: "\u63A5\u7D9A\u30FB\u540C\u671F",
+    upload: "\u30D5\u30A1\u30A4\u30EB\u8FFD\u52A0",
+    chooseFile: "\u30D5\u30A1\u30A4\u30EB\u3092\u9078\u3076",
+    people: "\u53C2\u52A0\u8005\u30FB\u8868\u793A\u540D",
+    openPeople: "\u8A73\u7D30\u3092\u958B\u304F",
+    rename: "\u30D5\u30A1\u30A4\u30EB\u540D\u3092\u5909\u66F4",
+    noNote: "\u73FE\u5728\u30CE\u30FC\u30C8\u306F\u958B\u3044\u3066\u3044\u307E\u305B\u3093",
+    openActions: "\u63A5\u7D9A\u72B6\u614B\u30FB\u30D5\u30A1\u30A4\u30EB\u8FFD\u52A0\u30FB\u53C2\u52A0\u8005\u3092\u958B\u304F",
+    connecting: "\u63A5\u7D9A\u4E2D\u2026",
+    joining: "\u540C\u671F\u63A5\u7D9A\u4E2D\u2026",
+    offline: "\u30AA\u30D5\u30E9\u30A4\u30F3",
+    unconfigured: "\u672A\u63A5\u7D9A",
+    syncing: "\u540C\u671F\u4E2D\u2026",
+    synced: "\u540C\u671F\u6E08\u307F",
+    serverConnected: "\u30B5\u30FC\u30D0\u30FC\u63A5\u7D9A",
+    attention: "\u8981\u78BA\u8A8D"
+  },
+  en: {
+    status: "Connection & sync",
+    upload: "Add files",
+    chooseFile: "Choose files",
+    people: "Participants & display name",
+    openPeople: "View details",
+    rename: "Rename file",
+    noNote: "No note open",
+    openActions: "Open connection, files & participants",
+    connecting: "Connecting\u2026",
+    joining: "Connecting to note\u2026",
+    offline: "Offline",
+    unconfigured: "Not connected",
+    syncing: "Syncing\u2026",
+    synced: "Synced",
+    serverConnected: "Server connected",
+    attention: "Needs attention"
+  }
+};
+function mobileUiCopy(language = mobileUiLanguage()) {
+  return strings[language] || strings.en;
+}
+
+// src/mobile-controls.ts
+function nativeConnectionState(message, configured, socketOpen, language = "ja") {
+  const t = mobileUiCopy(language);
+  if (/revoked|unauthoriz|error|failed|need.s? review|conflict|blocked/i.test(message)) {
+    return { kind: "error", label: t.attention };
+  }
+  if (!configured)
+    return { kind: "offline", label: t.unconfigured };
+  if (!socketOpen)
+    return { kind: "offline", label: t.offline };
+  if (/syncing|pending|waiting|offline|reconnect|awaiting/i.test(message)) {
+    return { kind: "syncing", label: t.syncing };
+  }
+  if (/^Synced · server acknowledged$/i.test(message)) {
+    return { kind: "connected", label: t.synced };
+  }
+  return { kind: "connected", label: t.serverConnected };
+}
+async function importNativeFiles(vault, files, isSafePath, maxFileBytes = 4 * 1024 * 1024) {
+  let imported = 0;
+  let failed = 0;
+  let tooLarge = 0;
+  for (const file of files) {
+    if (!Number.isFinite(file.size) || file.size > maxFileBytes) {
+      tooLarge++;
+      continue;
+    }
+    try {
+      const path = uniqueUploadPath(vault, vault.getRoot().path, file.name);
+      if (!isSafePath(path)) {
+        failed++;
+        continue;
+      }
+      await vault.createBinary(path, await file.arrayBuffer());
+      imported++;
+    } catch {
+      failed++;
+    }
+  }
+  return { imported, failed, tooLarge };
+}
+
+// ../../packages/server-core/src/mobile-navbar.ts
+function mountMobileNavbarAction(action, doc2 = document) {
+  const attach = () => {
+    const navbar = doc2.querySelector(".mobile-navbar .mobile-navbar-actions");
+    const editing = doc2.querySelector(".mobile-toolbar .mobile-toolbar-options-list");
+    const useEditing = Boolean(editing && (doc2.body.classList.contains("mod-toolbar-open") || !navbar));
+    const target = useEditing ? editing : navbar;
+    if (!target || action.parentElement === target)
+      return;
+    action.classList.toggle("mobile-navbar-action", !useEditing);
+    action.classList.toggle("mobile-toolbar-option", useEditing);
+    if (useEditing) {
+      target.prepend(action);
+    } else {
+      target.appendChild(action);
+    }
+  };
+  const observer = new MutationObserver(attach);
+  observer.observe(doc2.body, { childList: true, subtree: true });
+  const modeObserver = new MutationObserver(attach);
+  modeObserver.observe(doc2.body, { attributes: true, attributeFilter: ["class"] });
+  attach();
+  return () => {
+    observer.disconnect();
+    modeObserver.disconnect();
+    action.remove();
+  };
+}
+
+// src/main.ts
+var import_content_scope2 = __toESM(require_content_scope());
+
+// src/sharing-settings.ts
+var import_content_scope = __toESM(require_content_scope());
+var import_media_bypass = __toESM(require_media_bypass());
+function formatLocalBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0)
+    return "0 B";
+  if (bytes < 1024)
+    return Math.floor(bytes) + " B";
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let index = -1;
+  do {
+    value /= 1024;
+    index += 1;
+  } while (value >= 1024 && index < units.length - 1);
+  return value.toFixed(1) + " " + units[index];
+}
+function effectiveContentScope(serverScope, deviceScope) {
+  if (serverScope === "markdown-only" || deviceScope === "markdown-only") {
+    return "markdown-only";
+  }
+  return "all";
+}
+function effectiveMediaBypassExtensions(serverScope, deviceScope, serverExtensions = [], selectedExtensions = []) {
+  const offered = (0, import_media_bypass.normalizeMediaBypassExtensions)(serverExtensions);
+  const selected = (0, import_media_bypass.normalizeMediaBypassExtensions)(selectedExtensions);
+  if (deviceScope !== "markdown-only")
+    return offered;
+  return selected.filter((extension) => serverScope === "all" || offered.includes(extension));
+}
+function sharingSummary(files, serverScope, deviceScope, pending = [], pendingWrites = [], serverBypassExtensions = [], deviceBypassExtensions = []) {
+  const effective = effectiveContentScope(serverScope, deviceScope);
+  const effectiveBypass = effectiveMediaBypassExtensions(
+    serverScope,
+    deviceScope,
+    serverBypassExtensions,
+    deviceBypassExtensions
+  );
+  const policy = (0, import_content_scope.createContentScope)(effective, effectiveBypass);
+  let sharedFiles = 0;
+  let localOnlyFiles = 0;
+  let oversizedFiles = 0;
+  let localOnlyBytes = 0;
+  for (const file of files) {
+    const bytes = Math.max(0, Number(file.stat?.size) || 0);
+    if (policy.allowsPath(file.path) && bytes <= 4 * 1024 * 1024) {
+      sharedFiles += 1;
+    } else if ((0, import_content_scope.createContentScope)("all").allowsPath(file.path)) {
+      localOnlyFiles += 1;
+      localOnlyBytes += bytes;
+      if (bytes > 4 * 1024 * 1024)
+        oversizedFiles += 1;
+    }
+  }
+  const blockedQueued = [...pending, ...pendingWrites].filter(
+    (item) => !policy.allowsPath(item.path) || item.toPath !== void 0 && !policy.allowsPath(item.toPath)
+  ).length;
+  return {
+    serverScope,
+    deviceScope,
+    effective,
+    effectiveBypass,
+    sharedFiles,
+    localOnlyFiles,
+    localOnlyBytes,
+    oversizedFiles,
+    pendingOperations: pending.length + pendingWrites.length,
+    blockedQueued
+  };
+}
+
+// src/main.ts
+var import_media_bypass2 = __toESM(require_media_bypass());
+
+// src/connection-recovery.ts
+function connectionRecoveryLabel(state, settings) {
+  if (state.ready) {
+    return "Connected to " + state.vaultId + (settings.authMode === "tailnet" ? " \xB7 Tailscale" : " \xB7 Device token");
+  }
+  if (state.vaultId && settings.serverUrl) {
+    if (settings.authMode === "device") {
+      return "Previously connected to " + state.vaultId + ". This device needs its verified token again after restart. Open Advanced: Vault ID or device-token connection, paste the device token and select Connect and verify. Your local notes are retained.";
+    }
+    return "Previously connected to " + state.vaultId + ". Reconnect through your trusted Tailscale identity. Your local notes are retained.";
+  }
+  return "Not connected. Paste your Ignis invite link to start.";
+}
+
 // src/main.ts
 var DEFAULT = {
   displayName: "",
@@ -11540,6 +11969,10 @@ var DEFAULT = {
   serverDeviceId: "",
   vaultId: "",
   deviceId: "",
+  contentScope: "all",
+  deviceContentScope: "follow-server",
+  serverMediaBypassExtensions: [],
+  deviceMediaBypassExtensions: [],
   cursor: 0,
   baselines: {},
   pending: [],
@@ -11553,6 +11986,13 @@ var DEFAULT = {
 var SECRET_PREFIX = "ignis-connector-vault-";
 var MAX_FILE_BYTES = 4 * 1024 * 1024;
 var textEncoder = new TextEncoder();
+function safeBypassList(value) {
+  try {
+    return [...(0, import_media_bypass2.normalizeMediaBypassExtensions)(value)];
+  } catch {
+    return [];
+  }
+}
 function isSyncablePath(path) {
   const parts = path.split("/");
   return !!path && !path.includes("\\") && !path.includes("\0") && !path.startsWith("/") && !parts.some((part) => {
@@ -11599,7 +12039,217 @@ async function discover(discoveryUrl, serverDeviceId) {
     }
   });
 }
+var NativeMobileActionsModal = class extends import_obsidian.Modal {
+  constructor(app, currentStatus, addFiles, showPeople) {
+    super(app);
+    this.currentStatus = currentStatus;
+    this.addFiles = addFiles;
+    this.showPeople = showPeople;
+  }
+  stateText = null;
+  onOpen() {
+    const t = mobileUiCopy();
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Ignis" });
+    this.stateText = contentEl.createEl("p");
+    this.refreshStatus();
+    new import_obsidian.Setting(contentEl).setName(t.upload).addButton((button) => button.setButtonText(t.chooseFile).onClick(() => {
+      this.close();
+      this.addFiles();
+    }));
+    new import_obsidian.Setting(contentEl).setName(t.people).addButton((button) => button.setButtonText(t.openPeople).onClick(() => {
+      this.close();
+      this.showPeople();
+    }));
+  }
+  refreshStatus() {
+    if (this.stateText)
+      this.stateText.textContent = mobileUiCopy().status + ": " + this.currentStatus();
+  }
+  onClose() {
+    this.stateText = null;
+  }
+};
 var IgnisConnector = class extends import_obsidian.Plugin {
+  fileScope = (0, import_content_scope2.createContentScope)();
+  devicePolicy(deviceScope = this.settings.deviceContentScope || "follow-server", deviceBypass = this.settings.deviceMediaBypassExtensions || [], serverScope = this.settings.contentScope || "all", serverBypass = this.settings.serverMediaBypassExtensions || []) {
+    return (0, import_content_scope2.createContentScope)(
+      effectiveContentScope(serverScope, deviceScope),
+      effectiveMediaBypassExtensions(
+        serverScope,
+        deviceScope,
+        serverBypass,
+        deviceBypass
+      )
+    );
+  }
+  canShare(path) {
+    return this.fileScope.allowsPath(path);
+  }
+  rebuildFileScope() {
+    this.fileScope = this.devicePolicy();
+  }
+  getSharingDetails() {
+    const files = typeof this.app?.vault?.getFiles === "function" ? this.app.vault.getFiles() : [];
+    return sharingSummary(
+      files,
+      this.settings.contentScope || "all",
+      this.settings.deviceContentScope || "follow-server",
+      this.settings.pending || [],
+      this.settings.pendingWrites || [],
+      this.settings.serverMediaBypassExtensions || [],
+      this.settings.deviceMediaBypassExtensions || []
+    );
+  }
+  getServerMediaBypassExtensions() {
+    return (0, import_media_bypass2.normalizeMediaBypassExtensions)(
+      this.settings.serverMediaBypassExtensions || []
+    );
+  }
+  getDeviceMediaBypassExtensions() {
+    return (0, import_media_bypass2.normalizeMediaBypassExtensions)(
+      this.settings.deviceMediaBypassExtensions || []
+    );
+  }
+  async setDeviceMediaBypassExtensions(value) {
+    let proposed;
+    try {
+      proposed = (0, import_media_bypass2.normalizeMediaBypassExtensions)(value);
+    } catch {
+      return { ok: false, message: "Unsupported file extension selection." };
+    }
+    if (!this.ready())
+      return { ok: false, message: "Verify the Ignis connection before changing media bypass." };
+    if (this.syncing)
+      return { ok: false, message: "A sync is running. Retry when it finishes." };
+    const scope = this.settings.deviceContentScope || "follow-server";
+    if (scope !== "markdown-only")
+      return { ok: false, message: "Enable Keep attachments on this device to choose individual exceptions." };
+    const selected = effectiveMediaBypassExtensions(
+      this.settings.contentScope || "all",
+      scope,
+      this.settings.serverMediaBypassExtensions || [],
+      proposed
+    );
+    if (selected.length !== proposed.length)
+      return { ok: false, message: "The server has not authorized those file types. Ask the Mac owner to approve them." };
+    const target = this.devicePolicy(scope, proposed);
+    if ([...this.settings.pending || [], ...this.settings.pendingWrites || []].some((item) => !target.allowsPath(item.path) || "toPath" in item && typeof item.toPath === "string" && !target.allowsPath(item.toPath))) {
+      return { ok: false, message: "Unsent operations for excluded files need review first." };
+    }
+    const previous = [...this.settings.deviceMediaBypassExtensions || []];
+    this.settings.deviceMediaBypassExtensions = [...proposed];
+    this.rebuildFileScope();
+    try {
+      await this.persistSettings();
+    } catch {
+      this.settings.deviceMediaBypassExtensions = previous;
+      this.rebuildFileScope();
+      return { ok: false, message: "Could not save bypass; previous choice restored." };
+    }
+    this.schedule();
+    return { ok: true, message: proposed.length ? "Selected types now use IGNIS Sync independently of Syncthing (4 MiB maximum)." : "Document/media exceptions disabled on this device." };
+  }
+  async setDeviceContentScope(value) {
+    if (value !== "markdown-only" && value !== "follow-server") {
+      return { ok: false, message: "Unsupported device sharing preference." };
+    }
+    if (this.settings.deviceContentScope === value) {
+      return { ok: true, message: "Device sharing preference is unchanged." };
+    }
+    if (this.syncing) {
+      return { ok: false, message: "A sync is in progress. Retry this change after it finishes." };
+    }
+    const target = this.devicePolicy(value);
+    const previousEffective = effectiveContentScope(
+      this.settings.contentScope || "all",
+      this.settings.deviceContentScope || "follow-server"
+    );
+    const queued = [
+      ...this.settings.pending || [],
+      ...this.settings.pendingWrites || []
+    ];
+    const blocked = queued.filter(
+      (op) => !target.allowsPath(op.path) || op.toPath && !target.allowsPath(op.toPath)
+    );
+    if (blocked.length && (previousEffective !== target.mode || blocked.some((op) => this.fileScope.allowsPath(op.path) || op.toPath && this.fileScope.allowsPath(op.toPath)))) {
+      return { ok: false, message: blocked.length + " unsent attachment operation(s) require review. The previous setting was preserved." };
+    }
+    const previous = this.settings.deviceContentScope || "follow-server";
+    this.settings.deviceContentScope = value;
+    this.rebuildFileScope();
+    try {
+      await this.persistSettings();
+    } catch {
+      this.settings.deviceContentScope = previous;
+      this.rebuildFileScope();
+      return { ok: false, message: "Could not save the device preference. The previous setting was restored." };
+    }
+    this.schedule();
+    return { ok: true, message: value === "markdown-only" ? "Attachments stay on this device. Markdown remains shared." : "Using the server's allowed file types on this device." };
+  }
+  async recheckSharingScope() {
+    if (!this.ready()) {
+      return { ok: false, message: "Verify your Ignis connection before checking server sharing rules." };
+    }
+    if (this.syncing) {
+      return { ok: false, message: "Finish the current sync before rechecking the server's sharing rules." };
+    }
+    const scope = this.settings.scope;
+    const deviceId = this.settings.deviceId;
+    const vaultId = this.settings.vaultId;
+    const attempt = this.connectionAttempt;
+    try {
+      const reply = await this.deviceRequest(
+        "/vaults/" + encodeURIComponent(vaultId) + "/session"
+      );
+      const session = reply.json;
+      if (scope !== this.settings.scope || deviceId !== this.settings.deviceId || vaultId !== this.settings.vaultId || attempt !== this.connectionAttempt || session?.vaultId !== vaultId || session?.deviceId !== deviceId || !["all", "markdown-only"].includes(session.contentScope)) {
+        return { ok: false, message: "Server identity or sharing rules could not be verified; settings unchanged." };
+      }
+      let serverBypass;
+      try {
+        serverBypass = [...(0, import_media_bypass2.normalizeMediaBypassExtensions)(
+          session.mediaBypassExtensions || []
+        )];
+      } catch {
+        return { ok: false, message: "Server returned invalid file sharing exceptions; settings unchanged." };
+      }
+      const target = this.devicePolicy(
+        this.settings.deviceContentScope || "follow-server",
+        this.settings.deviceMediaBypassExtensions || [],
+        session.contentScope,
+        serverBypass
+      );
+      const pending = [
+        ...this.settings.pending || [],
+        ...this.settings.pendingWrites || []
+      ];
+      if (pending.some((item) => !target.allowsPath(item.path) || item.toPath && !target.allowsPath(item.toPath))) {
+        return { ok: false, message: "Unsent attachment operations conflict with the server's rules. Resolve those operations before changing the sharing scope." };
+      }
+      if (session.contentScope !== this.settings.contentScope || JSON.stringify(serverBypass) !== JSON.stringify(this.settings.serverMediaBypassExtensions || [])) {
+        const previousScope = this.settings.contentScope;
+        const previousBypass = this.settings.serverMediaBypassExtensions || [];
+        this.settings.contentScope = session.contentScope;
+        this.settings.serverMediaBypassExtensions = serverBypass;
+        this.rebuildFileScope();
+        try {
+          await this.persistSettings();
+        } catch {
+          this.settings.contentScope = previousScope;
+          this.settings.serverMediaBypassExtensions = previousBypass;
+          this.rebuildFileScope();
+          return { ok: false, message: "Could not save verified sharing rules; previous state retained." };
+        }
+        this.schedule();
+      }
+      return { ok: true, message: (session.contentScope === "markdown-only" ? "Server: Markdown only." : "Server: Markdown + small attachments.") + (this.settings.deviceContentScope === "markdown-only" ? " This device keeps attachments locally except selected bypass types." : "") + (serverBypass.length ? " Allowed bypass: " + serverBypass.join(", ") + "." : "") };
+    } catch {
+      return { ok: false, message: "Could not check current sharing rules. Local files remain unchanged." };
+    }
+  }
   incomingLink = "";
   token = "";
   socket = null;
@@ -11608,6 +12258,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   quiet = /* @__PURE__ */ new Set();
   status = null;
   collaborationRibbon = null;
+  mobileActions = null;
+  mobileConnection = null;
+  mobileConnectionDot = null;
+  mobileMenu = null;
+  unmountMobileNavbar = null;
   statusText = "Not connected";
   timer = null;
   lastError = "";
@@ -11631,6 +12286,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings = {
       ...DEFAULT,
       ...saved,
+      contentScope: saved?.contentScope === "markdown-only" ? "markdown-only" : "all",
+      deviceContentScope: saved?.deviceContentScope === "markdown-only" ? "markdown-only" : "follow-server",
+      serverMediaBypassExtensions: safeBypassList(saved?.serverMediaBypassExtensions),
+      deviceMediaBypassExtensions: safeBypassList(saved?.deviceMediaBypassExtensions),
       displayName: normalizeDisplayName(
         typeof saved?.displayName === "string" ? saved.displayName : ""
       ),
@@ -11642,6 +12301,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       yjsIds: saved?.yjsIds || {},
       archivedScopes: saved?.archivedScopes || []
     };
+    this.rebuildFileScope();
     if (!this.settings.scope && this.settings.serverUrl && this.settings.vaultId) {
       try {
         this.settings.scope = this.currentScope();
@@ -11679,6 +12339,9 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       "Ignis collaborators and display name",
       () => this.openCollaborators()
     );
+    this.addRibbonIcon("upload", "Import files to this Obsidian Vault", () => this.openFilePicker());
+    if (import_obsidian.Platform.isMobile)
+      this.createMobileActions();
     this.showStatus(this.statusText);
     this.addCommand({
       id: "show-collaborators",
@@ -11689,6 +12352,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       id: "change-display-name",
       name: "Change my Ignis display name",
       callback: () => this.openDisplayName()
+    });
+    this.addCommand({
+      id: "import-files-to-vault",
+      name: "Import files into this Obsidian Vault",
+      callback: () => this.openFilePicker()
     });
     this.registerObsidianProtocolHandler("ignis-connector", (params2) => {
       if (typeof params2.link !== "string")
@@ -11718,12 +12386,12 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       callback: () => this.openSyncIssues()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof import_obsidian.TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
+      if (file instanceof import_obsidian.TFile && this.canShare(file.path) && !this.quiet.has(file.path)) {
         this.schedule();
       }
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(oldPath) || !isSyncablePath(file.path))
+      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !this.canShare(oldPath) || !this.canShare(file.path))
         return;
       if (!this.live.relocate(oldPath, file.path))
         return;
@@ -11741,7 +12409,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       void this.persistSettings().then(() => this.schedule());
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(file.path))
+      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !this.canShare(file.path))
         return;
       queueDelete(this.settings, file.path, crypto.randomUUID());
       void this.persistSettings().then(() => this.schedule());
@@ -11788,8 +12456,128 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   getCurrentStatus() {
     return this.statusText;
   }
+  createMobileActions() {
+    const action = document.createElement("div");
+    action.className = "mobile-navbar-action ignis-connector-navbar-action";
+    action.style.position = "relative";
+    action.style.minWidth = "36px";
+    const connection = document.createElement("button");
+    connection.type = "button";
+    connection.className = "ignis-connector-navbar-trigger";
+    connection.setAttribute("aria-haspopup", "dialog");
+    Object.assign(connection.style, {
+      position: "relative",
+      border: "0",
+      padding: "0",
+      background: "transparent",
+      color: "var(--text-normal)",
+      touchAction: "manipulation",
+      width: "100%",
+      height: "100%",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center"
+    });
+    (0, import_obsidian.setIcon)(connection, "flame");
+    const dot = document.createElement("span");
+    Object.assign(dot.style, {
+      position: "absolute",
+      top: "calc(50% - 20px)",
+      left: "calc(50% + 8px)",
+      width: "9px",
+      height: "9px",
+      borderRadius: "50%",
+      border: "2px solid var(--background-primary)",
+      background: "var(--text-muted)",
+      pointerEvents: "none"
+    });
+    dot.setAttribute("aria-hidden", "true");
+    connection.appendChild(dot);
+    connection.addEventListener("click", () => {
+      this.mobileMenu?.close();
+      this.mobileMenu = new NativeMobileActionsModal(
+        this.app,
+        () => nativeConnectionState(
+          this.statusText,
+          this.ready(),
+          this.socket?.readyState === WebSocket.OPEN,
+          mobileUiLanguage()
+        ).label,
+        () => this.openFilePicker(),
+        () => this.openCollaborators()
+      );
+      this.mobileMenu.open();
+    });
+    action.appendChild(connection);
+    this.unmountMobileNavbar = mountMobileNavbarAction(action);
+    this.mobileActions = action;
+    this.mobileConnection = connection;
+    this.mobileConnectionDot = dot;
+  }
+  openFilePicker() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.className = "ignis-native-upload-input";
+    input.setAttribute("aria-label", "Choose files for Obsidian Vault");
+    Object.assign(input.style, {
+      position: "fixed",
+      width: "1px",
+      height: "1px",
+      opacity: "0",
+      left: "-100px",
+      top: "0"
+    });
+    const cleanup = () => input.remove();
+    input.addEventListener("cancel", cleanup, { once: true });
+    input.addEventListener("change", async () => {
+      const files = Array.from(input.files || []);
+      if (!files.length) {
+        cleanup();
+        return;
+      }
+      try {
+        new import_obsidian.Notice("Importing " + files.length + " file(s) into Obsidian\u2026");
+        const outcome = await importNativeFiles(
+          this.app.vault,
+          files,
+          isSyncablePath,
+          MAX_FILE_BYTES
+        );
+        if (outcome.imported) {
+          this.showStatus(this.ready() ? "Syncing" : "Pending \xB7 locally retained");
+          this.schedule();
+          new import_obsidian.Notice("Imported " + outcome.imported + " file(s)." + (effectiveContentScope(
+            this.settings.contentScope,
+            this.settings.deviceContentScope || "follow-server"
+          ) === "markdown-only" ? " Markdown files sync; attachments stay on this device." : " Ignis sync queued."));
+        }
+        if (outcome.failed || outcome.tooLarge) {
+          new import_obsidian.Notice("Skipped " + (outcome.failed + outcome.tooLarge) + " file(s); Ignis Sync supports attachments up to 4 MiB.", 6e3);
+        }
+      } finally {
+        cleanup();
+      }
+    });
+    document.body.appendChild(input);
+    input.click();
+  }
   openSyncIssues() {
-    new SyncIssuesModal(this.app, this.settings.syncIssues, this.lastError).open();
+    const queued = [
+      ...(this.settings.pending || []).map((operation) => ({
+        path: operation.path,
+        reason: "Unsent " + operation.type + (operation.toPath ? " to " + operation.toPath : "") + "; retained until the server acknowledges it."
+      })),
+      ...(this.settings.pendingWrites || []).map((operation) => ({
+        path: operation.path,
+        reason: "Unsent " + operation.type + "; staged bytes are retained for safe retry."
+      }))
+    ];
+    new SyncIssuesModal(
+      this.app,
+      [...this.settings.syncIssues || [], ...queued],
+      this.lastError
+    ).open();
   }
   currentParticipants() {
     const path = this.app.workspace.getActiveFile()?.path || null;
@@ -11802,6 +12590,9 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     return this.live.jumpToParticipant(path, id2);
   }
   onunload() {
+    this.mobileMenu?.close();
+    this.unmountMobileNavbar?.();
+    this.mobileActions = null;
     this.stopped = true;
     this.live.disconnected();
     void this.live.dispose();
@@ -11878,6 +12669,16 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       if (!selectedToken && session.auth !== "tailnet") {
         return { ok: false, message: "Server did not confirm Tailscale authentication." };
       }
+      if (session.contentScope !== void 0 && !["all", "markdown-only"].includes(session.contentScope)) {
+        return { ok: false, message: "Server returned an unsupported content scope." };
+      }
+      if (session.mediaBypassExtensions !== void 0) {
+        try {
+          (0, import_media_bypass2.normalizeMediaBypassExtensions)(session.mediaBypassExtensions);
+        } catch {
+          return { ok: false, message: "Server returned unsupported media bypass extensions." };
+        }
+      }
     } catch {
       return {
         ok: false,
@@ -11886,6 +12687,16 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     }
     if (this.stopped || attempt !== this.connectionAttempt) {
       return { ok: false, message: "The connection check was interrupted. Try again." };
+    }
+    const incomingScope = session.contentScope || "all";
+    if (incomingScope !== this.settings.contentScope && !switching) {
+      const ineligible = [
+        ...(this.settings.pending || []).map((entry) => entry.path),
+        ...(this.settings.pendingWrites || []).map((entry) => entry.path)
+      ].filter((file) => !(0, import_content_scope2.createContentScope)(incomingScope).allowsPath(file));
+      if (ineligible.length) {
+        return { ok: false, message: "The server's file scope changed while local operations are pending. Review unsent files before switching." };
+      }
     }
     const oldSocket = this.socket;
     this.socket = null;
@@ -11913,6 +12724,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings.vaultId = target.vaultId;
     this.settings.scope = target.scope;
     this.settings.deviceId = session.deviceId;
+    this.settings.contentScope = incomingScope;
+    this.settings.serverMediaBypassExtensions = [
+      ...(0, import_media_bypass2.normalizeMediaBypassExtensions)(session.mediaBypassExtensions || [])
+    ];
+    this.rebuildFileScope();
     this.token = selectedToken;
     if (switching)
       await this.live.resetForConnection();
@@ -11934,7 +12750,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.showStatus("Connected \xB7 " + target.vaultId);
     return {
       ok: true,
-      message: (selectedToken ? "Connected" : "Connected through Tailscale") + " to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (memoryOnly ? ". Device token is held only until Obsidian closes." : "."),
+      message: (selectedToken ? "Connected" : "Connected through Tailscale") + " to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (memoryOnly ? ". Device token is held only until Obsidian closes." : ".") + (effectiveContentScope(
+        incomingScope,
+        this.settings.deviceContentScope || "follow-server"
+      ) === "markdown-only" ? " Markdown-only sharing; images and videos stay local." : ""),
       memoryOnly
     };
   }
@@ -11967,6 +12786,29 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       this.status.setText("Ignis: " + status);
     this.collaborationRibbon?.setAttribute("aria-label", "Ignis: " + status + " \xB7 open collaborators and sync status");
     this.collaborationRibbon?.setAttribute("title", "Ignis: " + status);
+    if (this.mobileConnection) {
+      const projection = nativeConnectionState(
+        status,
+        this.ready(),
+        this.socket?.readyState === WebSocket.OPEN,
+        mobileUiLanguage()
+      );
+      this.mobileActions?.setAttribute("data-connection", projection.kind);
+      this.mobileConnection.setAttribute(
+        "aria-label",
+        "Ignis: " + projection.label + " \xB7 " + mobileUiCopy().openActions
+      );
+      this.mobileConnection.setAttribute("title", "Ignis: " + status);
+      if (this.mobileConnectionDot) {
+        this.mobileConnectionDot.style.backgroundColor = {
+          connected: "#28a46e",
+          syncing: "#d3a440",
+          offline: "var(--text-muted)",
+          error: "#da5b5b"
+        }[projection.kind];
+      }
+      this.mobileMenu?.refreshStatus();
+    }
   }
   schedule() {
     if (this.timer !== null)
@@ -12122,7 +12964,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     return this.app.workspace.getLeavesOfType("markdown").some((leaf) => leaf.view.file?.path === path);
   }
   localFiles() {
-    return new Map(this.app.vault.getFiles().filter((file) => isSyncablePath(file.path)).map((file) => [file.path, file]));
+    return new Map(this.app.vault.getFiles().filter((file) => this.canShare(file.path)).map((file) => [file.path, file]));
   }
   async localHash(file) {
     if (file.stat.size > MAX_FILE_BYTES)
@@ -12191,6 +13033,9 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   }
   async replayPending() {
     for (const pending of [...this.settings.pending]) {
+      if (!this.canShare(pending.path) || pending.toPath && !this.canShare(pending.toPath)) {
+        throw new Error("An excluded file has an unsent rename/delete; review before syncing");
+      }
       const result = await this.sendOperation(pending);
       acknowledgePending(this.settings, result);
       if (pending.toPath) {
@@ -12203,6 +13048,9 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     const vaultId = encodeURIComponent(this.settings.vaultId);
     while (this.settings.pendingWrites.length) {
       const staged = this.settings.pendingWrites[0];
+      if (!this.canShare(staged.path)) {
+        throw new Error("An excluded file has an unsent write; review before syncing");
+      }
       const receiptResponse = await this.deviceRequest(
         "/vaults/" + vaultId + "/operations/" + encodeURIComponent(staged.opId),
         "GET",
@@ -12237,6 +13085,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     }
   }
   async stageAndSend(type, file, base) {
+    if (!this.canShare(file.path))
+      return;
     const payload = await this.payloadFor(file);
     const bytes = "content" in payload ? textEncoder.encode(payload.content) : Uint8Array.from(atob(payload.contentBase64), (ch) => ch.charCodeAt(0));
     const digest = await sha256(bytes);
@@ -12283,7 +13133,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       const conflicts = [];
       const report = (path, reason) => conflicts.push({ path, reason });
       for (const remote of manifest.files) {
-        if (!isSyncablePath(remote.path))
+        if (!this.canShare(remote.path))
           continue;
         remotePaths.add(remote.path);
         if (remote.size > MAX_FILE_BYTES) {
@@ -12388,6 +13238,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         await this.persistSettings();
       }
       for (const path of Object.keys(this.settings.baselines)) {
+        if (!this.canShare(path))
+          continue;
         const base = this.settings.baselines[path];
         const absence = classifyAbsence(path, base, remotePaths, changes);
         if (absence === "present")
@@ -12595,10 +13447,85 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
       }
     }
     const state = this.plugin.connectionSummary();
+    let recheckButton;
     const feedback = containerEl.createDiv({ cls: "ignis-connection-feedback" });
     feedback.setAttr("role", "status");
     feedback.setAttr("aria-live", "polite");
-    feedback.setText(state.ready ? "Connected to " + state.vaultId + (this.plugin.settings.authMode === "tailnet" ? " \xB7 Tailscale" : " \xB7 Device token") : "Not connected. Paste your Ignis invite link to start.");
+    feedback.setText(connectionRecoveryLabel(state, this.plugin.settings));
+    const sharingMode = new import_obsidian.Setting(containerEl).setName("Files allowed by server");
+    const renderMode = () => {
+      const bypass = this.plugin.getServerMediaBypassExtensions();
+      sharingMode.setDesc(
+        (this.plugin.settings.contentScope === "markdown-only" ? "Markdown (.md)" + (bypass.length ? " + authorized bypass types: " + bypass.join(", ") : " only; attachments stay local") : "Markdown and attachments") + ". IGNIS Sync uses a 4 MiB per-file limit, independent of Syncthing."
+      );
+    };
+    renderMode();
+    const sharingFeedback = containerEl.createDiv({ cls: "ignis-sharing-feedback" });
+    sharingFeedback.setAttr("role", "status");
+    sharingFeedback.setAttr("aria-live", "polite");
+    const sharingSummaryEl = containerEl.createDiv({ cls: "ignis-sharing-summary" });
+    sharingSummaryEl.setAttr("aria-live", "polite");
+    const renderSharing = () => {
+      const summary = this.plugin.getSharingDetails();
+      sharingSummaryEl.setText(
+        summary.sharedFiles + " file(s) eligible \xB7 " + summary.localOnlyFiles + " file(s) kept on this device (" + formatLocalBytes(summary.localOnlyBytes) + ") \xB7 " + summary.pendingOperations + " unsent operation(s)." + (summary.blockedQueued ? " " + summary.blockedQueued + " queued operation(s) need review before syncing." : "") + (summary.oversizedFiles ? " " + summary.oversizedFiles + " file(s) exceed the 4 MiB transfer limit." : "")
+      );
+    };
+    renderSharing();
+    new import_obsidian.Setting(containerEl).setName("Keep attachments on this device").setDesc("Share only Markdown, plus any individual bypass types you select below. Existing local files are not deleted.").addToggle((toggle) => toggle.setValue(this.plugin.settings.deviceContentScope === "markdown-only").onChange(async (enabled) => {
+      const outcome = await this.plugin.setDeviceContentScope(
+        enabled ? "markdown-only" : "follow-server"
+      );
+      if (!outcome.ok)
+        toggle.setValue(!enabled);
+      sharingFeedback.setText(outcome.message);
+      renderSharing();
+    }));
+    const bypassDetails = containerEl.createEl("details", {
+      cls: "ignis-media-bypass-details"
+    });
+    bypassDetails.createEl("summary", { text: "PDFs and media Bypass" });
+    bypassDetails.createEl("p", {
+      text: "When Keep attachments is enabled, choose the document/media types that IGNIS Sync may still transfer. Syncthing's running or stopped state does not change this rule. Each file must be at most 4 MiB. The Mac server must also authorize these types.",
+      cls: "setting-item-description"
+    });
+    const bypassFeedback = bypassDetails.createDiv({
+      cls: "ignis-media-bypass-feedback"
+    });
+    bypassFeedback.setAttr("role", "status");
+    bypassFeedback.setAttr("aria-live", "polite");
+    const pretty = (extension) => ({
+      pdf: "PDF document",
+      docx: "Word document",
+      xlsx: "Excel workbook",
+      pptx: "PowerPoint presentation"
+    })[extension] || "." + extension + " media";
+    for (const extension of import_media_bypass2.MEDIA_BYPASS_TYPES) {
+      new import_obsidian.Setting(bypassDetails).setName(pretty(extension) + " (." + extension + ")").addToggle((toggle) => toggle.setValue(this.plugin.getDeviceMediaBypassExtensions().includes(extension)).onChange(async (selected) => {
+        const current = this.plugin.getDeviceMediaBypassExtensions();
+        const proposed = selected ? [...current, extension] : current.filter((item) => item !== extension);
+        const result = await this.plugin.setDeviceMediaBypassExtensions(proposed);
+        if (!result.ok)
+          toggle.setValue(!selected);
+        bypassFeedback.setText(result.message);
+        renderSharing();
+      }));
+    }
+    new import_obsidian.Setting(containerEl).setName("Check sharing rules").setDesc("Read the server's current scope without restarting live editing. No file content is uploaded.").addButton((button) => {
+      recheckButton = button;
+      button.setButtonText("Recheck").setDisabled(!state.ready).onClick(async () => {
+        button.setDisabled(true).setButtonText("Checking\u2026");
+        try {
+          const outcome = await this.plugin.recheckSharingScope();
+          sharingFeedback.setText(outcome.message);
+          renderMode();
+          renderSharing();
+        } finally {
+          button.setDisabled(false).setButtonText("Recheck");
+        }
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Review unsent changes").setDesc("Inspect pending paths and sync conflicts. Nothing is discarded or uploaded by opening this view.").addButton((button) => button.setButtonText("Review").onClick(() => this.plugin.openSyncIssues()));
     const availableVaults = containerEl.createDiv({ cls: "ignis-vault-picker" });
     availableVaults.setAttr("aria-live", "polite");
     let serverInput;
@@ -12673,6 +13600,9 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
           tokenInput.value = "";
           button.setButtonText("Connected");
           syncButton?.setDisabled(false);
+          recheckButton?.setDisabled(false);
+          renderMode();
+          renderSharing();
         } else {
           button.setButtonText("Retry connection");
         }
