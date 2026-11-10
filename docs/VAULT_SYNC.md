@@ -22,6 +22,100 @@ are not implemented.
 No extra raw TCP listener, desktop-only transport, or Syncthing BEP exists.
 The existing reverse proxy should terminate HTTPS/WSS on the same hostname.
 
+## Markdown-only sharing with Syncthing disabled
+
+IGNIS Vault Sync and Yjs can share Markdown without a Syncthing process or
+the optional IGNIS Media Desktop plugin. For a **new isolated Vault with no
+existing Sync history**, set the content scope at the server. The Vault's
+scope is persisted in the same SQLite journal as its file identities.
+
+```sh
+# Default to existing behavior, but make the named Vault Markdown-only.
+IGNIS_SYNC_CONTENT_SCOPES='{"MarkdownLab":"markdown-only"}'
+
+# Or use Markdown-only for all newly enrolled Vaults on this server.
+IGNIS_SYNC_CONTENT_SCOPE=markdown-only
+```
+
+Pass the chosen environment setting into the IGNIS Server process alongside
+the existing IGNIS_SYNC_TOKEN. The default is `all` for backward
+compatibility; per-Vault settings take precedence over that default.
+
+The server selects each Vault's sharing policy, advertises it in the
+authenticated `/session` response, and refuses non-Markdown operations with
+`OUT_OF_SCOPE` (HTTP 409). The Obsidian Connector adopts the verified scope:
+`.md` notes are eligible; images, videos, JSON, Canvas, and other attachments
+stay on the local device. Markdown files within a `Media/` folder are still
+Markdown and may sync. Their image/video references will not magically make
+the referenced media available on another device.
+
+Changing the content scope of an existing Vault with previous file history
+**is intentionally blocked** until a history-aware migration is implemented.
+It does not send tombstones for omitted media, delete local media, or silently
+reinterpret an old journal. A client with unsent binary writes must resolve
+those pending operations before adopting a narrower scope.
+An empty Vault with no registered device and no file history can still choose
+another scope before its first synchronization operation.
+
+### Administrator setup: preview and save
+
+From the Mac running IGNIS Server, set `IGNIS_SYNC_TOKEN` in the environment
+and use the local-only setup console instead of editing JSON by hand:
+
+```sh
+# Default localhost port is 3192; pass --port <your-port> as needed.
+node scripts/ignis-sync-setup.mjs show --vault MarkdownLab
+node scripts/ignis-sync-setup.mjs preview --vault MarkdownLab --mode markdown-only
+node scripts/ignis-sync-setup.mjs set --vault MarkdownLab --mode markdown-only
+```
+
+The console connects only to `http://127.0.0.1` on the specified port.
+`show` and `preview` only inspect metadata; the latter explains whether
+history or registered devices block the selection. `set` requires operator
+confirmation (or explicit `--yes` for noninteractive use), compares the
+previous scope before saving, and stores the preference transactionally in
+SQLite. The owner's saved preference overrides server startup defaults after
+restart. API routes:
+`GET /api/sync/v1/admin/vaults/:vaultId/content-scope[?mode=markdown-only]`
+and `PUT /api/sync/v1/admin/vaults/:vaultId/content-scope` are both protected
+by the administrator token. **Never put the administrator token in the
+Obsidian Connector**.
+
+### Device settings: local-only media
+
+The Obsidian Connector (v0.1.3 and later) has a
+**Keep attachments on this device** switch. It applies only to the current
+device and never widens what the server permits. This is useful when a server
+Vault still uses `all`, but the Windows laptop should receive/send only
+Markdown. The settings tab also shows eligible file counts, locally retained
+file counts and sizes, pending operations, a read-only **Recheck** action
+to verify current server sharing rules without disconnecting Yjs editing,
+and **Review** to inspect queued operations and conflicts without discarding
+them. The switch can be chosen before connecting to a server.
+
+Before narrowing the scope, the plugin checks for unsent attachment
+operations; if any exist, the switch is not saved and an actionable
+explanation appears. Existing local media and baselines are not removed.
+Changing this device-only preference never starts or stops Syncthing; that
+optional server/Desktop plugin is managed independently.
+
+The server and device preferences are combined by intersection. If the
+server permits only Markdown, a device preference of “follow server” cannot
+enable media. If the server permits media and this device says “keep
+attachments here,” that device never requests or uploads attachment bytes.
+Markdown links to an attachment still sync, but the attachment itself
+will be missing on the receiving machine.
+
+**Cross-device acceptance (2026-11-07):** With the isolated Syncthing
+instances gracefully shut down on both Mac and Windows SLS, an authenticated
+IGNIS API on the Mac carried a Markdown note to SLS and accepted a second
+Markdown note from SLS. Image/video paths were absent from the remote
+manifest, a binary upload received HTTP 409, and the journal contained only
+the two Markdown changes. The temporary Mac test server and credential were
+cleaned up; the dedicated SLS `Markdown-Only-Test-Vault` retains the sample
+Markdown notes and a local-only media file for inspection. This is a
+cross-device API/transport test, not yet an Obsidian GUI editing test.
+
 ## Isolated development
 
 Export a random secret of at least 32 bytes in IGNIS_SYNC_TOKEN. Never commit it.
@@ -162,6 +256,35 @@ The Sync API has its own 6 MiB JSON parser ceiling, applied before Ignis's
 legacy global parser, including requests with chunked transfer encoding.
 This bounds server memory consumption even when the legacy API permits
 larger request bodies.
+
+### PDFs and media Bypass
+
+The owner can allow specific non-Markdown extensions (for example `pdf`,
+`docx`, `xlsx`, `pptx`) for an otherwise Markdown-only Vault through
+`PUT /api/sync/v1/admin/vaults/:vaultId/media-bypass`. This operation requires
+the server administrator token and an `expectedExtensions` compare-and-swap
+value. Choices are persisted in the server-owned journal. Disabling a
+previously enabled type requires a migration when devices or file history
+already exist; omission must never be interpreted as a remote deletion.
+
+On desktop, Media Desktop v0.3.2 exposes **PDFs and media Bypass**, delegating
+to the already authorized Ignis Connector v0.1.5-beta.1. The same choices are
+available in Connector settings. The effective allowed paths are bounded by
+the server's Vault policy and the device's own selection, **not** by whether
+Syncthing is running. A device cannot override a server rejection. Eligible
+files use the existing binary Vault Sync operations and their 4 MiB
+per-file maximum. Syncthing must not separately own the same Vault subtree.
+
+Oversized newly encountered bypass files are omitted before hashing; if an
+already journaled bypass file grows above 4 MiB, the server responds with
+`OVERSIZE_MEDIA_BYPASS` (HTTP 409) without issuing a deletion event or
+advancing the journal. Reducing the file below the limit permits normal
+recovery. This applies to Markdown-only bypass candidates, preserving the
+legacy `all` mode's historical file handling.
+
+IGNIS Web can preview PDF resources through a same-origin modal with a
+new-tab fallback. DOCX, XLSX and PPTX are transferred as binary attachments;
+the Web UI does not claim native Office rendering or editing.
 
 The Connector keeps local user text in the ordinary Obsidian Vault and records
 observed pending rename/delete operations in plugin data. Create and modify

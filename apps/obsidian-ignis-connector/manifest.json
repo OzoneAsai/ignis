@@ -1,7 +1,7 @@
 {
   "id": "ignis-connector",
   "name": "Ignis Connector",
-  "version": "0.1.0",
+  "version": "0.1.5-beta.2",
   "minAppVersion": "1.9.0",
   "description": "Experimental server-led Vault synchronization with Ignis over HTTPS and WSS.",
   "author": "Ignis contributors",

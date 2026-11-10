@@ -1,0 +1,9 @@
+{
+  "id": "ignis-media-desktop",
+  "name": "Ignis Media Desktop",
+  "version": "0.3.2",
+  "minAppVersion": "1.9.0",
+  "description": "Desktop-only management of Syncthing media replication for Ignis.",
+  "author": "Ignis contributors",
+  "isDesktopOnly": true
+}

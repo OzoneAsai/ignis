@@ -16,6 +16,19 @@ export type ValidatedConnection = {
 const TOKEN = /^ignis_dev_[A-Za-z0-9_-]{43}$/;
 const VAULT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
+// Obsidian SecretStorage accepts only lowercase letters, digits and hyphens
+// in an ID (64 characters maximum). A server origin / Vault scope contains
+// characters that are not allowed as an ID, so use a stable SHA-256-derived
+// identifier instead. Keep at least 160 bits of collision resistance.
+export async function scopedSecretId(scope: string): Promise<string> {
+  if (!scope || scope.length > 2048) throw new Error("Invalid Vault scope");
+  const data = new TextEncoder().encode(scope);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const hex = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0")).join("");
+  return "ignis-connector-vault-" + hex.slice(0, 40);
+}
+
 // Connection links carry public routing metadata only, NEVER credentials.
 // This is usable as one pasted URL on iOS, desktop and future QR pairing.
 export function parseJoinLink(raw: string): { origin: string; vaultId: string } {

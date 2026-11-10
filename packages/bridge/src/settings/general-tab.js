@@ -3,6 +3,7 @@ import { checkForUpdate } from "../update-check.js";
 import * as serverSettings from "./server-settings.js";
 import { numberField, listField } from "./server-setting-fields.js";
 import { messageDefinition, blockDefinition } from "./settings-ui.js";
+import { mobileToolbarSettingsGroup } from "./mobile-toolbar-setting.js";
 
 const GITHUB_URL = "https://github.com/Nystik-gh/ignis";
 
@@ -42,6 +43,7 @@ function settingDefinitions(tab) {
       items: [blockDefinition(addInsecureContextCallout)],
     },
     { type: "group", items: [serverStatusDefinition()] },
+    mobileToolbarSettingsGroup(),
     ...serverSettingsGroups(tab),
   ];
 }

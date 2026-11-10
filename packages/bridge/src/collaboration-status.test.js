@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collaborationStatus } from "./collaboration-status.js";
+import { collaborationStatus, collaborationStatusSummary } from "./collaboration-status.js";
 
 const ready = {
   hydrated: true,
@@ -12,12 +12,71 @@ const ready = {
 };
 
 describe("collaboration save state projection", () => {
+  it("keeps a readable short IME label while full details preserve save/peer facts", () => {
+    const current={...ready,composing:true,compositionPublished:true,
+      imeProjectionBlocked:true,serverSaveError:false};
+    const short=collaborationStatusSummary(current,true);
+    expect(short).toBe("競合保留中 · IME未確定");
+    expect(short.length).toBeLessThan(24);
+    expect(collaborationStatus(current,true)).toContain("peer edit waiting");
+    expect(collaborationStatusSummary({...current,serverSaveError:true},true))
+      .toContain("サーバー保存失敗");
+    expect(collaborationStatusSummary({...current,storageError:Error("full")},true))
+      .toContain("ローカル保存失敗");
+  });
+  it("never calls unfinished Japanese IME text a final saved edit", () => {
+    const provisional = {
+      ...ready, composing: true, compositionPublished: true,
+    };
+    const s = collaborationStatus(provisional, true);
+    expect(s).toContain("IME not confirmed");
+    expect(s).toContain("draft");
+    expect(s).not.toContain("online · saved");
+  });
+
+  it("separates an overlapping peer edit waiting for IME from transport health", () => {
+    const s = collaborationStatus({
+      ...ready, composing: true, imeProjectionBlocked: true,
+      compositionPublished: true, sentSeq: 7, confirmedSeq: 6,
+    }, true);
+    expect(s).toContain("syncing");
+    expect(s).toContain("IME not confirmed");
+    expect(s).toContain("peer edit waiting");
+    expect(s).not.toContain("server save failed");
+  });
+
+  it("keeps failure and offline truth visible even while candidate text is unconfirmed", () => {
+    expect(collaborationStatus({
+      ...ready, composing: true, storageError: Error("full"),
+    }, true)).toMatch(/local storage failed.*IME not confirmed/);
+    expect(collaborationStatus({ ...ready, composing: true }, false))
+      .toMatch(/offline.*IME not confirmed/);
+    expect(collaborationStatus({
+      ...ready, composing: true, imeProjectionBlocked: true,
+      serverSaveError: Error("network"),
+    }, true)).toMatch(/server save failed.*peer edit waiting/);
+  });
+  it("distinguishes an unrelated offline original from a known document generation replacement", () => {
+    expect(collaborationStatus({
+      generationMismatch: "new-server-id", joinConflictReason: "independent",
+    }, true)).toContain("separate original · draft protected");
+    expect(collaborationStatus({
+      generationMismatch: "new-server-id", joinConflictReason: "replaced",
+    }, true)).toContain("note replaced · old draft protected");
+  });
+
   it("distinguishes server-confirmed saves from syncing", () => {
     expect(collaborationStatus(ready, true)).toBe("Collab: 2 online · saved");
     expect(collaborationStatus({ ...ready, sentSeq: 5 }, true))
       .toContain("syncing");
     expect(collaborationStatus({ ...ready, dirty: true }, true))
       .toContain("syncing");
+  });
+  it("does not call a connected but causally incomplete Yjs document saved", () => {
+    const incomplete = { ...ready, causalGap: true };
+    expect(collaborationStatus(incomplete,true)).toContain("recovering missing shared history");
+    expect(collaborationStatus(incomplete,true)).not.toContain("online · saved");
+    expect(collaborationStatus(incomplete,false)).toContain("history incomplete");
   });
 
   it("does not let a recovery copy hide an unconfirmed remote save", () => {

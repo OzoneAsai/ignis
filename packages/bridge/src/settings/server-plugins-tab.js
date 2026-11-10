@@ -31,7 +31,7 @@ function settingDefinitions(tab) {
       type: "group",
       items: [
         messageDefinition(
-          "Ignis plugins extend server functionality and run alongside your vaults. " +
+          "Ignis plugins extend server functionality, with vault-scoped and server-wide services. " +
             "They are separate from Obsidian's built-in plugins.",
         ),
       ],
@@ -61,10 +61,20 @@ function pluginDefinitions(tab) {
 }
 
 function isEnabled(plugin) {
+  if (plugin.scope === "server") return plugin.serverEnabled === true;
   return plugin.enabledVaults.includes(getVaultId());
 }
 
 function pluginDefinition(tab, plugin) {
+  if (plugin.scope === "server") {
+    const state = !plugin.serverEnabled ? "disabled"
+      : plugin.loaded ? "running" : "unavailable";
+    return {
+      name: plugin.name,
+      desc: (plugin.description || "") +
+        ` (Server-wide: ${state}; manage on the server)`,
+    };
+  }
   return {
     name: plugin.name,
     desc: plugin.description || "",

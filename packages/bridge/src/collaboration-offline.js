@@ -300,17 +300,21 @@ export function createOfflineDocument(
         pointer.close();
       }
     },
-    async activateGeneration(newGeneration, recoveredText) {
+    async activateGeneration(newGeneration, recoveredText, isCurrent = () => true) {
       await ready;
       await pending;
+
+      // An async server handshake can outlive the pane that initiated it.
+      // Never repoint a later session's durable journal from a stale callback.
+      if (!isCurrent()) return false;
 
       if (!/^[a-f0-9-]{36}$/.test(newGeneration)) {
         throw new Error("Invalid server document generation");
       }
 
-      // Two pointer changes MUST commit together. The old Yjs journal is not
-      // deleted; a human-readable recovery copy is kept across browser restarts
-      // before the next generation's clean IndexedDB namespace is selected.
+      // Both metadata changes commit together. The old Yjs journal is never
+      // deleted. When the visible text is identical, no duplicate recovery
+      // warning is needed; otherwise the human-readable draft persists.
       const pointer = await openDatabase(legacyKey);
 
       try {
@@ -325,6 +329,7 @@ export function createOfflineDocument(
       } finally {
         pointer.close();
       }
+      return true;
     },
     flushPeerUpdates() {
       for (const { update, fromServer } of bufferedPeerUpdates.splice(0)) {

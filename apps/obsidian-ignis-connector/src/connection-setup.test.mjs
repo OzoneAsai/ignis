@@ -1,13 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { normalizeOrigin, parseJoinLink, sessionError, validateConnection } from "./connection-setup.ts";
+import {
+  normalizeOrigin, parseJoinLink, sessionError, scopedSecretId,
+  validateConnection
+} from "./connection-setup.ts";
 
 const token = "ignis_dev_" + "x".repeat(43);
 const draft = {
-  serverUrl: "https://manamacbook-air.manakin-acoustic.ts.net:8451/",
+  serverUrl: "https://mac.example.ts.net:8451/",
   vaultId: "IOSLab",
   token
 };
 describe("one explicit connection transaction", () => {
+  it("derives valid stable SecretStorage IDs from an entire origin-and-Vault scope", async () => {
+    const scope = "http://127.0.0.1:3230|iOSLiveQA";
+    const first = await scopedSecretId(scope);
+    expect(first).toMatch(/^[a-z0-9-]{1,64}$/);
+    expect(first).toBe(await scopedSecretId(scope));
+    expect(first).not.toBe(await scopedSecretId("http://127.0.0.1:3230|other"));
+    expect(first).not.toBe(await scopedSecretId("http://127.0.0.1:3231|iOSLiveQA"));
+  });
   it("accepts one secret-free HTTPS invite and never sends credentials from its URL", () => {
     const link = "https://mac.example:8452/join/IOSLab";
     expect(parseJoinLink(link)).toEqual({
@@ -32,11 +43,11 @@ describe("one explicit connection transaction", () => {
   });
   it("normalizes the URL without stripping the HTTPS port", () => {
     expect(normalizeOrigin(draft.serverUrl))
-      .toBe("https://manamacbook-air.manakin-acoustic.ts.net:8451");
+      .toBe("https://mac.example.ts.net:8451");
     expect(validateConnection(draft)).toEqual({
-      origin: "https://manamacbook-air.manakin-acoustic.ts.net:8451",
+      origin: "https://mac.example.ts.net:8451",
       vaultId: "IOSLab", token,
-      scope: "https://manamacbook-air.manakin-acoustic.ts.net:8451|IOSLab"
+      scope: "https://mac.example.ts.net:8451|IOSLab"
     });
   });
   it("blocks every incomplete form before making an HTTP request", () => {

@@ -1,10 +1,13 @@
 // Browser Markdown collaboration: bind the existing Obsidian Editor to Y.Text.
 // The shared Ignis WebSocket transports Yjs updates, not whole-file snapshots.
-import { MarkdownView, Modal } from "obsidian";
+import { MarkdownView, Modal, setIcon } from "obsidian";
 import * as Y from "yjs";
 import { createOfflineDocument, CROSS_TAB_ORIGIN } from "./collaboration-offline.js";
+import { classifyDocumentAncestry } from "./collaboration-ancestry.js";
+import { hasMissingYjsAncestors, causalRepairDelay,
+  MAX_CAUSAL_REPAIR_ATTEMPTS } from "./causal-history.js";
 import { saveOfflineNote } from "../../shim/src/offline-boot.js";
-import { collaborationStatus } from "./collaboration-status.js";
+import { collaborationStatus, collaborationStatusSummary } from "./collaboration-status.js";
 import { bindCollaborativeHistory } from "./collaboration-undo.js";
 import { fsShim } from "../../shim/src/fs/index.js";
 import {
@@ -13,24 +16,96 @@ import {
   reconcileEditor as reconcileEditorState,
 } from "./collaboration-editor.js";
 import {
+  beginComposition, publishComposition, commitComposition,
+  widenCompositionGuard, projectIndependentCompositionUpdate
+} from "./composition-rebase.js";
+import {
+  preferredDisplayName, saveDisplayName
+} from "./collaboration-identity.js";
+import { mobileConnectionState } from "./mobile-connection-state.js";
+import { showFilePicker, showFileRename } from "./file-actions.js";
+import { mountMobileNavbarAction } from "../../server-core/src/mobile-navbar.ts";
+import { mobileUiCopy, mobileUiLanguage } from "../../server-core/src/mobile-ui-copy.ts";
+import {
   createCursorOverlay,
   encodeCursorSelections,
 } from "./collaboration-cursors.js";
 
 const REMOTE = "remote";
 const LOCAL = "local";
-const NAME_KEY = "ignis-collab-display-name";
 const TAB_KEY = "ignis-collab-tab-id";
 
+class MobileIgnisActionsModal extends Modal {
+  constructor(app, getStatus, onUpload, onRename, onPeople) {
+    super(app);
+    this.getStatus = getStatus;
+    this.onUpload = onUpload;
+    this.onRename = onRename;
+    this.onPeople = onPeople;
+  }
+
+  onOpen() {
+    const t = mobileUiCopy();
+    const root = this.contentEl;
+    root.addClass("ignis-mobile-action-menu");
+    root.createEl("h3", { text: "Ignis" });
+    this.connectionLabel = root.createEl("p", { cls: "ignis-mobile-action-state" });
+    this.noteLabel = root.createEl("p", { cls: "ignis-mobile-action-detail" });
+    this.refreshStatus();
+    const addAction = (text, callback) => {
+      const button = root.createEl("button", { text });
+      button.type = "button";
+      button.addEventListener("click", () => {
+        this.close();
+        callback();
+      });
+    };
+    addAction(t.upload, this.onUpload);
+    addAction(t.rename, this.onRename);
+    addAction(t.people, this.onPeople);
+  }
+
+  refreshStatus() {
+    if (!this.connectionLabel) return;
+    const { connection, detail } = this.getStatus();
+    this.connectionLabel.setText(`${mobileUiCopy().status}: ${connection}`);
+    this.noteLabel.setText(detail);
+  }
+
+  onClose() {
+    this.connectionLabel = null;
+    this.noteLabel = null;
+  }
+}
+
+function availableStorage(key) {
+  try {
+    return window[key];
+  } catch {
+    return null;
+  }
+}
+
 function ownDisplayName() {
-  let tabId = sessionStorage.getItem(TAB_KEY);
+  const tabStorage = availableStorage("sessionStorage");
+  let tabId;
+  try {
+    tabId = tabStorage?.getItem(TAB_KEY);
+  } catch {
+    // Private PWA contexts may deny storage access.
+  }
 
   if (!tabId) {
     tabId = crypto.randomUUID();
-    sessionStorage.setItem(TAB_KEY, tabId);
+    try {
+      tabStorage?.setItem(TAB_KEY, tabId);
+    } catch {
+      // The session still has an ephemeral guest label.
+    }
   }
 
-  return sessionStorage.getItem(NAME_KEY) || `Guest ${tabId.slice(0, 4)}`;
+  return preferredDisplayName(availableStorage("localStorage"), tabStorage) ||
+    `Guest ${tabId.slice(0, 4)}`;
 }
 
 class PeopleModal extends Modal {
@@ -87,9 +162,14 @@ class PeopleModal extends Modal {
     }
 
     if (details.generationMismatch) {
-      root.createEl("h4", { text: "This note was replaced on the server" });
+      const independent = details.joinConflictReason === "independent";
+      root.createEl("h4", { text: independent
+        ? "Two independently created notes have the same name"
+        : "This note was replaced on the server" });
       root.createEl("p", {
-        text: "The same filename now refers to a different note. Your previous offline draft has NOT been merged into it. Keep a recovery copy and open the new server version separately.",
+        text: independent
+          ? "The browser's offline note and the server note have no verified common history. The local draft has NOT been merged or discarded. You can keep it as a recovery copy and open the server version separately."
+          : "The same filename now refers to a different note. Your previous offline draft has NOT been merged into it. Keep a recovery copy and open the new server version separately.",
       });
     }
 
@@ -228,6 +308,8 @@ export function initCollaboration(plugin) {
   const channel = ws.channel("collab");
   const status = plugin.addStatusBarItem();
   status.addClass("ignis-collaboration-status");
+  const writes = window.__ignis.writes;
+  let transportState = ws.isOpen() ? "open" : "connecting";
 
   let session = null;
   const sessions = new Map();
@@ -253,15 +335,12 @@ export function initCollaboration(plugin) {
   function showPeople() {
     peopleModal?.close();
     peopleModal = new PeopleModal(plugin.app, people, ownDisplayName, (value) => {
-      // eslint-disable-next-line no-control-regex
-      const clean = value.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
-        .trim().slice(0, 40);
+      const clean = saveDisplayName(value,
+        availableStorage("localStorage"), availableStorage("sessionStorage"));
 
       if (!clean) {
         return;
       }
-
-      sessionStorage.setItem(NAME_KEY, clean);
 
       if (session?.self) {
         session.self.name = clean;
@@ -277,11 +356,12 @@ export function initCollaboration(plugin) {
       }
     }, () => ({
       path: session?.path,
-      status: status.textContent,
+      status: collaborationStatus(session, ws.isOpen()),
       storageError: session?.storageError,
       serverSaveError: session?.serverSaveError,
       pendingDraft: session?.pendingConflict,
       generationMismatch: session?.generationMismatch,
+      joinConflictReason: session?.joinConflictReason,
       recoveredGenerationDraft: session?.recoveredGenerationDraft,
     }), () => {
       if (session?.joined && ws.isOpen()) {
@@ -325,6 +405,50 @@ export function initCollaboration(plugin) {
     }
   });
 
+  // One icon in Obsidian's own bottom navbar. A separate fixed dock would
+  // cover notes and collide with iOS Safari's navigation controls.
+  const navbarAction = document.createElement("div");
+  navbarAction.className = "mobile-navbar-action ignis-navbar-action";
+  const navbarButton = document.createElement("button");
+  navbarButton.type = "button";
+  navbarButton.className = "ignis-navbar-trigger";
+  navbarButton.setAttribute("aria-haspopup", "dialog");
+  navbarButton.setAttribute("aria-label", "Ignis: " + mobileUiCopy().openActions);
+  setIcon(navbarButton, "flame");
+  const connectionDot = document.createElement("span");
+  connectionDot.className = "ignis-navbar-connection-dot";
+  connectionDot.setAttribute("aria-hidden", "true");
+  navbarButton.appendChild(connectionDot);
+  navbarAction.appendChild(navbarButton);
+  let mobileMenu = null;
+  const openMobileMenu = () => {
+    mobileMenu?.close();
+    mobileMenu = new MobileIgnisActionsModal(plugin.app, () => {
+      const projection = mobileConnectionState(
+        session, transportState, writes?.getState?.() || "clean",
+        writes?.listFailed?.().length || 0, mobileUiLanguage(),
+      );
+      return {
+        connection: projection.label,
+        detail: collaborationStatus(session, ws.isOpen()) || mobileUiCopy().noNote,
+      };
+    }, () => showFilePicker(plugin.app), () => showFileRename(plugin.app), showPeople);
+    mobileMenu.open();
+  };
+  navbarButton.addEventListener("click", openMobileMenu);
+  const unmountNavbarAction = mountMobileNavbarAction(navbarAction);
+
+  plugin.addCommand({
+    id: "show-collaboration-people-and-name",
+    name: "共同編集: 参加者と表示名を変更",
+    callback: showPeople,
+  });
+  plugin.addCommand({
+    id: "open-mobile-ignis-actions",
+    name: "Ignis: 接続状態・ファイル追加・ファイル名変更・参加者",
+    callback: openMobileMenu,
+  });
+
   function renderPeers(current) {
     const members = [...current.people.values()];
     const counts = new Map();
@@ -348,17 +472,75 @@ export function initCollaboration(plugin) {
   }
 
   function render() {
-    const label = collaborationStatus(session, ws.isOpen());
+    const details = collaborationStatus(session, ws.isOpen());
+    const label = collaborationStatusSummary(session, ws.isOpen());
 
     if (status.textContent !== label) {
       status.setText(label);
     }
+    status.toggleClass("ignis-composition-active", Boolean(session?.composing));
+    status.setAttribute("aria-label", details ||
+      "Live collaborators: view people or edit your name");
+    status.setAttribute("title", details || "Open live collaborators");
+    const connection = mobileConnectionState(
+      session, transportState, writes?.getState?.() || "clean",
+      writes?.listFailed?.().length || 0, mobileUiLanguage(),
+    );
+    navbarAction.dataset.connection = connection.kind;
+    navbarButton.setAttribute("aria-label",
+      `Ignis: ${connection.label} · ${mobileUiCopy().openActions}`);
+    navbarButton.setAttribute("title", `Ignis: ${connection.label}`);
+    mobileMenu?.refreshStatus();
   }
 
   function sendJoin(current) {
     if (current?.hydrated && !current.generationMismatch && ws.isOpen() && !current.joined) {
       channel.send("join", { path: current.path, name: ownDisplayName() });
     }
+  }
+
+  function clearCausalRepair(current) {
+    clearTimeout(current.causalRepairTimer);
+    current.causalRepairTimer = null;
+    current.causalRepairAttempts = 0;
+    current.causalGap = false;
+  }
+
+  function ensureCausalConvergence(current) {
+    if (sessions.get(current.path) !== current) return;
+    if (!hasMissingYjsAncestors(current.doc)) {
+      clearCausalRepair(current);
+      render();
+      return;
+    }
+    current.causalGap = true;
+    render();
+    if (!ws.isOpen() || !current.joined || current.composing ||
+        current.generationMismatch || current.protocolError ||
+        current.causalRepairTimer !== null) return;
+    if (current.causalRepairAttempts >= MAX_CAUSAL_REPAIR_ATTEMPTS) {
+      current.protocolError = "Shared note history could not be repaired";
+      current.joined = false;
+      channel.send("leave", { path: current.path });
+      render();
+      return;
+    }
+    current.causalRepairTimer = setTimeout(() => {
+      current.causalRepairTimer = null;
+      if (sessions.get(current.path) !== current || !ws.isOpen() ||
+          !current.joined || current.generationMismatch || current.protocolError) return;
+      if (!hasMissingYjsAncestors(current.doc)) {
+        clearCausalRepair(current);
+        render();
+        return;
+      }
+      current.causalRepairAttempts++;
+      // Re-joining is idempotent for an already-present WebSocket peer.
+      // The server sends its full original Yjs state, not a re-created
+      // text snapshot, so dependent updates can be integrated exactly once.
+      channel.send("join", { path: current.path, name: ownDisplayName() });
+      ensureCausalConvergence(current);
+    }, causalRepairDelay(current.causalRepairAttempts));
   }
 
   function sendUpdate(current, bytes) {
@@ -434,17 +616,25 @@ export function initCollaboration(plugin) {
   }
 
   function sendSelection(current) {
-    if (!current || !current.initialized || !current.joined || !ws.isOpen() || current.suppress) {
+    if (!current || !current.initialized || !current.joined || !ws.isOpen() ||
+        current.suppress) {
       return;
     }
 
-    const selected = current.editor.cm?.state?.selection;
+    const editor = current.composing
+      ? current.composingEditor : current.editor;
+    const selected = editor?.cm?.state?.selection;
+    const text = current.composing
+      ? current.imeSnapshot?.text : current.text;
 
-    if (!selected) {
+    if (!selected || !text || (current.composing &&
+        editor.getValue() !== text.toString())) {
+      // A candidate may be visible in the IME's native DOM before CM6/Yjs
+      // has received it. Keep the previous awareness; never send "away".
       return;
     }
 
-    const encoded = encodeCursorSelections(current.text, selected.ranges, selected.mainIndex);
+    const encoded = encodeCursorSelections(text, selected.ranges, selected.mainIndex);
     if (!encoded) {
       current.protocolError = "Too many selections for shared cursor protocol (maximum 32)";
       render();
@@ -493,29 +683,41 @@ export function initCollaboration(plugin) {
       return;
     }
 
-    // Keep the original Y.Doc fixed during native IME composition. A remote
-    // update received mid-composition must not rewrite the composing DOM.
-    // Apply the author's completed change first, then merge buffered remote
-    // CRDT operations. This preserves both inputs and CodeMirror's IME state.
+    // The composing browser DOM stays at its frozen baseline, while remote
+    // Yjs edits and interim IME text have remained live for other panes and
+    // tabs. Commit the final input from that frozen CRDT history.
     const editor = current.composingEditor || current.editor;
+    let committed = false;
     current.sourceEditor = editor;
     try {
-      applyLocalChange(current.text, editor.getValue());
+      commitComposition(current.doc, current.imeSnapshot, editor.getValue(), LOCAL);
+      committed = true;
+    } catch (error) {
+      // Never replace uncommitted user input with a remote snapshot on error.
+      current.pendingConflict = editor.getValue();
+      current.protocolError = "IME draft could not be merged · recoverable text retained";
+      console.error("[collab] IME commit failed:", error);
     } finally {
       current.sourceEditor = null;
+      current.composing = false;
+      current.composingEditor = null;
+      current.imeSnapshot = null;
+      current.imeGuard = null;
+      current.imeProjectionBlocked = false;
+      current.compositionPublished = false;
     }
-    current.composing = false;
-    current.composingEditor = null;
-
-    // The same origin may receive edits over BroadcastChannel, bypassing the
-    // WebSocket update handler. Apply both transports only after IME commits.
     current.local.flushPeerUpdates();
-
-    for (const update of current.pendingRemote.splice(0)) {
-      Y.applyUpdate(current.doc, update, REMOTE);
+    if (committed) {
+      current.suppress = true;
+      try {
+        reconcileEditorState(editor, current.text.toString());
+      } finally {
+        current.suppress = false;
+      }
+      renderPeers(current);
+      scheduleSelection(current);
     }
-
-    scheduleSelection(current);
+    render();
   }
 
   function bindEditor(current, editor) {
@@ -599,9 +801,19 @@ export function initCollaboration(plugin) {
     }
 
     const onCompositionStart = () => {
-      if (current.initialized) {
+      if (current.initialized && !current.composing) {
+        if (current === session) sendSelection(current);
+        current.imeSnapshot = beginComposition(current.doc);
+        const selection = editor.cm?.state?.selection?.main;
+        current.imeGuard = selection ?
+          { from:selection.from, to:selection.to } : null;
+        current.imeProjectionBlocked = false;
+        current.compositionPublished = false;
         current.composing = true;
         current.composingEditor = editor;
+        // Candidate selection remains owned by this editor; do not broadcast
+        // "cursor-away" or make other participants think it has disappeared.
+        if (current === session) render();
       }
     };
     const onCompositionEnd = () => {
@@ -659,6 +871,7 @@ export function initCollaboration(plugin) {
     // Native IME composition must finish against this live Y.Doc before its
     // room membership is removed, even if the composing pane is closing.
     finishComposition(current);
+    clearCausalRepair(current);
     sessions.delete(current.path);
 
     if (session === current) {
@@ -703,12 +916,17 @@ export function initCollaboration(plugin) {
       serverSaveError: false,
       serverDocumentId: null,
       generationMismatch: null,
+      joinConflictReason: null,
+      hasLocalCopy: false,
       identitySaving: false,
       recoveredGenerationDraft: false,
       protocolError: null,
       previewSaving: false,
       previewRevision: 0,
       previewTimer: null,
+      causalGap: false,
+      causalRepairTimer: null,
+      causalRepairAttempts: 0,
       previewPromise: Promise.resolve(),
       suppress: false,
       participants: 1,
@@ -720,8 +938,11 @@ export function initCollaboration(plugin) {
       sourceEditor: null,
       composing: false,
       composingEditor: null,
+      imeSnapshot: null,
+      imeGuard: null,
+      imeProjectionBlocked: false,
+      compositionPublished: false,
       compositionTimer: null,
-      pendingRemote: [],
     };
 
     const local = createOfflineDocument(window.__currentVaultId, file.path, (storage) => {
@@ -730,7 +951,7 @@ export function initCollaboration(plugin) {
         next.storageError = storage.error;
         render();
       }
-    }, () => next.composing || Boolean(next.generationMismatch));
+    }, () => Boolean(next.generationMismatch));
     const { doc, text } = local;
     next.doc = doc;
     next.text = text;
@@ -744,6 +965,37 @@ export function initCollaboration(plugin) {
     bindEditor(next, editor);
 
     doc.on("update", (update, origin) => {
+      // The live CRDT stores all peers' operations, including operations
+      // touching the unconfirmed candidate. The composing editor is a
+      // distinct projection: accept independently safe updates against its
+      // own Yjs lineage, even after an earlier conflict was held.
+      if (sessions.get(next.path) === next && next.composing &&
+          next.composingEditor && next.imeSnapshot &&
+          (origin === REMOTE || origin === CROSS_TAB_ORIGIN ||
+            next.sourceEditor !== next.composingEditor)) {
+        const wasSuppressed=next.suppress;
+        next.suppress=true;
+        try {
+          const decision=projectIndependentCompositionUpdate(
+            next.imeSnapshot, update, next.imeGuard,
+            (projection,delta)=>patchEditor(next.composingEditor,projection,delta)
+          );
+          if (decision.projected) {
+            next.imeGuard=decision.guard;
+            renderPeers(next);
+          } else {
+            next.imeProjectionBlocked=true;
+          }
+        } catch (error) {
+          // Keep the real composition untouched and the full update in the
+          // live doc. It can be reconciled after the IME commits.
+          next.imeProjectionBlocked=true;
+          console.warn("[collab] IME projection deferred:",error);
+        } finally {
+          next.suppress=wasSuppressed;
+        }
+        if (next === session) render();
+      }
       if ((origin === LOCAL || origin === next.undoManager || origin === CROSS_TAB_ORIGIN) &&
           sessions.get(next.path) === next) {
         next.dirty = true;
@@ -762,7 +1014,14 @@ export function initCollaboration(plugin) {
 
         try {
           for (const binding of next.bindings.values()) {
-            if (binding.editor !== next.sourceEditor) {
+            if (binding.editor === next.sourceEditor) continue;
+            if (next.composing && binding.editor === next.composingEditor) {
+              // A Yjs text observer runs before the corresponding document
+              // update event. The latter carries original operation IDs and
+              // owns the selective projection, including independent edits
+              // received after a different participant's conflict.
+              continue;
+            } else {
               if (!patchEditor(binding.editor, next.text, event.delta)) {
                 reconcileEditorState(binding.editor, next.text.toString());
               }
@@ -791,6 +1050,7 @@ export function initCollaboration(plugin) {
       }
 
       next.serverDocumentId = storedId || next.local.activeGeneration || null;
+      next.hasLocalCopy = hasLocalCopy;
       next.pendingConflict = typeof unsentDraft === "string"
         ? unsentDraft : (typeof replacedDraft === "string" ? replacedDraft : null);
       next.recoveredGenerationDraft = typeof replacedDraft === "string";
@@ -905,7 +1165,7 @@ export function initCollaboration(plugin) {
   }
 
   const unsubscribe = [
-    channel.subscribe("init", (msg) => {
+    channel.subscribe("init", async (msg) => {
       const current = sessions.get(msg.path);
 
       if (!current?.hydrated) {
@@ -919,10 +1179,41 @@ export function initCollaboration(plugin) {
         return;
       }
 
-      if (current.serverDocumentId && current.serverDocumentId !== msg.documentId) {
+      let decision;
+      try {
+        // The server supplied a Yjs snapshot, not a plain string. Inspect
+        // its independent text before letting it touch a local Y.Doc.
+        let incomingText = "";
+        if (current.hasLocalCopy && !current.serverDocumentId) {
+          const candidate = new Y.Doc();
+          try {
+            Y.applyUpdate(candidate, decodeUpdate(msg.state));
+            incomingText = candidate.getText("content").toString();
+          } finally {
+            candidate.destroy();
+          }
+        }
+        decision = classifyDocumentAncestry({
+          hasLocalCopy: current.hasLocalCopy,
+          localDocumentId: current.serverDocumentId,
+          incomingDocumentId: msg.documentId,
+          localText: current.text.toString(), incomingText,
+          localHasOperations: Y.decodeStateVector(
+            Y.encodeStateVector(current.doc)).size > 0,
+        });
+      } catch {
+        current.protocolError = "Could not verify incoming note history";
+        channel.send("leave", { path: current.path });
+        render();
+        return;
+      }
+
+      if (decision === "replaced" || decision === "independent") {
         // A deleted/recreated path is NOT the old note. It cannot accept old
-        // offline operations merely because the filename was reused.
+        // offline operations merely because the filename was reused. The
+        // same applies to two separate originals never sharing a document ID.
         current.generationMismatch = msg.documentId;
+        current.joinConflictReason = decision;
         current.joined = false;
         current.pendingConflict = current.text.toString();
         current.people.clear();
@@ -933,6 +1224,31 @@ export function initCollaboration(plugin) {
 
         channel.send("leave", { path: current.path });
         render();
+        return;
+      }
+
+      if (decision === "adopt-identical") {
+        // Visible bytes are the same, but CRDT struct IDs are NOT. Do not
+        // merge the two Yjs histories. Durably switch to the exact server
+        // generation, leaving the old journal untouched for recovery.
+        current.generationMismatch = msg.documentId;
+        for (const binding of current.bindings.values()) {
+          binding.unlock ||= guardEditor(binding.editor);
+        }
+        try {
+          const adopted = await current.local.activateGeneration(msg.documentId, null,
+            () => sessions.get(current.path) === current);
+          if (!adopted) return;
+          if (sessions.get(current.path) === current) {
+            dispose(current);
+            syncActive();
+          }
+        } catch (error) {
+          current.storageError = error;
+          current.protocolError = "Could not safely switch identical note history";
+          channel.send("leave", { path: current.path });
+          render();
+        }
         return;
       }
 
@@ -981,6 +1297,7 @@ export function initCollaboration(plugin) {
         scheduleOfflinePreview(current);
         // Full state exchange includes local edits retained while disconnected.
         sendUpdate(current, Y.encodeStateAsUpdate(current.doc));
+        ensureCausalConvergence(current);
         render();
         renderPeers(current);
         scheduleSelection(current);
@@ -999,11 +1316,10 @@ export function initCollaboration(plugin) {
       try {
         const bytes = decodeUpdate(msg.update);
 
-        if (current.composing) {
-          current.pendingRemote.push(bytes);
-        } else {
-          Y.applyUpdate(current.doc, bytes, REMOTE);
-        }
+        // Remote state is always live. Only the composing DOM is deferred,
+        // so another pane can display changes without disturbing IME input.
+        Y.applyUpdate(current.doc, bytes, REMOTE);
+        ensureCausalConvergence(current);
       } catch (error) {
         console.error("[collab] Invalid remote update:", error);
       }
@@ -1084,8 +1400,14 @@ export function initCollaboration(plugin) {
       }
     }),
     ws.onStateChange((state) => {
+      transportState = state;
       for (const current of sessions.values()) {
         current.joined = false;
+        if (state !== "open") {
+          clearTimeout(current.causalRepairTimer);
+          current.causalRepairTimer = null;
+          current.causalRepairAttempts = 0;
+        }
 
         if (state === "open") {
           sendJoin(current);
@@ -1099,6 +1421,11 @@ export function initCollaboration(plugin) {
       render();
     }),
   ];
+  if (writes?.onStateChange) {
+    unsubscribe.push(writes.onStateChange(() => render()));
+    unsubscribe.push(writes.onFailure(() => render()));
+    unsubscribe.push(writes.onFailureChange(() => render()));
+  }
 
   plugin.registerEvent(plugin.app.workspace.on("active-leaf-change", scheduleActive));
   plugin.registerEvent(plugin.app.workspace.on("file-open", scheduleActive));
@@ -1106,14 +1433,27 @@ export function initCollaboration(plugin) {
   plugin.registerEvent(plugin.app.workspace.on("editor-change", (editor) => {
     for (const current of sessions.values()) {
       if (!current.bindings.has(editor) || !current.initialized ||
-          current.suppress || current.composing || current.generationMismatch) {
+          current.suppress ||
+          current.generationMismatch) {
         continue;
       }
 
       current.sourceEditor = editor;
 
       try {
-        applyLocalChange(current.text, editor.getValue());
+        if (current.composing && current.composingEditor === editor) {
+          // Publish provisional phonetic/converted text to other clients on
+          // each editor transaction, while never reconciling the composing
+          // CodeMirror view against remote Yjs changes.
+          current.imeGuard = widenCompositionGuard(
+            current.imeGuard, current.imeSnapshot.text.toString(),
+            editor.getValue());
+          if (publishComposition(current.doc, current.imeSnapshot, editor.getValue(), LOCAL)) {
+            current.compositionPublished = true;
+          }
+        } else {
+          applyLocalChange(current.text, editor.getValue());
+        }
       } finally {
         current.sourceEditor = null;
       }
@@ -1133,6 +1473,7 @@ export function initCollaboration(plugin) {
   return () => {
     clearTimeout(activeTimer);
     peopleModal?.close();
+    mobileMenu?.close();
 
     for (const current of sessions.values()) {
       dispose(current);
@@ -1143,6 +1484,7 @@ export function initCollaboration(plugin) {
     }
 
     status.remove();
+    unmountNavbarAction();
     delete window.__ignis.collaboration;
   };
 }

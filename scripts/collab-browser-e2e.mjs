@@ -581,11 +581,16 @@ try {
   const concurrentText = `[DURING-IME-${markerId}]`;
   await cdp.evaluate(b, `(() => {
     const editor = window.app.workspace.activeLeaf.view.editor;
+    editor.setCursor(editor.offsetToPos(editor.getValue().length));
     editor.cm.dom.dispatchEvent(new CompositionEvent('compositionstart', {bubbles:true}));
     editor.replaceRange(${JSON.stringify(composingText)},
       editor.offsetToPos(editor.getValue().length));
     return true;
   })()`);
+  // Both directions must stay live DURING composition. Candidate input is
+  // not an excuse to freeze disjoint peer updates or clear their carets.
+  await poll(async () => (await read(a)).includes(composingText), 10000);
+  console.log("PASS: remote browser sees provisional IME text before compositionend");
   await cdp.evaluate(a, `(() => {
     const editor = window.app.workspace.activeLeaf.view.editor;
     editor.replaceRange(${JSON.stringify(concurrentText)}, {line:0,ch:0});
@@ -595,8 +600,8 @@ try {
   const composingView = await read(b);
 
 
-  if (!composingView.includes(composingText) || composingView.includes(concurrentText)) {
-    throw new Error("Incoming remote edit interfered with the active composition: " + JSON.stringify({
+  if (!composingView.includes(composingText) || !composingView.includes(concurrentText)) {
+    throw new Error("Disjoint remote edit was not rendered during active IME: " + JSON.stringify({
       localPresent: composingView.includes(composingText),
       remotePresent: composingView.includes(concurrentText),
       status: await status(b),
@@ -606,6 +611,7 @@ try {
       }))()`),
     }));
   }
+  console.log("PASS: composing browser renders disjoint peer edits before compositionend");
 
   await cdp.evaluate(b, "window.app.workspace.activeLeaf.view.editor.cm.dom.dispatchEvent(new CompositionEvent('compositionend', {bubbles:true})); true");
   await poll(async () => {
@@ -710,6 +716,53 @@ try {
     return status.includes('1 online') && document.querySelectorAll('.ignis-collab-remote-caret').length === 0;
   })()`), 15000);
   console.log("PASS: departed user's remote caret removed");
+
+  // Installed iOS PWAs do not show the desktop Obsidian status bar. Verify
+  // the visible mobile shortcut, the existing participant modal and a name
+  // that survives a new standalone page load with sessionStorage cleared.
+  await cdp.command("Emulation.setDeviceMetricsOverride", {
+    width: 390, height: 844, deviceScaleFactor: 3, mobile: true
+  }, b);
+  const mobileName = "PWA 日本語";
+  const trigger = await poll(() => cdp.evaluate(b, `(() => {
+    const button = document.querySelector('.ignis-collab-mobile-people-trigger');
+    if (!button) return null;
+    const rect = button.getBoundingClientRect();
+    const style = getComputedStyle(button);
+    const visible = style.display !== 'none' && rect.width >= 90 &&
+      rect.height >= 40 && rect.left >= 0 && rect.right <= innerWidth + 1 &&
+      rect.top >= 0 && rect.bottom <= innerHeight + 1;
+    if (!visible) return null;
+    const over = document.elementFromPoint(
+      (rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+    if (!button.contains(over) && over !== button) return null;
+    button.click();
+    const input = document.querySelector('.modal-container form input');
+    if (!input) return null;
+    input.value = ${JSON.stringify(mobileName)};
+    input.closest('form').dispatchEvent(
+      new Event('submit', { bubbles: true, cancelable: true }));
+    return { viewport: innerWidth, width: rect.width, height: rect.height,
+      label: button.textContent,
+      saved: localStorage.getItem('ignis-collab-display-name') };
+  })()`), 15000);
+  if (trigger.saved !== mobileName) {
+    throw new Error("Mobile PWA name save failed: " + JSON.stringify(trigger));
+  }
+  await cdp.evaluate(b, "sessionStorage.removeItem('ignis-collab-display-name'); true");
+  await cdp.command("Page.reload", { ignoreCache: true }, b);
+  await poll(() => cdp.evaluate(b,
+    "Boolean(window.app?.workspace?.getLeaf && document.querySelector('.ignis-collab-mobile-people-trigger'))"), 35000);
+  const persistentName = await cdp.evaluate(b, `(() => {
+    document.querySelector('.ignis-collab-mobile-people-trigger').click();
+    return document.querySelector('.modal-container form input')?.value || null;
+  })()`);
+  if (persistentName !== mobileName) {
+    throw new Error("Mobile PWA display name did not survive restart: " +
+      JSON.stringify({ persistentName, mobileName }));
+  }
+  console.log("PASS: iOS-size PWA shortcut opens participant name editor and persists after reload:",
+    JSON.stringify(trigger));
   socket.close();
 } finally {
   thirdPeer?.close();

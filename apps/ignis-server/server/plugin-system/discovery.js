@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { readSidecarManifest } = require("./sidecar-manifest");
 
 function discoverPlugins(pluginsDir) {
   const discovered = new Map();
@@ -18,6 +19,23 @@ function discoverPlugins(pluginsDir) {
     }
 
     const pluginPath = path.join(pluginsDir, entry.name);
+    try {
+      const sidecar = readSidecarManifest(pluginPath);
+      if (sidecar) {
+        discovered.set(sidecar.id, {
+          ...sidecar,
+          module: null,
+          obsidianPlugin: null,
+          bundledPluginId: null,
+          bundledManifest: null,
+        });
+        console.log(`[plugins] Discovered sidecar: ${sidecar.name}`);
+        continue;
+      }
+    } catch (error) {
+      console.warn(`[plugins] Skipping ${entry.name}: ${error.message}`);
+      continue;
+    }
     const indexPath = path.join(pluginPath, "index.js");
 
     if (!fs.existsSync(indexPath)) {
@@ -39,6 +57,11 @@ function discoverPlugins(pluginsDir) {
       );
       continue;
     }
+    const scope = plugin.scope ?? "vault";
+    if (scope !== "vault" && scope !== "server") {
+      console.warn(`[plugins] Skipping ${entry.name}: invalid scope ${scope}`);
+      continue;
+    }
 
     let bundledManifest = null;
 
@@ -58,6 +81,8 @@ function discoverPlugins(pluginsDir) {
     discovered.set(plugin.id, {
       id: plugin.id,
       name: plugin.name,
+      scope,
+      runtime: "in-process",
       description: plugin.description || "",
       obsidianPlugin: plugin.obsidianPlugin || null,
       bundledPluginId: bundledManifest ? bundledManifest.id : null,

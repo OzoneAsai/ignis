@@ -34,9 +34,15 @@ export function decodeCursorPosition(value) {
 }
 
 export function encodeCursorSelection(text, anchor, head) {
+  // A stationary caret belongs to the glyph on its LEFT. A different
+  // participant inserting a newline at the same index must not pull this
+  // caret onto the new line. For a selection, preserve the selected glyphs:
+  // the beginning attaches to the right and the end to the left.
+  const affinity = (index) => anchor === head ? -1 :
+    index === Math.min(anchor,head) ? 0 : -1;
   const at = (index) => encodeBytes(Y.encodeRelativePosition(
     Y.createRelativePositionFromTypeIndex(
-      text, Math.max(0, Math.min(text.length, index))
+      text, Math.max(0, Math.min(text.length, index)), affinity(index)
     )));
   const result = { anchor: at(anchor), head: at(head) };
   return decodeCursorPosition(result.anchor) && decodeCursorPosition(result.head)

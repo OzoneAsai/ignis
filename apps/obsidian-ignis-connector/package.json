@@ -1,6 +1,6 @@
 {
   "name": "@ignis/obsidian-connector",
-  "version": "0.1.0",
+  "version": "0.1.5-beta.2",
   "private": true,
   "description": "Experimental mobile-compatible native Obsidian client for the Ignis Vault Sync server",
   "scripts": {

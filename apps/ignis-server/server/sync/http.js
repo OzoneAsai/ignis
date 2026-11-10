@@ -3,6 +3,9 @@
 const crypto = require("node:crypto");
 const express = require("express");
 const { tailnetPrincipal, authorizedVaults } = require("./tailnet-auth");
+const {
+  normalizeMediaBypassExtensions,
+} = require("../../../../packages/sync-policy/src/media-bypass");
 
 function secureEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
@@ -22,7 +25,16 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
   });
   router.get("/capabilities", (_req, res) => {
     res.json({ protocol: "ignis-sync/1", transport: ["https", "wss"],
-      supported: ["manifest", "changes", "conditional-text", "conditional-binary-4MiB", "file-identity"],
+      supported: ["manifest", "changes", "conditional-text",
+        ...(store.contentScope.mode === "all" ||
+          (store.db.prepare(
+            "SELECT COUNT(*) AS count FROM vault_sync_media_bypass WHERE extensions_json <> '[]'"
+          ).get().count > 0) ||
+          [...store.contentScopeOverrides.values()].some((scope) => scope.mode === "all")
+          ? ["conditional-binary-4MiB"] : []),
+        "file-identity"],
+      contentScope: store.contentScope.mode,
+      scopedByVault: store.contentScopeOverrides.size > 0,
       auth: tailnetAccess.size ? ["scoped-device-token", "tailscale-serve"] :
         ["scoped-device-token"],
       experimental: true });
@@ -70,6 +82,83 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
     }
     res.status(204).end();
   }));
+  router.get("/admin/vaults/:vaultId/content-scope", adminOnly, route((req, res) => {
+    const desired = req.query.mode;
+    if (desired !== undefined && !["all", "markdown-only"].includes(desired)) {
+      return res.status(400).json({
+        code: "INVALID_CONTENT_SCOPE",
+        error: "Preview mode must be all or markdown-only",
+      });
+    }
+    res.json(store.previewContentScope(req.params.vaultId, desired || null));
+  }));
+  router.get("/admin/vaults/:vaultId/media-bypass", adminOnly, route((req, res) => {
+    const raw = req.query.extensions;
+    let proposed = null;
+    if (raw !== undefined) {
+      if (typeof raw !== "string" || raw.length > 300) {
+        return res.status(400).json({
+          code: "INVALID_BYPASS_EXTENSIONS", error: "Invalid preview extension list",
+        });
+      }
+      try { proposed = normalizeMediaBypassExtensions(
+        raw ? raw.split(",") : []
+      ); } catch {
+        return res.status(400).json({
+          code: "INVALID_BYPASS_EXTENSIONS",
+          error: "Choose supported media extensions",
+        });
+      }
+    }
+    res.json(store.previewMediaBypass(req.params.vaultId, proposed));
+  }));
+  router.put("/admin/vaults/:vaultId/media-bypass", adminOnly, route(async (req, res) => {
+    let requested, expected;
+    try {
+      requested = normalizeMediaBypassExtensions(req.body?.extensions);
+      expected = normalizeMediaBypassExtensions(req.body?.expectedExtensions);
+    } catch {
+      return res.status(400).json({
+        code: "INVALID_BYPASS_EXTENSIONS",
+        error: "Choose supported document/media extensions",
+      });
+    }
+    res.json(await store.setMediaBypass(req.params.vaultId, requested, expected));
+  }));
+  router.put("/admin/vaults/:vaultId/content-scope", adminOnly, route(async (req, res) => {
+    const { contentScope, expectedScope } = req.body || {};
+    if (!["all", "markdown-only"].includes(contentScope) ||
+        !["all", "markdown-only"].includes(expectedScope)) {
+      return res.status(400).json({
+        code: "INVALID_CONTENT_SCOPE",
+        error: "Provide contentScope and expectedScope: all or markdown-only",
+      });
+    }
+    res.json(await store.setContentScope(req.params.vaultId,
+      contentScope, expectedScope));
+  }));
+  router.get("/admin/vaults/:vaultId/media-preflight", adminOnly, route(async (req, res) => {
+    const requested = req.query.root;
+    const roots = typeof requested === "string" ? [requested] :
+      Array.isArray(requested) && requested.every((x) => typeof x === "string")
+        ? requested : [];
+    if (!roots.length || roots.length > 8) {
+      return res.status(400).json({
+        code: "INVALID_MEDIA_ROOTS", error: "Supply one to eight media root paths",
+      });
+    }
+    try {
+      const report = await store.preflightMediaOwnership(req.params.vaultId, roots);
+      res.json(report);
+    } catch (error) {
+      if (error instanceof Error && /Invalid|root|Overlapping|path/.test(error.message)) {
+        return res.status(400).json({
+          code: "INVALID_MEDIA_ROOTS", error: "Invalid media synchronization roots",
+        });
+      }
+      throw error;
+    }
+  }));
 
   router.use("/vaults/:vaultId", (req, res, next) => {
     const match = /^Bearer (ignis_dev_[A-Za-z0-9_-]{43})$/.exec(
@@ -84,15 +173,60 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
     }
     req.ignisSyncDevice = device;
     req.ignisSyncAuth = login && !match ? "tailnet" : "device";
+    // The request's body and opId remain byte-for-byte compatible with old
+    // operation receipts. A separate precondition header allows upgraded
+    // Connectors to prevent commits to a replacement journal even when the
+    // server changes between a manifest check and an outgoing POST.
+    const expectedLineage = req.get("X-Ignis-Journal-Lineage");
+    if (req.method !== "GET" && expectedLineage &&
+        expectedLineage !== store.journalLineage(req.params.vaultId)) {
+      return res.status(409).json({ code: "JOURNAL_LINEAGE_MISMATCH",
+        error: "Server Sync history changed; local operations must be reviewed" });
+    }
+    const checkpointSeq = req.get("X-Ignis-Journal-Cursor");
+    const checkpointProof = req.get("X-Ignis-Journal-Proof");
+    if (req.method !== "GET" &&
+        (checkpointSeq !== undefined || checkpointProof !== undefined)) {
+      const seq = Number(checkpointSeq);
+      if (!expectedLineage || checkpointSeq === undefined ||
+          !/^(0|[1-9][0-9]*)$/.test(checkpointSeq) ||
+          !Number.isSafeInteger(seq) ||
+          typeof checkpointProof !== "string" ||
+          !/^[a-f0-9]{64}$/.test(checkpointProof)) {
+        return res.status(400).json({code:"INVALID_CHECKPOINT",
+          error:"A complete valid Sync history checkpoint is required"});
+      }
+      // The client can remain behind unrelated editors without losing write
+      // access; the exact former operation, not the latest server HEAD, is
+      // the CAS condition. This closes a restore/catch-up race between a
+      // client's manifest verification and a delayed outgoing write.
+      if (store.journalCheckpoint(req.params.vaultId,seq).proof !== checkpointProof) {
+        return res.status(409).json({code:"JOURNAL_CHECKPOINT_MISMATCH",
+          error:"Server Sync history differs from a previously verified checkpoint"});
+      }
+    }
     next();
   });
   router.get("/vaults/:vaultId/session", (req, res) => {
     const device = req.ignisSyncDevice;
     res.json({ deviceId: device.deviceId, vaultId: device.vaultId,
-      label: device.label, auth: req.ignisSyncAuth });
+      label: device.label, auth: req.ignisSyncAuth,
+      journalLineage: store.journalLineage(device.vaultId),
+      contentScope: store.contentScopeFor(device.vaultId),
+      mediaBypassExtensions: store.mediaBypassFor(device.vaultId) });
   });
   router.get("/vaults/:vaultId/manifest", route(async (req, res) => {
     res.json(await store.scan(req.params.vaultId));
+  }));
+  router.get("/vaults/:vaultId/checkpoint", route(async (req, res) => {
+    const seq = Number(req.query.seq);
+    if (!Number.isSafeInteger(seq) || seq < 0 || req.query.seq === undefined) {
+      return res.status(400).json({code:"INVALID_CURSOR",error:"Invalid checkpoint sequence"});
+    }
+    // A read-only indexed witness for the exact historical frontier already
+    // acknowledged by this client. Do not advance, rescan or mutate a Vault
+    // when another client is verifying continuity before replaying writes.
+    res.json(store.journalCheckpoint(req.params.vaultId, seq));
   }));
   router.get("/vaults/:vaultId/changes", route(async (req, res) => {
     const since = Number(req.query.since ?? 0);
@@ -104,12 +238,17 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
     await store.scan(req.params.vaultId);
     res.json(store.changes(req.params.vaultId, since, limit));
   }));
-  router.get("/vaults/:vaultId/operations/:opId", route((req, res) => {
+  router.get("/vaults/:vaultId/operations/:opId", route(async (req, res) => {
+    await store.recover(req.params.vaultId);
     const receipt = store.operationReceipt(req.params.vaultId, req.params.opId);
     if (!receipt) return res.status(404).json({
       code: "OPERATION_NOT_FOUND", error: "Operation not recorded"
     });
+    await store.retireCommittedCreateMarker(req.params.vaultId, req.params.opId);
     res.json(receipt);
+  }));
+  router.post("/vaults/:vaultId/operations/:opId/abandon", route(async (req, res) => {
+    res.json(await store.abandonOperation(req.params.vaultId, req.params.opId));
   }));
   router.get("/vaults/:vaultId/files/:fileId", route(async (req, res) => {
     const result = await store.read(req.params.vaultId, req.params.fileId);
@@ -144,7 +283,8 @@ function registerSyncChannel(wss, store, { token, tailnetAccess = new Map() } = 
     peers.add(ws);
     ws.send(JSON.stringify({ channel: "sync", type: "ready",
       vaultId: ws.ignisVaultId, deviceId: device.deviceId,
-      vaultSeq: store.head(ws.ignisVaultId) }));
+      vaultSeq: store.head(ws.ignisVaultId),
+      journalLineage: store.journalLineage(ws.ignisVaultId) }));
   });
   channel.on("resume", (msg, ws) => {
     if (!store.deviceActive(authorized.get(ws), ws.ignisVaultId)) {

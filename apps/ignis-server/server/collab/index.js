@@ -68,6 +68,14 @@ async function assertCanonicalNotePath(vaultRoot, notePath) {
     const entries = await fs.promises.readdir(directory);
 
     if (!entries.includes(part)) {
+      // A new native-only note does not exist on an empty Ignis server yet.
+      // This is a missing file, not a generic collaboration failure. Keep a
+      // differently-cased existing name distinct to protect canonical rooms.
+      if (!entries.some(name => name.toLowerCase() === part.toLowerCase())) {
+        const missing = new Error("Note not found");
+        missing.code = "ENOENT";
+        throw missing;
+      }
       throw new Error("Noncanonical collaborative note path");
     }
 

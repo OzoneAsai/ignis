@@ -26,6 +26,28 @@ body {
   }
 
   body.is-phone .mobile-toolbar {
-    top: calc(100dvh - var(--keyboard-height) - var(--mobile-toolbar-height));
+    /* Browser Safari does not receive the native iOS keyboard height.
+       Use its VisualViewport bottom edge; retain Obsidian's default if absent. */
+    top: calc(
+      var(--ignis-mobile-visual-bottom, calc(100dvh - var(--keyboard-height))) -
+      var(--mobile-toolbar-height)
+    );
   }
+}
+
+/* Built-in Obsidian editing toolbar, not a separate floating Ignis dock.
+   The bottom position is the default; up uses the native view's top inset. */
+body.is-phone[data-ignis-mobile-toolbar="top"] .mobile-toolbar {
+  top: calc(
+    var(--safe-area-inset-top, 0px) +
+    var(--view-header-height, 52px) +
+    var(--size-4-2, 8px)
+  ) !important;
+}
+
+/* Prevent a stale native toolbar from flashing on boot while the Bridge
+   intercepts MobileToolbar.show() for the hidden setting. */
+body.is-phone[data-ignis-mobile-toolbar="hidden"] .mobile-toolbar,
+body.is-phone[data-ignis-mobile-toolbar="hidden"] .mobile-toolbar-spacer {
+  display: none !important;
 }

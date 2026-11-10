@@ -326,7 +326,16 @@ export function initialize() {
     window.__ignisBootReady = loadOfflineBootstrap(window.__currentVaultId)
       .then((offline) => {
         if (offline) {
-          applyBootstrapData(offline.bootstrap);
+          applyBootstrapData({
+            ...offline.bootstrap,
+            tree: {
+              ...offline.bootstrap.tree,
+              ...offline.previewMetadata,
+            },
+            // The offline metadata set is provisional until an actual
+            // post-reconnect server tree has been fetched and reconciled.
+            etag: null,
+          });
 
           for (const [path, content] of Object.entries({
             ...offline.files,

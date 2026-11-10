@@ -15,24 +15,46 @@
   }
 </script>
 
-<!-- svelte-ignore a11y-no-static-element-interactions -->
-<div class="list-item" class:active class:clickable on:click={onClick}>
-  {#if $$slots.icon}
-    <div class="item-icon">
-      <slot name="icon" />
+<div class="list-item" class:active class:clickable>
+  {#if clickable}
+    <button type="button" class="item-main" aria-current={active ? "true" : undefined} on:click={onClick}>
+      {#if $$slots.icon}
+        <div class="item-icon">
+          <slot name="icon" />
+        </div>
+      {/if}
+
+      <div class="item-content">
+        {#if $$slots.default}
+          <slot />
+        {:else}
+          <span class="item-primary">{primary}</span>
+          {#if secondary}
+            <span class="item-secondary">{secondary}</span>
+          {/if}
+        {/if}
+      </div>
+    </button>
+  {:else}
+    <div class="item-main">
+      {#if $$slots.icon}
+        <div class="item-icon">
+          <slot name="icon" />
+        </div>
+      {/if}
+
+      <div class="item-content">
+        {#if $$slots.default}
+          <slot />
+        {:else}
+          <span class="item-primary">{primary}</span>
+          {#if secondary}
+            <span class="item-secondary">{secondary}</span>
+          {/if}
+        {/if}
+      </div>
     </div>
   {/if}
-
-  <div class="item-content">
-    {#if $$slots.default}
-      <slot />
-    {:else}
-      <span class="item-primary">{primary}</span>
-      {#if secondary}
-        <span class="item-secondary">{secondary}</span>
-      {/if}
-    {/if}
-  </div>
 
   {#if $$slots.action}
     <div class="item-action">
@@ -63,6 +85,28 @@
   .list-item.clickable:hover {
     background: var(--background-modifier-hover);
     border-color: var(--background-modifier-border);
+  }
+  .item-main {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex: 1;
+    min-width: 0;
+  }
+  button.item-main {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
+    text-align: left;
+  }
+  button.item-main:focus-visible {
+    outline: 2px solid var(--interactive-accent);
+    outline-offset: 3px;
+    border-radius: 0.25rem;
   }
 
   .item-icon {

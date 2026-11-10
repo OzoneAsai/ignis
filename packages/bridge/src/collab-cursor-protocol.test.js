@@ -38,6 +38,26 @@ describe("shared Yjs cursor wire semantics", () => {
     doc.destroy();
   });
 
+  it("does not drag a stationary remote caret after somebody else's newline at that same line end", () => {
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    text.insert(0, "Q: 今すぐ質問しますか？\nA: はい");
+    const at = text.toString().indexOf("\n");
+    const caret = encodeCursorSelection(text, at, at);
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    // The author inserts a newline at exactly the stationary peer's caret.
+    peer.getText("content").insert(at, "\n");
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer));
+    expect(resolveCursorSelection(text, caret)).toEqual({anchor:at,head:at});
+    const movingOwnCaret = encodeCursorSelection(text, at+1, at+1);
+    expect(resolveCursorSelection(text,movingOwnCaret)).toEqual({
+      anchor:at+1,head:at+1
+    });
+    peer.destroy();
+    doc.destroy();
+  });
+
   it("does not silently truncate 33 selections or accept an invalid mainIndex", () => {
     const doc = new Y.Doc(), text = doc.getText("content");
     text.insert(0, "hello world");

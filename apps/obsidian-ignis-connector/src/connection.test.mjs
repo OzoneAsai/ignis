@@ -16,6 +16,17 @@ vi.mock("./live", () => ({
   NativeYjs: class {}
 }));
 import IgnisConnector from "./main.ts";
+import { scopedSecretId } from "./connection-setup.ts";
+
+const JOURNAL_ID = "00000000-0000-4000-8000-000000000011";
+const REPLACEMENT_ID = "00000000-0000-4000-8000-000000000022";
+const ready = (deviceId="device-a") => ({ channel:"sync",type:"ready",
+  vaultId:"lab",deviceId,journalLineage:JOURNAL_ID,vaultSeq:0 });
+const verifiedManifest = () => ({status:200,json:{vaultId:"lab",vaultSeq:0,
+  journalLineage:JOURNAL_ID,files:[]}});
+const flushAuth = async () => {
+  for (let i=0;i<16;i++) await Promise.resolve();
+};
 
 class FakeSocket {
   static OPEN = 1;
@@ -54,6 +65,8 @@ function connector() {
     scope: "https://ignis.example|lab",
     vaultId: "lab",
     deviceId: "device-a",
+    journalLineage: JOURNAL_ID,
+    cursor: 0,
     baselines: {},
     pending: [],
     yjsIds: {}
@@ -62,6 +75,7 @@ function connector() {
   plugin.status = { setText: vi.fn() };
   plugin.schedule = vi.fn();
   plugin.live = {
+    blockingPaths: vi.fn(() => []),
     connected: vi.fn(),
     disconnected: vi.fn(),
     handle: vi.fn()
@@ -77,6 +91,49 @@ afterEach(() => {
 });
 
 describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
+  it("never starts Yjs when the same Vault announces a different journal lineage and newer sequence", async () => {
+    vi.stubGlobal("WebSocket",FakeSocket);
+    const plugin=connector();
+    plugin.settings.cursor=5;
+    plugin.settings.baselines={"LocalOriginal.md":{
+      fileId:"file-one",generationId:"generation-one",hash:"a".repeat(64),revision:1
+    }};
+    plugin.settings.pendingWrites=[{type:"create",opId:"unsent-draft-op",
+      path:"Unsent.md",content:"draft",localHash:"b".repeat(64)}];
+    plugin.saveData=vi.fn(async()=>{});
+    plugin.connectSocket();
+    const socket=sockets()[0];
+    socket.open();
+    socket.receive({...ready(),journalLineage:REPLACEMENT_ID,vaultSeq:900});
+    await vi.waitFor(()=>expect(socket.readyState).toBe(FakeSocket.CLOSED));
+    expect(plugin.live.connected).not.toHaveBeenCalled();
+    expect(plugin.settings.journalLineage).toBe(JOURNAL_ID);
+    expect(plugin.settings.pendingWrites).toHaveLength(1);
+    expect(plugin.settings.baselines["LocalOriginal.md"].fileId).toBe("file-one");
+    expect(plugin.journalRecoveryInfo().message).toContain("Server history changed");
+    expect(plugin.settings.syncIssues[0].path).toBe("LocalOriginal.md");
+  });
+
+  it("rejects reconnecting with a new device token if the same endpoint replaced its journal",async()=>{
+    const plugin=connector();
+    plugin.app={};
+    plugin.saveData=vi.fn(async()=>{});
+    const oldToken=plugin.token;
+    mockRequest.mockResolvedValueOnce({status:200,json:{
+      vaultId:"lab",deviceId:"new-device",label:"Replacement server",
+      journalLineage:REPLACEMENT_ID
+    }});
+    const result=await plugin.connectToServer({
+      serverUrl:"https://ignis.example",vaultId:"lab",
+      token:"ignis_dev_"+"z".repeat(43)
+    });
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/different Sync history/);
+    expect(plugin.settings.journalLineage).toBe(JOURNAL_ID);
+    expect(plugin.token).toBe(oldToken);
+    expect(plugin.saveData).toHaveBeenCalledOnce(); // Only the protective warning.
+    expect(plugin.settings.scope).toBe("https://ignis.example|lab");
+  });
   it("guards old sockets from leaking a newly entered token across origins", () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const plugin = connector();
@@ -110,6 +167,7 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     mockRequest.mockResolvedValueOnce({
       status: 200, json: {
         auth: "tailnet", vaultId: "IOSLab", deviceId: "tailnet-user-a",
+        journalLineage: JOURNAL_ID,
         label: "Tailnet user"
       }
     });
@@ -129,22 +187,75 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     expect(socket.sent).toEqual([{ channel: "sync", type: "auth" }]);
   });
 
-  it("does not forward stale collaboration frames after replacing a socket", () => {
+  it("adopts the server's Markdown-only scope without requiring Syncthing", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
+    const plugin = connector();
+    plugin.app = { secretStorage: null };
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    plugin.live.resetForConnection = vi.fn().mockResolvedValue(undefined);
+    plugin.settings.pendingWrites = [];
+    plugin.settings.syncIssues = [];
+    plugin.settings.archivedScopes = [];
+    plugin.settings.cursor = 0;
+    plugin.settings.contentScope = "all";
+    mockRequest.mockResolvedValueOnce({
+      status: 200, json: {
+        auth: "tailnet", vaultId: "MarkdownTest", deviceId: "sls-test",
+        journalLineage: JOURNAL_ID,
+        contentScope: "markdown-only",
+      },
+    });
+    const response = await plugin.connectToServer({
+      serverUrl: "https://mac.example:8452/join/MarkdownTest",
+      vaultId: "", token: "",
+    });
+    expect(response.ok).toBe(true);
+    expect(response.message).toContain("Markdown-only sharing");
+    expect(plugin.settings.contentScope).toBe("markdown-only");
+    expect(plugin.fileScope.allowsPath("Notes/sls.md")).toBe(true);
+    expect(plugin.fileScope.allowsPath("Media/photo.jpg")).toBe(false);
+  });
+
+  it("does not forward stale collaboration frames after replacing a socket", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    mockRequest.mockImplementation(async () => verifiedManifest());
     const plugin = connector();
     plugin.connectSocket();
     const old = sockets()[0];
     old.open();
-    old.receive({ channel: "sync", type: "ready", vaultId: "lab", deviceId: "device-a" });
+    old.receive(ready());
+    await flushAuth();
     expect(plugin.live.connected).toHaveBeenCalledTimes(1);
     plugin.recoverConnection();
     const current = sockets()[1];
     old.receive({ channel: "collab", type: "update", path: "test.md" });
     expect(plugin.live.handle).not.toHaveBeenCalled();
     current.open();
-    current.receive({ channel: "sync", type: "ready", vaultId: "lab", deviceId: "device-a" });
+    current.receive(ready());
+    // A remote frame received while its HTTP history check is still pending
+    // is not authorized to enter the local Yjs document.
+    current.receive({ channel: "collab", type: "update", path: "test.md" });
+    await flushAuth();
+    expect(plugin.live.handle).not.toHaveBeenCalled();
     current.receive({ channel: "collab", type: "update", path: "test.md" });
     expect(plugin.live.handle).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the history warning visible and excludes late Yjs frames after a disputed journal",async()=>{
+    vi.stubGlobal("WebSocket",FakeSocket);
+    mockRequest.mockImplementation(async()=>verifiedManifest());
+    const plugin=connector();
+    plugin.connectSocket();
+    const socket=sockets()[0];
+    socket.open();
+    socket.receive(ready());
+    await flushAuth();
+    expect(plugin.live.connected).toHaveBeenCalledOnce();
+    plugin.historyHold="diverged";
+    plugin.showStatus("Server persisted collaborative edits");
+    expect(plugin.getCurrentStatus()).toContain("Server history diverged");
+    socket.receive({channel:"collab",type:"update",path:"stale.md"});
+    expect(plugin.live.handle).not.toHaveBeenCalled();
   });
 
   it("stops reconnecting when the server explicitly rejects authorization", () => {
@@ -176,6 +287,27 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     expect(sockets()).toHaveLength(2);
     vi.advanceTimersByTime(1);
     expect(sockets()).toHaveLength(3);
+  });
+
+  it("reconnects a hidden desktop Connector after a server restart", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeSocket);
+    mockRequest.mockImplementation(async () => verifiedManifest());
+    const plugin = connector();
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    plugin.connectSocket();
+    const first = sockets()[0];
+    first.open();
+    first.receive(ready());
+    await flushAuth();
+    first.close(1006);
+    expect(plugin.live.disconnected).toHaveBeenCalled();
+    vi.advanceTimersByTime(1000);
+    expect(sockets()).toHaveLength(2);
+    sockets()[1].open();
+    sockets()[1].receive(ready());
+    await flushAuth();
+    expect(plugin.live.connected).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed when the server announces a different Vault", () => {
@@ -219,7 +351,7 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     mockRequest.mockResolvedValueOnce({
       status: 200, json: {
         deviceId: "11111111-1111-4111-8111-111111111111",
-        vaultId: "lab", label: "iPhone"
+        vaultId: "lab", label: "iPhone", journalLineage: JOURNAL_ID
       }
     });
     const result = await plugin.connectToServer({
@@ -232,12 +364,45 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
       headers: { Authorization: "Bearer " + good }
     }));
     expect(secrets.setSecret).toHaveBeenCalledWith(
-      "ignis-connector-vault-https://ignis.example|lab", good
+      await scopedSecretId("https://ignis.example|lab"), good
     );
     expect(plugin.settings.deviceId).toBe("11111111-1111-4111-8111-111111111111");
     expect(plugin.token).toBe(good);
     expect(sockets()).toHaveLength(1);
     expect(plugin.saveData).toHaveBeenCalledOnce();
+  });
+
+  it("does not call a Keychain -34018 failure durable, while retaining the verified live session", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const plugin = connector();
+    const secrets = {
+      secrets: { "another-vault": "must-be-preserved" },
+      adapter: {
+        save: vi.fn(async () => { throw Error("An OS error occurred (-34018)"); }),
+        load: vi.fn(async () => ({}))
+      },
+      setSecret: vi.fn()
+    };
+    plugin.app = { secretStorage: secrets };
+    plugin.saveData = vi.fn(async () => {});
+    const good = "ignis_dev_" + "z".repeat(43);
+    mockRequest.mockResolvedValueOnce({
+      status: 200,
+      json: { deviceId: "11111111-1111-4111-8111-111111111111",
+        vaultId: "lab", label: "iPhone 8 isolated QA", journalLineage: JOURNAL_ID }
+    });
+    const result = await plugin.connectToServer({
+      serverUrl: "https://ignis.example/", vaultId: "lab", token: good
+    });
+    expect(result.ok).toBe(true);
+    expect(result.memoryOnly).toBe(true);
+    expect(result.message).toMatch(/Secure storage did not confirm/);
+    expect(plugin.getCurrentStatus()).toContain("device token not saved");
+    expect(secrets.setSecret).not.toHaveBeenCalled();
+    expect(secrets.secrets["another-vault"]).toBe("must-be-preserved");
+    expect(plugin.token).toBe(good);
+    expect(sockets()).toHaveLength(1);
+    expect(JSON.stringify(plugin.settings)).not.toContain(good);
   });
 
   it("rejects an administrator token and a device enrolled to another Vault", async () => {
@@ -311,7 +476,8 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     plugin.live.resetForConnection = vi.fn(async () => {});
     mockRequest.mockResolvedValueOnce({
       status: 200,
-      json: { deviceId: "new-device", vaultId: "IOSLab", label: "Phone" }
+      json: { deviceId: "new-device", vaultId: "IOSLab", label: "Phone",
+        journalLineage: JOURNAL_ID }
     });
     const result = await plugin.connectToServer({
       serverUrl: "https://mac.example:8451", vaultId: "IOSLab",
@@ -332,7 +498,7 @@ describe("one HTTPS/WSS connector lifecycle on mobile and desktop", () => {
     plugin.connectSocket();
     const first = sockets()[0];
     first.open();
-    first.receive({ channel: "sync", type: "ready", vaultId: "lab", deviceId: "device-a" });
+    first.receive(ready());
     first.close(4003);
     expect(plugin.authBlocked).toBe(true);
     vi.advanceTimersByTime(60000);

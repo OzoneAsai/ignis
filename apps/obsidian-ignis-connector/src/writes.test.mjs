@@ -32,6 +32,13 @@ describe("durable immutable outbound write requests", () => {
     expect(acknowledgeWrite(restored, receipt(restored[0]))).toEqual(write());
     expect(restored).toEqual([]);
   });
+  it("retires a later independent acknowledged write without dropping a blocked earlier write", () => {
+    const blocked = write("blocked-operation");
+    const successful = { ...write("successful-operation"), path: "new.md" };
+    const pending = [blocked, successful];
+    expect(acknowledgeWrite(pending, receipt(successful))).toEqual(successful);
+    expect(pending).toEqual([blocked]);
+  });
   it("rejects a wrong or stale receipt without consuming the pending request", () => {
     const pending = [write()];
     for (const altered of [

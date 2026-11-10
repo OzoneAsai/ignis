@@ -44,6 +44,45 @@ function noteKey(vaultId, notePath) {
   return JSON.stringify([vaultId, notePath]);
 }
 
+function validPreviewPath(path) {
+  return typeof path === "string" && path.toLowerCase().endsWith(".md") &&
+    !path.startsWith("/") && !path.includes("\\") && !path.includes("\0") &&
+    path.split("/").every(part => part && part !== "." && part !== ".." &&
+      ![".obsidian", ".git", ".trash", ".ignis-connector"].includes(part.toLowerCase()));
+}
+
+// Offline startup metadata is a snapshot from the last ONLINE bootstrap, but
+// a newly created note may have entered durable local storage AFTER it.
+// Its saved content is recoverable; without its metadata Obsidian omits the
+// note from the Vault entirely on a mobile offline restart. Layer later
+// locally persisted previews on top of that earlier snapshot, marking their
+// origin so an online manifest can replace/delete them without pretending
+// they were already confirmed by the server.
+export function offlinePreviewMetadata(snapshot, entries) {
+  const tree = snapshot?.bootstrap?.tree || {};
+  const baseTime = snapshot?.savedAt || 0;
+  const recovered = {};
+  for (const entry of entries || []) {
+    if (!validPreviewPath(entry?.path) || typeof entry?.content !== "string" ||
+        !Number.isSafeInteger(entry.savedAt) || entry.savedAt < baseTime ||
+        Object.hasOwn(tree, entry.path)) continue;
+    const size = new TextEncoder().encode(entry.content).byteLength;
+    if (size > MAX_FILE_BYTES) continue;
+    const parts = entry.path.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      const parent = parts.slice(0, i).join("/");
+      if (!Object.hasOwn(tree, parent) && !Object.hasOwn(recovered, parent)) {
+        recovered[parent] = { type: "directory", offlineRecovery: true };
+      }
+    }
+    recovered[entry.path] = {
+      type: "file", size, mtime: entry.savedAt, ctime: entry.savedAt,
+      offlineRecovery: true,
+    };
+  }
+  return recovered;
+}
+
 function isBootstrapFile(path) {
   if (/^\.obsidian\/[^/]+\.json$/.test(path)) {
     return true;
@@ -119,14 +158,18 @@ export async function loadOfflineBootstrap(vaultId) {
       }
     }
 
-    return { ...snapshot, notes };
+    return {
+      ...snapshot, notes,
+      previewMetadata: offlinePreviewMetadata(snapshot,
+        entries.filter(entry => entry.vaultId === vaultId)),
+    };
   } finally {
     db.close();
   }
 }
 
 export async function saveOfflineNote(vaultId, notePath, content) {
-  if (!vaultId || !notePath.toLowerCase().endsWith(".md") ||
+  if (!vaultId || !validPreviewPath(notePath) ||
       new TextEncoder().encode(content).byteLength > MAX_FILE_BYTES) {
     return false;
   }

@@ -1,4 +1,4 @@
-/* Ignis Connector v0.1.0 */
+/* Ignis Connector v0.1.5-beta.2 */
 "use strict";
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -6,6 +6,9 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __commonJS = (cb, mod) => function __require() {
+  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
 var __export = (target, all2) => {
   for (var name in all2)
     __defProp(target, name, { get: all2[name], enumerable: true });
@@ -28,12 +31,936 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+// ../../node_modules/fast-diff/diff.js
+var require_diff = __commonJS({
+  "../../node_modules/fast-diff/diff.js"(exports, module2) {
+    var DIFF_DELETE = -1;
+    var DIFF_INSERT = 1;
+    var DIFF_EQUAL = 0;
+    function diff_main(text1, text2, cursor_pos, cleanup, _fix_unicode) {
+      if (text1 === text2) {
+        if (text1) {
+          return [[DIFF_EQUAL, text1]];
+        }
+        return [];
+      }
+      if (cursor_pos != null) {
+        var editdiff = find_cursor_edit_diff(text1, text2, cursor_pos);
+        if (editdiff) {
+          return editdiff;
+        }
+      }
+      var commonlength = diff_commonPrefix(text1, text2);
+      var commonprefix = text1.substring(0, commonlength);
+      text1 = text1.substring(commonlength);
+      text2 = text2.substring(commonlength);
+      commonlength = diff_commonSuffix(text1, text2);
+      var commonsuffix = text1.substring(text1.length - commonlength);
+      text1 = text1.substring(0, text1.length - commonlength);
+      text2 = text2.substring(0, text2.length - commonlength);
+      var diffs = diff_compute_(text1, text2);
+      if (commonprefix) {
+        diffs.unshift([DIFF_EQUAL, commonprefix]);
+      }
+      if (commonsuffix) {
+        diffs.push([DIFF_EQUAL, commonsuffix]);
+      }
+      diff_cleanupMerge(diffs, _fix_unicode);
+      if (cleanup) {
+        diff_cleanupSemantic(diffs);
+      }
+      return diffs;
+    }
+    function diff_compute_(text1, text2) {
+      var diffs;
+      if (!text1) {
+        return [[DIFF_INSERT, text2]];
+      }
+      if (!text2) {
+        return [[DIFF_DELETE, text1]];
+      }
+      var longtext = text1.length > text2.length ? text1 : text2;
+      var shorttext = text1.length > text2.length ? text2 : text1;
+      var i = longtext.indexOf(shorttext);
+      if (i !== -1) {
+        diffs = [
+          [DIFF_INSERT, longtext.substring(0, i)],
+          [DIFF_EQUAL, shorttext],
+          [DIFF_INSERT, longtext.substring(i + shorttext.length)]
+        ];
+        if (text1.length > text2.length) {
+          diffs[0][0] = diffs[2][0] = DIFF_DELETE;
+        }
+        return diffs;
+      }
+      if (shorttext.length === 1) {
+        return [
+          [DIFF_DELETE, text1],
+          [DIFF_INSERT, text2]
+        ];
+      }
+      var hm = diff_halfMatch_(text1, text2);
+      if (hm) {
+        var text1_a = hm[0];
+        var text1_b = hm[1];
+        var text2_a = hm[2];
+        var text2_b = hm[3];
+        var mid_common = hm[4];
+        var diffs_a = diff_main(text1_a, text2_a);
+        var diffs_b = diff_main(text1_b, text2_b);
+        return diffs_a.concat([[DIFF_EQUAL, mid_common]], diffs_b);
+      }
+      return diff_bisect_(text1, text2);
+    }
+    function diff_bisect_(text1, text2) {
+      var text1_length = text1.length;
+      var text2_length = text2.length;
+      var max_d = Math.ceil((text1_length + text2_length) / 2);
+      var v_offset = max_d;
+      var v_length = 2 * max_d;
+      var v1 = new Array(v_length);
+      var v2 = new Array(v_length);
+      for (var x = 0; x < v_length; x++) {
+        v1[x] = -1;
+        v2[x] = -1;
+      }
+      v1[v_offset + 1] = 0;
+      v2[v_offset + 1] = 0;
+      var delta = text1_length - text2_length;
+      var front = delta % 2 !== 0;
+      var k1start = 0;
+      var k1end = 0;
+      var k2start = 0;
+      var k2end = 0;
+      for (var d = 0; d < max_d; d++) {
+        for (var k1 = -d + k1start; k1 <= d - k1end; k1 += 2) {
+          var k1_offset = v_offset + k1;
+          var x1;
+          if (k1 === -d || k1 !== d && v1[k1_offset - 1] < v1[k1_offset + 1]) {
+            x1 = v1[k1_offset + 1];
+          } else {
+            x1 = v1[k1_offset - 1] + 1;
+          }
+          var y1 = x1 - k1;
+          while (x1 < text1_length && y1 < text2_length && text1.charAt(x1) === text2.charAt(y1)) {
+            x1++;
+            y1++;
+          }
+          v1[k1_offset] = x1;
+          if (x1 > text1_length) {
+            k1end += 2;
+          } else if (y1 > text2_length) {
+            k1start += 2;
+          } else if (front) {
+            var k2_offset = v_offset + delta - k1;
+            if (k2_offset >= 0 && k2_offset < v_length && v2[k2_offset] !== -1) {
+              var x2 = text1_length - v2[k2_offset];
+              if (x1 >= x2) {
+                return diff_bisectSplit_(text1, text2, x1, y1);
+              }
+            }
+          }
+        }
+        for (var k2 = -d + k2start; k2 <= d - k2end; k2 += 2) {
+          var k2_offset = v_offset + k2;
+          var x2;
+          if (k2 === -d || k2 !== d && v2[k2_offset - 1] < v2[k2_offset + 1]) {
+            x2 = v2[k2_offset + 1];
+          } else {
+            x2 = v2[k2_offset - 1] + 1;
+          }
+          var y2 = x2 - k2;
+          while (x2 < text1_length && y2 < text2_length && text1.charAt(text1_length - x2 - 1) === text2.charAt(text2_length - y2 - 1)) {
+            x2++;
+            y2++;
+          }
+          v2[k2_offset] = x2;
+          if (x2 > text1_length) {
+            k2end += 2;
+          } else if (y2 > text2_length) {
+            k2start += 2;
+          } else if (!front) {
+            var k1_offset = v_offset + delta - k2;
+            if (k1_offset >= 0 && k1_offset < v_length && v1[k1_offset] !== -1) {
+              var x1 = v1[k1_offset];
+              var y1 = v_offset + x1 - k1_offset;
+              x2 = text1_length - x2;
+              if (x1 >= x2) {
+                return diff_bisectSplit_(text1, text2, x1, y1);
+              }
+            }
+          }
+        }
+      }
+      return [
+        [DIFF_DELETE, text1],
+        [DIFF_INSERT, text2]
+      ];
+    }
+    function diff_bisectSplit_(text1, text2, x, y) {
+      var text1a = text1.substring(0, x);
+      var text2a = text2.substring(0, y);
+      var text1b = text1.substring(x);
+      var text2b = text2.substring(y);
+      var diffs = diff_main(text1a, text2a);
+      var diffsb = diff_main(text1b, text2b);
+      return diffs.concat(diffsb);
+    }
+    function diff_commonPrefix(text1, text2) {
+      if (!text1 || !text2 || text1.charAt(0) !== text2.charAt(0)) {
+        return 0;
+      }
+      var pointermin = 0;
+      var pointermax = Math.min(text1.length, text2.length);
+      var pointermid = pointermax;
+      var pointerstart = 0;
+      while (pointermin < pointermid) {
+        if (text1.substring(pointerstart, pointermid) == text2.substring(pointerstart, pointermid)) {
+          pointermin = pointermid;
+          pointerstart = pointermin;
+        } else {
+          pointermax = pointermid;
+        }
+        pointermid = Math.floor((pointermax - pointermin) / 2 + pointermin);
+      }
+      if (is_surrogate_pair_start(text1.charCodeAt(pointermid - 1))) {
+        pointermid--;
+      }
+      return pointermid;
+    }
+    function diff_commonOverlap_(text1, text2) {
+      var text1_length = text1.length;
+      var text2_length = text2.length;
+      if (text1_length == 0 || text2_length == 0) {
+        return 0;
+      }
+      if (text1_length > text2_length) {
+        text1 = text1.substring(text1_length - text2_length);
+      } else if (text1_length < text2_length) {
+        text2 = text2.substring(0, text1_length);
+      }
+      var text_length = Math.min(text1_length, text2_length);
+      if (text1 == text2) {
+        return text_length;
+      }
+      var best = 0;
+      var length2 = 1;
+      while (true) {
+        var pattern = text1.substring(text_length - length2);
+        var found = text2.indexOf(pattern);
+        if (found == -1) {
+          return best;
+        }
+        length2 += found;
+        if (found == 0 || text1.substring(text_length - length2) == text2.substring(0, length2)) {
+          best = length2;
+          length2++;
+        }
+      }
+    }
+    function diff_commonSuffix(text1, text2) {
+      if (!text1 || !text2 || text1.slice(-1) !== text2.slice(-1)) {
+        return 0;
+      }
+      var pointermin = 0;
+      var pointermax = Math.min(text1.length, text2.length);
+      var pointermid = pointermax;
+      var pointerend = 0;
+      while (pointermin < pointermid) {
+        if (text1.substring(text1.length - pointermid, text1.length - pointerend) == text2.substring(text2.length - pointermid, text2.length - pointerend)) {
+          pointermin = pointermid;
+          pointerend = pointermin;
+        } else {
+          pointermax = pointermid;
+        }
+        pointermid = Math.floor((pointermax - pointermin) / 2 + pointermin);
+      }
+      if (is_surrogate_pair_end(text1.charCodeAt(text1.length - pointermid))) {
+        pointermid--;
+      }
+      return pointermid;
+    }
+    function diff_halfMatch_(text1, text2) {
+      var longtext = text1.length > text2.length ? text1 : text2;
+      var shorttext = text1.length > text2.length ? text2 : text1;
+      if (longtext.length < 4 || shorttext.length * 2 < longtext.length) {
+        return null;
+      }
+      function diff_halfMatchI_(longtext2, shorttext2, i) {
+        var seed = longtext2.substring(i, i + Math.floor(longtext2.length / 4));
+        var j = -1;
+        var best_common = "";
+        var best_longtext_a, best_longtext_b, best_shorttext_a, best_shorttext_b;
+        while ((j = shorttext2.indexOf(seed, j + 1)) !== -1) {
+          var prefixLength = diff_commonPrefix(
+            longtext2.substring(i),
+            shorttext2.substring(j)
+          );
+          var suffixLength = diff_commonSuffix(
+            longtext2.substring(0, i),
+            shorttext2.substring(0, j)
+          );
+          if (best_common.length < suffixLength + prefixLength) {
+            best_common = shorttext2.substring(j - suffixLength, j) + shorttext2.substring(j, j + prefixLength);
+            best_longtext_a = longtext2.substring(0, i - suffixLength);
+            best_longtext_b = longtext2.substring(i + prefixLength);
+            best_shorttext_a = shorttext2.substring(0, j - suffixLength);
+            best_shorttext_b = shorttext2.substring(j + prefixLength);
+          }
+        }
+        if (best_common.length * 2 >= longtext2.length) {
+          return [
+            best_longtext_a,
+            best_longtext_b,
+            best_shorttext_a,
+            best_shorttext_b,
+            best_common
+          ];
+        } else {
+          return null;
+        }
+      }
+      var hm1 = diff_halfMatchI_(
+        longtext,
+        shorttext,
+        Math.ceil(longtext.length / 4)
+      );
+      var hm2 = diff_halfMatchI_(
+        longtext,
+        shorttext,
+        Math.ceil(longtext.length / 2)
+      );
+      var hm;
+      if (!hm1 && !hm2) {
+        return null;
+      } else if (!hm2) {
+        hm = hm1;
+      } else if (!hm1) {
+        hm = hm2;
+      } else {
+        hm = hm1[4].length > hm2[4].length ? hm1 : hm2;
+      }
+      var text1_a, text1_b, text2_a, text2_b;
+      if (text1.length > text2.length) {
+        text1_a = hm[0];
+        text1_b = hm[1];
+        text2_a = hm[2];
+        text2_b = hm[3];
+      } else {
+        text2_a = hm[0];
+        text2_b = hm[1];
+        text1_a = hm[2];
+        text1_b = hm[3];
+      }
+      var mid_common = hm[4];
+      return [text1_a, text1_b, text2_a, text2_b, mid_common];
+    }
+    function diff_cleanupSemantic(diffs) {
+      var changes = false;
+      var equalities = [];
+      var equalitiesLength = 0;
+      var lastequality = null;
+      var pointer = 0;
+      var length_insertions1 = 0;
+      var length_deletions1 = 0;
+      var length_insertions2 = 0;
+      var length_deletions2 = 0;
+      while (pointer < diffs.length) {
+        if (diffs[pointer][0] == DIFF_EQUAL) {
+          equalities[equalitiesLength++] = pointer;
+          length_insertions1 = length_insertions2;
+          length_deletions1 = length_deletions2;
+          length_insertions2 = 0;
+          length_deletions2 = 0;
+          lastequality = diffs[pointer][1];
+        } else {
+          if (diffs[pointer][0] == DIFF_INSERT) {
+            length_insertions2 += diffs[pointer][1].length;
+          } else {
+            length_deletions2 += diffs[pointer][1].length;
+          }
+          if (lastequality && lastequality.length <= Math.max(length_insertions1, length_deletions1) && lastequality.length <= Math.max(length_insertions2, length_deletions2)) {
+            diffs.splice(equalities[equalitiesLength - 1], 0, [
+              DIFF_DELETE,
+              lastequality
+            ]);
+            diffs[equalities[equalitiesLength - 1] + 1][0] = DIFF_INSERT;
+            equalitiesLength--;
+            equalitiesLength--;
+            pointer = equalitiesLength > 0 ? equalities[equalitiesLength - 1] : -1;
+            length_insertions1 = 0;
+            length_deletions1 = 0;
+            length_insertions2 = 0;
+            length_deletions2 = 0;
+            lastequality = null;
+            changes = true;
+          }
+        }
+        pointer++;
+      }
+      if (changes) {
+        diff_cleanupMerge(diffs);
+      }
+      diff_cleanupSemanticLossless(diffs);
+      pointer = 1;
+      while (pointer < diffs.length) {
+        if (diffs[pointer - 1][0] == DIFF_DELETE && diffs[pointer][0] == DIFF_INSERT) {
+          var deletion = diffs[pointer - 1][1];
+          var insertion = diffs[pointer][1];
+          var overlap_length1 = diff_commonOverlap_(deletion, insertion);
+          var overlap_length2 = diff_commonOverlap_(insertion, deletion);
+          if (overlap_length1 >= overlap_length2) {
+            if (overlap_length1 >= deletion.length / 2 || overlap_length1 >= insertion.length / 2) {
+              diffs.splice(pointer, 0, [
+                DIFF_EQUAL,
+                insertion.substring(0, overlap_length1)
+              ]);
+              diffs[pointer - 1][1] = deletion.substring(
+                0,
+                deletion.length - overlap_length1
+              );
+              diffs[pointer + 1][1] = insertion.substring(overlap_length1);
+              pointer++;
+            }
+          } else {
+            if (overlap_length2 >= deletion.length / 2 || overlap_length2 >= insertion.length / 2) {
+              diffs.splice(pointer, 0, [
+                DIFF_EQUAL,
+                deletion.substring(0, overlap_length2)
+              ]);
+              diffs[pointer - 1][0] = DIFF_INSERT;
+              diffs[pointer - 1][1] = insertion.substring(
+                0,
+                insertion.length - overlap_length2
+              );
+              diffs[pointer + 1][0] = DIFF_DELETE;
+              diffs[pointer + 1][1] = deletion.substring(overlap_length2);
+              pointer++;
+            }
+          }
+          pointer++;
+        }
+        pointer++;
+      }
+    }
+    var nonAlphaNumericRegex_ = /[^a-zA-Z0-9]/;
+    var whitespaceRegex_ = /\s/;
+    var linebreakRegex_ = /[\r\n]/;
+    var blanklineEndRegex_ = /\n\r?\n$/;
+    var blanklineStartRegex_ = /^\r?\n\r?\n/;
+    function diff_cleanupSemanticLossless(diffs) {
+      function diff_cleanupSemanticScore_(one, two) {
+        if (!one || !two) {
+          return 6;
+        }
+        var char1 = one.charAt(one.length - 1);
+        var char2 = two.charAt(0);
+        var nonAlphaNumeric1 = char1.match(nonAlphaNumericRegex_);
+        var nonAlphaNumeric2 = char2.match(nonAlphaNumericRegex_);
+        var whitespace1 = nonAlphaNumeric1 && char1.match(whitespaceRegex_);
+        var whitespace2 = nonAlphaNumeric2 && char2.match(whitespaceRegex_);
+        var lineBreak1 = whitespace1 && char1.match(linebreakRegex_);
+        var lineBreak2 = whitespace2 && char2.match(linebreakRegex_);
+        var blankLine1 = lineBreak1 && one.match(blanklineEndRegex_);
+        var blankLine2 = lineBreak2 && two.match(blanklineStartRegex_);
+        if (blankLine1 || blankLine2) {
+          return 5;
+        } else if (lineBreak1 || lineBreak2) {
+          return 4;
+        } else if (nonAlphaNumeric1 && !whitespace1 && whitespace2) {
+          return 3;
+        } else if (whitespace1 || whitespace2) {
+          return 2;
+        } else if (nonAlphaNumeric1 || nonAlphaNumeric2) {
+          return 1;
+        }
+        return 0;
+      }
+      var pointer = 1;
+      while (pointer < diffs.length - 1) {
+        if (diffs[pointer - 1][0] == DIFF_EQUAL && diffs[pointer + 1][0] == DIFF_EQUAL) {
+          var equality1 = diffs[pointer - 1][1];
+          var edit = diffs[pointer][1];
+          var equality2 = diffs[pointer + 1][1];
+          var commonOffset = diff_commonSuffix(equality1, edit);
+          if (commonOffset) {
+            var commonString = edit.substring(edit.length - commonOffset);
+            equality1 = equality1.substring(0, equality1.length - commonOffset);
+            edit = commonString + edit.substring(0, edit.length - commonOffset);
+            equality2 = commonString + equality2;
+          }
+          var bestEquality1 = equality1;
+          var bestEdit = edit;
+          var bestEquality2 = equality2;
+          var bestScore = diff_cleanupSemanticScore_(equality1, edit) + diff_cleanupSemanticScore_(edit, equality2);
+          while (edit.charAt(0) === equality2.charAt(0)) {
+            equality1 += edit.charAt(0);
+            edit = edit.substring(1) + equality2.charAt(0);
+            equality2 = equality2.substring(1);
+            var score = diff_cleanupSemanticScore_(equality1, edit) + diff_cleanupSemanticScore_(edit, equality2);
+            if (score >= bestScore) {
+              bestScore = score;
+              bestEquality1 = equality1;
+              bestEdit = edit;
+              bestEquality2 = equality2;
+            }
+          }
+          if (diffs[pointer - 1][1] != bestEquality1) {
+            if (bestEquality1) {
+              diffs[pointer - 1][1] = bestEquality1;
+            } else {
+              diffs.splice(pointer - 1, 1);
+              pointer--;
+            }
+            diffs[pointer][1] = bestEdit;
+            if (bestEquality2) {
+              diffs[pointer + 1][1] = bestEquality2;
+            } else {
+              diffs.splice(pointer + 1, 1);
+              pointer--;
+            }
+          }
+        }
+        pointer++;
+      }
+    }
+    function diff_cleanupMerge(diffs, fix_unicode) {
+      diffs.push([DIFF_EQUAL, ""]);
+      var pointer = 0;
+      var count_delete = 0;
+      var count_insert = 0;
+      var text_delete = "";
+      var text_insert = "";
+      var commonlength;
+      while (pointer < diffs.length) {
+        if (pointer < diffs.length - 1 && !diffs[pointer][1]) {
+          diffs.splice(pointer, 1);
+          continue;
+        }
+        switch (diffs[pointer][0]) {
+          case DIFF_INSERT:
+            count_insert++;
+            text_insert += diffs[pointer][1];
+            pointer++;
+            break;
+          case DIFF_DELETE:
+            count_delete++;
+            text_delete += diffs[pointer][1];
+            pointer++;
+            break;
+          case DIFF_EQUAL:
+            var previous_equality = pointer - count_insert - count_delete - 1;
+            if (fix_unicode) {
+              if (previous_equality >= 0 && ends_with_pair_start(diffs[previous_equality][1])) {
+                var stray = diffs[previous_equality][1].slice(-1);
+                diffs[previous_equality][1] = diffs[previous_equality][1].slice(
+                  0,
+                  -1
+                );
+                text_delete = stray + text_delete;
+                text_insert = stray + text_insert;
+                if (!diffs[previous_equality][1]) {
+                  diffs.splice(previous_equality, 1);
+                  pointer--;
+                  var k = previous_equality - 1;
+                  if (diffs[k] && diffs[k][0] === DIFF_INSERT) {
+                    count_insert++;
+                    text_insert = diffs[k][1] + text_insert;
+                    k--;
+                  }
+                  if (diffs[k] && diffs[k][0] === DIFF_DELETE) {
+                    count_delete++;
+                    text_delete = diffs[k][1] + text_delete;
+                    k--;
+                  }
+                  previous_equality = k;
+                }
+              }
+              if (starts_with_pair_end(diffs[pointer][1])) {
+                var stray = diffs[pointer][1].charAt(0);
+                diffs[pointer][1] = diffs[pointer][1].slice(1);
+                text_delete += stray;
+                text_insert += stray;
+              }
+            }
+            if (pointer < diffs.length - 1 && !diffs[pointer][1]) {
+              diffs.splice(pointer, 1);
+              break;
+            }
+            if (text_delete.length > 0 || text_insert.length > 0) {
+              if (text_delete.length > 0 && text_insert.length > 0) {
+                commonlength = diff_commonPrefix(text_insert, text_delete);
+                if (commonlength !== 0) {
+                  if (previous_equality >= 0) {
+                    diffs[previous_equality][1] += text_insert.substring(
+                      0,
+                      commonlength
+                    );
+                  } else {
+                    diffs.splice(0, 0, [
+                      DIFF_EQUAL,
+                      text_insert.substring(0, commonlength)
+                    ]);
+                    pointer++;
+                  }
+                  text_insert = text_insert.substring(commonlength);
+                  text_delete = text_delete.substring(commonlength);
+                }
+                commonlength = diff_commonSuffix(text_insert, text_delete);
+                if (commonlength !== 0) {
+                  diffs[pointer][1] = text_insert.substring(text_insert.length - commonlength) + diffs[pointer][1];
+                  text_insert = text_insert.substring(
+                    0,
+                    text_insert.length - commonlength
+                  );
+                  text_delete = text_delete.substring(
+                    0,
+                    text_delete.length - commonlength
+                  );
+                }
+              }
+              var n = count_insert + count_delete;
+              if (text_delete.length === 0 && text_insert.length === 0) {
+                diffs.splice(pointer - n, n);
+                pointer = pointer - n;
+              } else if (text_delete.length === 0) {
+                diffs.splice(pointer - n, n, [DIFF_INSERT, text_insert]);
+                pointer = pointer - n + 1;
+              } else if (text_insert.length === 0) {
+                diffs.splice(pointer - n, n, [DIFF_DELETE, text_delete]);
+                pointer = pointer - n + 1;
+              } else {
+                diffs.splice(
+                  pointer - n,
+                  n,
+                  [DIFF_DELETE, text_delete],
+                  [DIFF_INSERT, text_insert]
+                );
+                pointer = pointer - n + 2;
+              }
+            }
+            if (pointer !== 0 && diffs[pointer - 1][0] === DIFF_EQUAL) {
+              diffs[pointer - 1][1] += diffs[pointer][1];
+              diffs.splice(pointer, 1);
+            } else {
+              pointer++;
+            }
+            count_insert = 0;
+            count_delete = 0;
+            text_delete = "";
+            text_insert = "";
+            break;
+        }
+      }
+      if (diffs[diffs.length - 1][1] === "") {
+        diffs.pop();
+      }
+      var changes = false;
+      pointer = 1;
+      while (pointer < diffs.length - 1) {
+        if (diffs[pointer - 1][0] === DIFF_EQUAL && diffs[pointer + 1][0] === DIFF_EQUAL) {
+          if (diffs[pointer][1].substring(
+            diffs[pointer][1].length - diffs[pointer - 1][1].length
+          ) === diffs[pointer - 1][1]) {
+            diffs[pointer][1] = diffs[pointer - 1][1] + diffs[pointer][1].substring(
+              0,
+              diffs[pointer][1].length - diffs[pointer - 1][1].length
+            );
+            diffs[pointer + 1][1] = diffs[pointer - 1][1] + diffs[pointer + 1][1];
+            diffs.splice(pointer - 1, 1);
+            changes = true;
+          } else if (diffs[pointer][1].substring(0, diffs[pointer + 1][1].length) == diffs[pointer + 1][1]) {
+            diffs[pointer - 1][1] += diffs[pointer + 1][1];
+            diffs[pointer][1] = diffs[pointer][1].substring(diffs[pointer + 1][1].length) + diffs[pointer + 1][1];
+            diffs.splice(pointer + 1, 1);
+            changes = true;
+          }
+        }
+        pointer++;
+      }
+      if (changes) {
+        diff_cleanupMerge(diffs, fix_unicode);
+      }
+    }
+    function is_surrogate_pair_start(charCode) {
+      return charCode >= 55296 && charCode <= 56319;
+    }
+    function is_surrogate_pair_end(charCode) {
+      return charCode >= 56320 && charCode <= 57343;
+    }
+    function starts_with_pair_end(str) {
+      return is_surrogate_pair_end(str.charCodeAt(0));
+    }
+    function ends_with_pair_start(str) {
+      return is_surrogate_pair_start(str.charCodeAt(str.length - 1));
+    }
+    function remove_empty_tuples(tuples) {
+      var ret = [];
+      for (var i = 0; i < tuples.length; i++) {
+        if (tuples[i][1].length > 0) {
+          ret.push(tuples[i]);
+        }
+      }
+      return ret;
+    }
+    function make_edit_splice(before, oldMiddle, newMiddle, after) {
+      if (ends_with_pair_start(before) || starts_with_pair_end(after)) {
+        return null;
+      }
+      return remove_empty_tuples([
+        [DIFF_EQUAL, before],
+        [DIFF_DELETE, oldMiddle],
+        [DIFF_INSERT, newMiddle],
+        [DIFF_EQUAL, after]
+      ]);
+    }
+    function find_cursor_edit_diff(oldText, newText, cursor_pos) {
+      var oldRange = typeof cursor_pos === "number" ? { index: cursor_pos, length: 0 } : cursor_pos.oldRange;
+      var newRange = typeof cursor_pos === "number" ? null : cursor_pos.newRange;
+      var oldLength = oldText.length;
+      var newLength = newText.length;
+      if (oldRange.length === 0 && (newRange === null || newRange.length === 0)) {
+        var oldCursor = oldRange.index;
+        var oldBefore = oldText.slice(0, oldCursor);
+        var oldAfter = oldText.slice(oldCursor);
+        var maybeNewCursor = newRange ? newRange.index : null;
+        editBefore: {
+          var newCursor = oldCursor + newLength - oldLength;
+          if (maybeNewCursor !== null && maybeNewCursor !== newCursor) {
+            break editBefore;
+          }
+          if (newCursor < 0 || newCursor > newLength) {
+            break editBefore;
+          }
+          var newBefore = newText.slice(0, newCursor);
+          var newAfter = newText.slice(newCursor);
+          if (newAfter !== oldAfter) {
+            break editBefore;
+          }
+          var prefixLength = Math.min(oldCursor, newCursor);
+          var oldPrefix = oldBefore.slice(0, prefixLength);
+          var newPrefix = newBefore.slice(0, prefixLength);
+          if (oldPrefix !== newPrefix) {
+            break editBefore;
+          }
+          var oldMiddle = oldBefore.slice(prefixLength);
+          var newMiddle = newBefore.slice(prefixLength);
+          return make_edit_splice(oldPrefix, oldMiddle, newMiddle, oldAfter);
+        }
+        editAfter: {
+          if (maybeNewCursor !== null && maybeNewCursor !== oldCursor) {
+            break editAfter;
+          }
+          var cursor = oldCursor;
+          var newBefore = newText.slice(0, cursor);
+          var newAfter = newText.slice(cursor);
+          if (newBefore !== oldBefore) {
+            break editAfter;
+          }
+          var suffixLength = Math.min(oldLength - cursor, newLength - cursor);
+          var oldSuffix = oldAfter.slice(oldAfter.length - suffixLength);
+          var newSuffix = newAfter.slice(newAfter.length - suffixLength);
+          if (oldSuffix !== newSuffix) {
+            break editAfter;
+          }
+          var oldMiddle = oldAfter.slice(0, oldAfter.length - suffixLength);
+          var newMiddle = newAfter.slice(0, newAfter.length - suffixLength);
+          return make_edit_splice(oldBefore, oldMiddle, newMiddle, oldSuffix);
+        }
+      }
+      if (oldRange.length > 0 && newRange && newRange.length === 0) {
+        replaceRange: {
+          var oldPrefix = oldText.slice(0, oldRange.index);
+          var oldSuffix = oldText.slice(oldRange.index + oldRange.length);
+          var prefixLength = oldPrefix.length;
+          var suffixLength = oldSuffix.length;
+          if (newLength < prefixLength + suffixLength) {
+            break replaceRange;
+          }
+          var newPrefix = newText.slice(0, prefixLength);
+          var newSuffix = newText.slice(newLength - suffixLength);
+          if (oldPrefix !== newPrefix || oldSuffix !== newSuffix) {
+            break replaceRange;
+          }
+          var oldMiddle = oldText.slice(prefixLength, oldLength - suffixLength);
+          var newMiddle = newText.slice(prefixLength, newLength - suffixLength);
+          return make_edit_splice(oldPrefix, oldMiddle, newMiddle, oldSuffix);
+        }
+      }
+      return null;
+    }
+    function diff3(text1, text2, cursor_pos, cleanup) {
+      return diff_main(text1, text2, cursor_pos, cleanup, true);
+    }
+    diff3.INSERT = DIFF_INSERT;
+    diff3.DELETE = DIFF_DELETE;
+    diff3.EQUAL = DIFF_EQUAL;
+    module2.exports = diff3;
+  }
+});
+
+// ../../packages/sync-policy/src/index.js
+var require_src = __commonJS({
+  "../../packages/sync-policy/src/index.js"(exports, module2) {
+    var RESERVED = /* @__PURE__ */ new Set([".obsidian", ".git", ".trash", ".ignis-connector"]);
+    function canonicalPath(relative) {
+      if (typeof relative !== "string" || !relative || relative.length > 2048 || relative.includes("\\") || relative.includes("\0") || relative.startsWith("/") || /[\r\n]/u.test(relative)) {
+        throw new Error("Invalid relative Vault path");
+      }
+      const parts = relative.normalize("NFC").split("/");
+      if (parts.some((part) => !part || part === "." || part === "..")) {
+        throw new Error("Invalid Vault path segment");
+      }
+      return parts.join("/");
+    }
+    function excluded(relative) {
+      return relative.split("/").some((part) => {
+        const lower = part.toLocaleLowerCase("en-US");
+        return RESERVED.has(lower) || lower.startsWith(".ignis-sync-tmp-") || lower.startsWith(".ignis-collab-tmp-");
+      });
+    }
+    function comparisonKey(relative) {
+      return canonicalPath(relative).toLocaleLowerCase("en-US");
+    }
+    function isInside(root, relative) {
+      return relative === root || relative.startsWith(root + "/");
+    }
+    function createSyncPolicy({ enabled = false, roots = [] } = {}) {
+      if (typeof enabled !== "boolean" || !Array.isArray(roots)) {
+        throw new Error("Invalid synchronization policy");
+      }
+      const canonRoots = roots.map((raw) => {
+        const normalized = canonicalPath(raw);
+        if (excluded(normalized) || normalized.toLowerCase().endsWith(".md")) {
+          throw new Error("Syncthing root must be an ordinary folder");
+        }
+        return comparisonKey(normalized);
+      });
+      for (let i = 0; i < canonRoots.length; i += 1) {
+        for (let j = i + 1; j < canonRoots.length; j += 1) {
+          if (isInside(canonRoots[i], canonRoots[j]) || isInside(canonRoots[j], canonRoots[i])) {
+            throw new Error("Overlapping Syncthing roots");
+          }
+        }
+      }
+      const rootSet = Object.freeze(canonRoots);
+      function ownerFor(relative) {
+        let normalized;
+        try {
+          normalized = canonicalPath(relative);
+        } catch {
+          return "internal";
+        }
+        if (excluded(normalized))
+          return "internal";
+        if (!enabled)
+          return "ignis";
+        const lower = comparisonKey(normalized);
+        const managed = rootSet.some((root) => isInside(root, lower));
+        if (!managed)
+          return "ignis";
+        return lower.endsWith(".md") ? "conflict" : "syncthing";
+      }
+      return Object.freeze({ enabled, roots: rootSet, ownerFor });
+    }
+    module2.exports = { createSyncPolicy, canonicalPath };
+  }
+});
+
+// ../../packages/sync-policy/src/media-bypass.js
+var require_media_bypass = __commonJS({
+  "../../packages/sync-policy/src/media-bypass.js"(exports, module2) {
+    var MEDIA_BYPASS_TYPES2 = Object.freeze([
+      "pdf",
+      "docx",
+      "xlsx",
+      "pptx",
+      "doc",
+      "xls",
+      "ppt",
+      "odt",
+      "ods",
+      "odp",
+      "epub",
+      "png",
+      "jpg",
+      "jpeg",
+      "gif",
+      "webp",
+      "heic",
+      "mp3",
+      "m4a",
+      "wav",
+      "mp4",
+      "mov"
+    ]);
+    var KNOWN = new Set(MEDIA_BYPASS_TYPES2);
+    function normalizeMediaBypassExtensions3(value = []) {
+      if (!Array.isArray(value) || value.length > MEDIA_BYPASS_TYPES2.length) {
+        throw new Error("Invalid media bypass extension list");
+      }
+      const extensions = value.map((raw) => {
+        if (typeof raw !== "string" || !/^[a-zA-Z0-9]{2,6}$/.test(raw)) {
+          throw new Error("Invalid media bypass extension");
+        }
+        const extension = raw.toLowerCase();
+        if (!KNOWN.has(extension)) {
+          throw new Error("Unsupported media bypass extension");
+        }
+        return extension;
+      });
+      return Object.freeze([...new Set(extensions)].sort());
+    }
+    function bypassesPath(relative, extensions) {
+      if (typeof relative !== "string")
+        return false;
+      const name = relative.split("/").at(-1);
+      const dot = name?.lastIndexOf(".") ?? -1;
+      if (dot <= 0 || dot === name.length - 1)
+        return false;
+      return extensions.includes(name.slice(dot + 1).toLowerCase());
+    }
+    module2.exports = {
+      MEDIA_BYPASS_TYPES: MEDIA_BYPASS_TYPES2,
+      normalizeMediaBypassExtensions: normalizeMediaBypassExtensions3,
+      bypassesPath
+    };
+  }
+});
+
+// ../../packages/sync-policy/src/content-scope.js
+var require_content_scope = __commonJS({
+  "../../packages/sync-policy/src/content-scope.js"(exports, module2) {
+    var { createSyncPolicy } = require_src();
+    var {
+      normalizeMediaBypassExtensions: normalizeMediaBypassExtensions3,
+      bypassesPath
+    } = require_media_bypass();
+    var CONTENT_SCOPES = Object.freeze(["all", "markdown-only"]);
+    function createContentScope3(mode = "all", bypassExtensions = []) {
+      if (!CONTENT_SCOPES.includes(mode)) {
+        throw new Error("Unknown IGNIS sync content scope");
+      }
+      const base = createSyncPolicy();
+      const bypass = normalizeMediaBypassExtensions3(bypassExtensions);
+      function allowsPath(relative) {
+        if (base.ownerFor(relative) !== "ignis")
+          return false;
+        return mode !== "markdown-only" || relative.toLowerCase().endsWith(".md") || bypassesPath(relative, bypass);
+      }
+      return Object.freeze({ mode, bypassExtensions: bypass, allowsPath });
+    }
+    module2.exports = { CONTENT_SCOPES, createContentScope: createContentScope3 };
+  }
+});
+
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
   CollaboratorsModal: () => CollaboratorsModal,
   ConnectorSettings: () => ConnectorSettings,
   DisplayNameModal: () => DisplayNameModal,
+  UndoReviewModal: () => UndoReviewModal,
   default: () => IgnisConnector
 });
 module.exports = __toCommonJS(main_exports);
@@ -856,9 +1783,9 @@ var IntDiffOptRleDecoder = class extends Decoder {
    */
   read() {
     if (this.count === 0) {
-      const diff = readVarInt(this);
-      const hasCount = diff & 1;
-      this.diff = floor(diff / 2);
+      const diff3 = readVarInt(this);
+      const hasCount = diff3 & 1;
+      this.diff = floor(diff3 / 2);
       this.count = 1;
       if (hasCount) {
         this.count = readVarUint(this) + 2;
@@ -2682,9 +3609,9 @@ var DSDecoderV2 = class {
    * @return {number}
    */
   readDsLen() {
-    const diff = readVarUint(this.restDecoder) + 1;
-    this.dsCurrVal += diff;
-    return diff;
+    const diff3 = readVarUint(this.restDecoder) + 1;
+    this.dsCurrVal += diff3;
+    return diff3;
   }
 };
 var UpdateDecoderV2 = class extends DSDecoderV2 {
@@ -2911,9 +3838,9 @@ var DSEncoderV2 = class {
    * @param {number} clock
    */
   writeDsClock(clock) {
-    const diff = clock - this.dsCurrVal;
+    const diff3 = clock - this.dsCurrVal;
     this.dsCurrVal = clock;
-    writeVarUint(this.restEncoder, diff);
+    writeVarUint(this.restEncoder, diff3);
   }
   /**
    * @param {number} len
@@ -3531,10 +4458,10 @@ var readRelativePosition = (decoder) => {
 var decodeRelativePosition = (uint8Array) => readRelativePosition(createDecoder(uint8Array));
 var getItemWithOffset = (store, id2) => {
   const item = getItem(store, id2);
-  const diff = id2.clock - item.id.clock;
+  const diff3 = id2.clock - item.id.clock;
   return {
     item,
-    diff
+    diff: diff3
   };
 };
 var createAbsolutePositionFromRelativePosition = (rpos, doc2, followUndoneDeletions = true) => {
@@ -4016,9 +4943,9 @@ var popStackItem = (undoManager, stack, eventType) => {
       iterateDeletedStructs(transaction, stackItem.insertions, (struct) => {
         if (struct instanceof Item) {
           if (struct.redone !== null) {
-            let { item, diff } = followRedone(store, struct.id);
-            if (diff > 0) {
-              item = getItemCleanStart(transaction, createID(item.id.client, item.id.clock + diff));
+            let { item, diff: diff3 } = followRedone(store, struct.id);
+            if (diff3 > 0) {
+              item = getItemCleanStart(transaction, createID(item.id.client, item.id.clock + diff3));
             }
             struct = item;
           }
@@ -4359,13 +5286,13 @@ var LazyStructWriter = class {
   }
 };
 var mergeUpdates = (updates) => mergeUpdatesV2(updates, UpdateDecoderV1, UpdateEncoderV1);
-var sliceStruct = (left, diff) => {
+var sliceStruct = (left, diff3) => {
   if (left.constructor === GC) {
     const { client, clock } = left.id;
-    return new GC(createID(client, clock + diff), left.length - diff);
+    return new GC(createID(client, clock + diff3), left.length - diff3);
   } else if (left.constructor === Skip) {
     const { client, clock } = left.id;
-    return new Skip(createID(client, clock + diff), left.length - diff);
+    return new Skip(createID(client, clock + diff3), left.length - diff3);
   } else {
     const leftItem = (
       /** @type {Item} */
@@ -4373,14 +5300,14 @@ var sliceStruct = (left, diff) => {
     );
     const { client, clock } = leftItem.id;
     return new Item(
-      createID(client, clock + diff),
+      createID(client, clock + diff3),
       null,
-      createID(client, clock + diff - 1),
+      createID(client, clock + diff3 - 1),
       null,
       leftItem.rightOrigin,
       leftItem.parent,
       leftItem.parentSub,
-      leftItem.content.splice(diff)
+      leftItem.content.splice(diff3)
     );
   }
 };
@@ -4443,17 +5370,17 @@ var mergeUpdatesV2 = (updates, YDecoder = UpdateDecoderV2, YEncoder = UpdateEnco
             currWrite.struct.length = curr.id.clock + curr.length - currWrite.struct.id.clock;
           } else {
             writeStructToLazyStructWriter(lazyStructEncoder, currWrite.struct, currWrite.offset);
-            const diff = curr.id.clock - currWrite.struct.id.clock - currWrite.struct.length;
-            const struct = new Skip(createID(firstClient, currWrite.struct.id.clock + currWrite.struct.length), diff);
+            const diff3 = curr.id.clock - currWrite.struct.id.clock - currWrite.struct.length;
+            const struct = new Skip(createID(firstClient, currWrite.struct.id.clock + currWrite.struct.length), diff3);
             currWrite = { struct, offset: 0 };
           }
         } else {
-          const diff = currWrite.struct.id.clock + currWrite.struct.length - curr.id.clock;
-          if (diff > 0) {
+          const diff3 = currWrite.struct.id.clock + currWrite.struct.length - curr.id.clock;
+          if (diff3 > 0) {
             if (currWrite.struct.constructor === Skip) {
-              currWrite.struct.length -= diff;
+              currWrite.struct.length -= diff3;
             } else {
-              curr = sliceStruct(curr, diff);
+              curr = sliceStruct(curr, diff3);
             }
           }
           if (!currWrite.struct.mergeWith(
@@ -8559,19 +9486,19 @@ var ContentType = class _ContentType {
 var readContentType = (decoder) => new ContentType(typeRefs[decoder.readTypeRef()](decoder));
 var followRedone = (store, id2) => {
   let nextID = id2;
-  let diff = 0;
+  let diff3 = 0;
   let item;
   do {
-    if (diff > 0) {
-      nextID = createID(nextID.client, nextID.clock + diff);
+    if (diff3 > 0) {
+      nextID = createID(nextID.client, nextID.clock + diff3);
     }
     item = getItem(store, nextID);
-    diff = nextID.clock - item.id.clock;
+    diff3 = nextID.clock - item.id.clock;
     nextID = item.redone;
   } while (nextID !== null && item instanceof Item);
   return {
     item,
-    diff
+    diff: diff3
   };
 };
 var keepItem = (item, keep) => {
@@ -8581,17 +9508,17 @@ var keepItem = (item, keep) => {
     item.parent._item;
   }
 };
-var splitItem = (transaction, leftItem, diff) => {
+var splitItem = (transaction, leftItem, diff3) => {
   const { client, clock } = leftItem.id;
   const rightItem = new Item(
-    createID(client, clock + diff),
+    createID(client, clock + diff3),
     leftItem,
-    createID(client, clock + diff - 1),
+    createID(client, clock + diff3 - 1),
     leftItem.right,
     leftItem.rightOrigin,
     leftItem.parent,
     leftItem.parentSub,
-    leftItem.content.splice(diff)
+    leftItem.content.splice(diff3)
   );
   if (leftItem.deleted) {
     rightItem.markDeleted();
@@ -8600,7 +9527,7 @@ var splitItem = (transaction, leftItem, diff) => {
     rightItem.keep = true;
   }
   if (leftItem.redone !== null) {
-    rightItem.redone = createID(leftItem.redone.client, leftItem.redone.clock + diff);
+    rightItem.redone = createID(leftItem.redone.client, leftItem.redone.clock + diff3);
   }
   leftItem.right = rightItem;
   if (rightItem.right !== null) {
@@ -8610,7 +9537,7 @@ var splitItem = (transaction, leftItem, diff) => {
   if (rightItem.parentSub !== null && rightItem.right === null) {
     rightItem.parent._map.set(rightItem.parentSub, rightItem);
   }
-  leftItem.length = diff;
+  leftItem.length = diff3;
   return rightItem;
 };
 var isDeletedByUndoStack = (stack, id2) => some(
@@ -9919,10 +10846,12 @@ function decodeCursorPosition(value) {
   }
 }
 function encodeCursorSelection(text2, anchor, head) {
+  const affinity = (index) => anchor === head ? -1 : index === Math.min(anchor, head) ? 0 : -1;
   const at = (index) => encodeBytes(encodeRelativePosition(
     createRelativePositionFromTypeIndex(
       text2,
-      Math.max(0, Math.min(text2.length, index))
+      Math.max(0, Math.min(text2.length, index)),
+      affinity(index)
     )
   ));
   const result = { anchor: at(anchor), head: at(head) };
@@ -10123,6 +11052,53 @@ function visibleContentObstacles(contentDOM, space, viewport, limit = 1500) {
   }
 }
 
+// ../../packages/server-core/src/cursor-viewport.ts
+function observeCursorViewport(host, scrollDOM, repaint, viewportChange = repaint) {
+  const owner = host.ownerDocument.defaultView || window;
+  const originalPosition = host.style.getPropertyValue("position");
+  const originalPriority = host.style.getPropertyPriority("position");
+  let adjusted = false;
+  const ensureContainingBlock = () => {
+    if (owner.getComputedStyle(host).position === "static") {
+      host.style.setProperty("position", "relative", "important");
+      adjusted = true;
+    }
+  };
+  const onGeometryChange = () => {
+    ensureContainingBlock();
+    repaint();
+  };
+  const onCapturedScroll = (event) => {
+    const target = event.target;
+    if (!(target instanceof Node) || host.contains(target) || target.contains(host))
+      onGeometryChange();
+  };
+  const onViewportChange = () => {
+    ensureContainingBlock();
+    viewportChange();
+  };
+  ensureContainingBlock();
+  owner.addEventListener("scroll", onCapturedScroll, { capture: true, passive: true });
+  scrollDOM.addEventListener("scroll", onGeometryChange, { passive: true });
+  owner.addEventListener("resize", onViewportChange);
+  owner.visualViewport?.addEventListener("resize", onViewportChange);
+  owner.visualViewport?.addEventListener("scroll", onViewportChange);
+  return () => {
+    owner.removeEventListener("scroll", onCapturedScroll, true);
+    scrollDOM.removeEventListener("scroll", onGeometryChange);
+    owner.removeEventListener("resize", onViewportChange);
+    owner.visualViewport?.removeEventListener("resize", onViewportChange);
+    owner.visualViewport?.removeEventListener("scroll", onViewportChange);
+    if (adjusted && host.style.getPropertyValue("position") === "relative") {
+      if (originalPosition) {
+        host.style.setProperty("position", originalPosition, originalPriority);
+      } else {
+        host.style.removeProperty("position");
+      }
+    }
+  };
+}
+
 // src/selection-decorations.ts
 var import_state = require("@codemirror/state");
 var import_view = require("@codemirror/view");
@@ -10226,10 +11202,12 @@ var CursorOverlay = class {
       pointerEvents: "none",
       zIndex: "8"
     });
-    this.originalPosition = view.dom.style.position;
-    if (getComputedStyle(view.dom).position === "static") {
-      view.dom.style.position = "relative";
-    }
+    this.detachGeometry = observeCursorViewport(
+      view.dom,
+      view.scrollDOM,
+      this.scroll,
+      this.mobile ? this.mobileViewportChange : this.scroll
+    );
     view.dom.appendChild(this.root);
     this.roster = document.createElement("details");
     this.roster.className = "ignis-native-people-roster";
@@ -10293,15 +11271,9 @@ var CursorOverlay = class {
     if (mobile) {
       document.body.appendChild(this.roster);
       this.positionMobileRoster();
-      window.visualViewport?.addEventListener("resize", this.mobileViewportChange);
-      window.visualViewport?.addEventListener("scroll", this.mobileViewportChange);
     } else {
       view.dom.appendChild(this.roster);
     }
-    view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
-    window.addEventListener("resize", this.scroll);
-    if (mobile)
-      window.addEventListener("resize", this.mobileViewportChange);
     this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM ? new MutationObserver(this.scroll) : null;
     this.contentMutation?.observe(view.contentDOM, {
       subtree: true,
@@ -10322,7 +11294,7 @@ var CursorOverlay = class {
   peers = [];
   text = null;
   raf = 0;
-  originalPosition;
+  detachGeometry;
   scroll = () => this.schedule();
   contentMutation;
   mobileViewportChange = () => {
@@ -10580,23 +11552,153 @@ var CursorOverlay = class {
   }
   destroy() {
     this.clear();
-    this.view.scrollDOM.removeEventListener("scroll", this.scroll);
-    window.removeEventListener("resize", this.scroll);
+    this.detachGeometry();
     this.contentMutation?.disconnect();
     document.fonts?.removeEventListener?.("loadingdone", this.scroll);
-    if (this.mobile) {
-      window.visualViewport?.removeEventListener("resize", this.mobileViewportChange);
-      window.visualViewport?.removeEventListener("scroll", this.mobileViewportChange);
-      window.removeEventListener("resize", this.mobileViewportChange);
-    }
     this.root.remove();
     this.roster.remove();
-    this.view.dom.style.position = this.originalPosition;
   }
 };
 
+// ../../packages/bridge/src/collaboration-editor.js
+var import_fast_diff = __toESM(require_diff(), 1);
+function deltaToChanges(delta) {
+  const changes = [];
+  let pos = 0;
+  let from2 = null;
+  let deleted = 0;
+  let inserted = "";
+  function flush() {
+    if (from2 !== null) {
+      changes.push({ from: from2, to: from2 + deleted, insert: inserted });
+      from2 = null;
+      deleted = 0;
+      inserted = "";
+    }
+  }
+  for (const operation of delta) {
+    if (Number.isInteger(operation.retain)) {
+      flush();
+      pos += operation.retain;
+    } else if (Number.isInteger(operation.delete)) {
+      if (from2 === null) {
+        from2 = pos;
+      }
+      deleted += operation.delete;
+      pos += operation.delete;
+    } else if (typeof operation.insert === "string") {
+      if (from2 === null) {
+        from2 = pos;
+      }
+      inserted += operation.insert;
+    } else {
+      throw new Error("Unexpected non-text CRDT operation");
+    }
+  }
+  flush();
+  return changes;
+}
+
+// ../../packages/bridge/src/composition-rebase.js
+function independentCompositionDelta(delta, guard) {
+  if (!guard || !Number.isSafeInteger(guard.from) || !Number.isSafeInteger(guard.to))
+    return false;
+  const changes = deltaToChanges(delta);
+  return changes.every(({ from: from2, to }) => to < guard.from || from2 > guard.to);
+}
+
+// ../../packages/bridge/src/causal-history.js
+function hasMissingYjsAncestors(doc2) {
+  return Boolean(doc2?.store?.pendingStructs?.missing?.size);
+}
+var MAX_CAUSAL_REPAIR_ATTEMPTS = 4;
+function causalRepairDelay(attempt) {
+  return Math.min(2400, 240 * 2 ** Math.min(attempt, MAX_CAUSAL_REPAIR_ATTEMPTS));
+}
+
+// src/prejoin-rebase.ts
+var import_fast_diff2 = __toESM(require_diff());
+function textEdits(before, after) {
+  const edits = [];
+  let position = 0;
+  let start = null;
+  let removed = 0;
+  let inserted = "";
+  const flush = () => {
+    if (start !== null) {
+      edits.push({ from: start, to: start + removed, insert: inserted });
+      start = null;
+      removed = 0;
+      inserted = "";
+    }
+  };
+  for (const [kind, content] of (0, import_fast_diff2.default)(before, after)) {
+    if (kind === import_fast_diff2.default.EQUAL) {
+      flush();
+      position += content.length;
+    } else if (kind === import_fast_diff2.default.DELETE) {
+      if (start === null)
+        start = position;
+      removed += content.length;
+      position += content.length;
+    } else {
+      if (start === null)
+        start = position;
+      inserted += content;
+    }
+  }
+  flush();
+  return edits;
+}
+function compete(left, right) {
+  const li = left.from === left.to;
+  const ri = right.from === right.to;
+  if (li && ri)
+    return left.from === right.from;
+  if (li)
+    return left.from >= right.from && left.from <= right.to;
+  if (ri)
+    return right.from >= left.from && right.from <= left.to;
+  return left.from < right.to && right.from < left.to;
+}
+function rebasePrejoinText(ancestor, local, remote) {
+  if (local === remote)
+    return { kind: "merged", text: remote };
+  if (local === ancestor)
+    return { kind: "merged", text: remote };
+  if (remote === ancestor)
+    return { kind: "merged", text: local };
+  const localEdits = textEdits(ancestor, local);
+  const remoteEdits = textEdits(ancestor, remote);
+  if (localEdits.some((left) => remoteEdits.some((right) => compete(left, right)))) {
+    return { kind: "review" };
+  }
+  let text2 = remote;
+  for (const edit of localEdits.reverse()) {
+    const shift = remoteEdits.filter((remoteEdit) => remoteEdit.to < edit.from || remoteEdit.to === edit.from && remoteEdit.from !== remoteEdit.to).reduce((value, change) => value + change.insert.length - (change.to - change.from), 0);
+    const from2 = edit.from + shift;
+    const to = edit.to + shift;
+    if (from2 < 0 || to > text2.length || from2 > to)
+      return { kind: "review" };
+    text2 = text2.slice(0, from2) + edit.insert + text2.slice(to);
+  }
+  return { kind: "merged", text: text2 };
+}
+function deltaForText(before, after) {
+  return (0, import_fast_diff2.default)(before, after).map(([kind, value]) => kind === import_fast_diff2.default.EQUAL ? { retain: value.length } : kind === import_fast_diff2.default.DELETE ? { delete: value.length } : { insert: value });
+}
+
 // src/live.ts
 var REMOTE = Symbol("ignis-remote");
+var UNDO_BOUNDARY_REPAIR = Symbol("ignis-undo-boundary-repair");
+function liveBoundary(doc2, position) {
+  if (!position.item)
+    return null;
+  const item = getItem(doc2.store, position.item);
+  if (!item || item.deleted)
+    return null;
+  return createAbsolutePositionFromRelativePosition(position, doc2)?.index ?? null;
+}
 var MAX_UPDATE_BYTES = 1024 * 1024;
 var MAX_FRAME_BYTES = 8 * 1024 * 1024;
 var MAX_COMPOSITION_BUFFER_BYTES = 4 * 1024 * 1024;
@@ -10623,6 +11725,7 @@ function newRoom(path, documentId) {
     path,
     documentId,
     wasKnown: !!documentId,
+    preJoinBase: null,
     doc: null,
     text: null,
     undo: null,
@@ -10634,6 +11737,7 @@ function newRoom(path, documentId) {
     joined: false,
     blocked: false,
     composing: false,
+    imeGuard: null,
     pendingHandshake: false,
     waiting: [],
     waitingBytes: 0,
@@ -10641,11 +11745,16 @@ function newRoom(path, documentId) {
     savedSeq: 0,
     retryCount: 0,
     retryTimer: null,
+    causalRepairAttempts: 0,
+    causalRepairTimer: null,
     snapshot: null,
     selfId: null,
     peers: /* @__PURE__ */ new Map(),
     cursorTimer: null,
-    lastCursor: null
+    lastCursor: null,
+    undoIntent: null,
+    redoIntent: null,
+    undoReview: null
   };
 }
 var NativeYjs = class {
@@ -10659,6 +11768,13 @@ var NativeYjs = class {
   compartment = new import_state2.Compartment();
   online = false;
   disposed = false;
+  compositionState(path) {
+    const room = path ? this.rooms.get(path) : void 0;
+    return {
+      composing: room?.composing === true,
+      peerEditWaiting: !!(room?.composing && room.waiting.length)
+    };
+  }
   extension() {
     const manager = this;
     return [
@@ -10671,6 +11787,10 @@ var NativeYjs = class {
         }
         update(update) {
           manager.observe(update.view);
+          if (update.docChanged)
+            manager.trackImeRange(update);
+          if (update.docChanged)
+            manager.captureLocalUndoIntent(update);
           if (update.selectionSet || update.docChanged || update.focusChanged) {
             manager.selectionChanged(update.view);
           }
@@ -10722,6 +11842,7 @@ var NativeYjs = class {
         }
       });
       if (old && old.views.size === 0 && old.joined) {
+        this.clearCausalRepair(old);
         this.sendCursorAway(old);
         this.opts.send({ channel: "collab", type: "leave", path: old.path });
         old.joined = false;
@@ -10735,6 +11856,7 @@ var NativeYjs = class {
     if (!room) {
       const id2 = this.opts.knownId(path);
       room = newRoom(path, id2);
+      room.preJoinBase = view.state.doc.toString();
       this.rooms.set(path, room);
       if (id2)
         void this.hydrate(room, id2);
@@ -10758,6 +11880,7 @@ var NativeYjs = class {
       return;
     room.views.delete(view);
     if (room.views.size === 0 && room.joined) {
+      this.clearCausalRepair(room);
       this.sendCursorAway(room);
       this.opts.send({ channel: "collab", type: "leave", path });
       room.joined = false;
@@ -10839,7 +11962,12 @@ var NativeYjs = class {
       this.bound.set(view, room);
       const extension = [
         yCollab(room.text, null, { undoManager: room.undo }),
-        import_state2.Prec.highest(import_view2.keymap.of(yUndoManagerKeymap))
+        import_state2.Prec.highest(import_view2.keymap.of([
+          { key: "Mod-z", run: (v) => this.undoNative(v) },
+          { key: "Mod-Shift-z", run: (v) => this.redoNative(v) },
+          { key: "Mod-y", run: (v) => this.redoNative(v) },
+          ...yUndoManagerKeymap.filter((binding) => !["Mod-z", "Mod-Shift-z", "Mod-y"].includes(binding.key || ""))
+        ]))
       ];
       queueMicrotask(() => {
         if (this.disposed || this.paths.get(view) !== room.path || this.bound.get(view) !== room)
@@ -10855,13 +11983,195 @@ var NativeYjs = class {
       });
     }
   }
+  captureLocalUndoIntent(update) {
+    const room = this.bound.get(update.view);
+    if (!room?.text || !room.undo)
+      return;
+    if (update.transactions.some((tx2) => tx2.annotation(ySyncAnnotation)))
+      return;
+    room.redoIntent = null;
+    const transactions = update.transactions.filter((tx2) => tx2.docChanged);
+    if (transactions.length !== 1 || room.text.toString() !== update.state.doc.toString()) {
+      room.undoIntent = null;
+      return;
+    }
+    const changes = [];
+    const tx = transactions[0];
+    tx.changes.iterChanges((fromA, toA, fromB, toB) => {
+      changes.push({ fromB, toB, deleted: tx.startState.doc.sliceString(fromA, toA) });
+    });
+    const change = changes.length === 1 ? changes[0] : null;
+    if (!change || !change.deleted || change.fromB !== change.toB) {
+      room.undoIntent = null;
+      return;
+    }
+    const item = room.undo.undoStack.at(-1);
+    if (!item)
+      return;
+    room.undoIntent = {
+      stackItem: item,
+      deleted: change.deleted,
+      // Assoc=0 attaches to the surviving RIGHT-hand character. Unlike
+      // a raw offset or the deleted left context, it survives a concurrent
+      // replacement of text immediately before the boundary.
+      right: createRelativePositionFromTypeIndex(room.text, change.fromB, 0)
+    };
+  }
+  pendingUndoReviews() {
+    return [...this.rooms.values()].flatMap((room) => room.undoReview ? [{ ...room.undoReview }] : []);
+  }
+  dismissUndoReview(path, documentId) {
+    const room = this.rooms.get(path);
+    if (!room?.undoReview || room.undoReview.documentId !== documentId)
+      return false;
+    room.undoReview = null;
+    return true;
+  }
+  requestUndoReview(room, operation, deleted, reason) {
+    const text2 = room.text?.toString() || "";
+    const previous = room.undoReview;
+    room.undoReview = {
+      path: room.path,
+      documentId: room.documentId,
+      operation,
+      deleted,
+      reason,
+      context: text2.length <= 240 ? text2 : text2.slice(0, 100) + "\n[\u2026]\n" + text2.slice(-100)
+    };
+    if (!previous || previous.reason !== reason || previous.deleted !== deleted || previous.operation !== operation) {
+      this.opts.notify(
+        room.path,
+        (operation === "undo" ? "Undo" : "Redo") + " needs review \xB7 open Ignis collaborators to inspect the original text"
+      );
+    }
+  }
+  undoNative(view) {
+    const room = this.bound.get(view);
+    if (!room?.text || !room.doc || !room.undo)
+      return false;
+    if (room.undoIntent?.manual) {
+      const intent2 = room.undoIntent;
+      const at = liveBoundary(room.doc, intent2.right);
+      if (at === null) {
+        this.requestUndoReview(room, "undo", intent2.deleted, "boundary-removed");
+        return true;
+      }
+      room.doc.transact(
+        () => room.text.insert(at, intent2.deleted),
+        UNDO_BOUNDARY_REPAIR
+      );
+      room.undoIntent = null;
+      room.redoIntent = { deleted: intent2.deleted, right: intent2.right, manual: true };
+      return true;
+    }
+    if (!room.undo.undoStack.length)
+      return false;
+    const intent = room.undoIntent?.stackItem === room.undo.undoStack.at(-1) ? room.undoIntent : null;
+    if (intent && liveBoundary(room.doc, intent.right) === null) {
+      this.requestUndoReview(room, "undo", intent.deleted, "boundary-removed");
+      return true;
+    }
+    room.undoIntent = null;
+    const insertions = [];
+    const observe = (event, transaction) => {
+      if (transaction.origin !== room.undo)
+        return;
+      let at = 0;
+      for (const part of event.delta) {
+        if (part.retain)
+          at += part.retain;
+        if (part.insert && typeof part.insert === "string") {
+          insertions.push({ at, text: part.insert });
+          at += part.insert.length;
+        }
+      }
+    };
+    room.text.observe(observe);
+    try {
+      room.undo.undo();
+    } finally {
+      room.text.unobserve(observe);
+    }
+    if (!intent)
+      return true;
+    const inserted = insertions.length === 1 ? insertions[0] : null;
+    if (!inserted || inserted.text !== intent.deleted)
+      return true;
+    const atRight = liveBoundary(room.doc, intent.right);
+    if (atRight === null)
+      return true;
+    if (inserted.at + inserted.text.length !== atRight) {
+      room.doc.transact(() => {
+        room.text.delete(inserted.at, inserted.text.length);
+        const corrected = liveBoundary(room.doc, intent.right);
+        if (corrected !== null)
+          room.text.insert(corrected, intent.deleted);
+      }, UNDO_BOUNDARY_REPAIR);
+      room.redoIntent = { deleted: intent.deleted, right: intent.right };
+    }
+    return true;
+  }
+  redoNative(view) {
+    const room = this.bound.get(view);
+    if (!room?.undo || !room.text || !room.doc)
+      return false;
+    if (room.redoIntent?.manual) {
+      const intent2 = room.redoIntent;
+      const atRight = liveBoundary(room.doc, intent2.right);
+      const at = atRight === null ? -1 : atRight - intent2.deleted.length;
+      if (atRight === null || at < 0 || room.text.toString().slice(at, atRight) !== intent2.deleted) {
+        this.requestUndoReview(room, "redo", intent2.deleted, "target-changed");
+        return true;
+      }
+      room.doc.transact(
+        () => room.text.delete(at, intent2.deleted.length),
+        UNDO_BOUNDARY_REPAIR
+      );
+      room.undoIntent = {
+        stackItem: null,
+        deleted: intent2.deleted,
+        right: intent2.right,
+        manual: true
+      };
+      room.redoIntent = null;
+      return true;
+    }
+    if (!room.undo.redoStack.length)
+      return false;
+    const intent = room.redoIntent;
+    if (intent && liveBoundary(room.doc, intent.right) === null) {
+      this.requestUndoReview(room, "redo", intent.deleted, "boundary-removed");
+      return true;
+    }
+    room.redoIntent = null;
+    room.undo.redo();
+    if (intent) {
+      const atRight = liveBoundary(room.doc, intent.right);
+      const at = atRight === null ? -1 : atRight - intent.deleted.length;
+      if (atRight !== null && at >= 0 && room.text.toString().slice(at, atRight) === intent.deleted) {
+        room.doc.transact(
+          () => room.text.delete(at, intent.deleted.length),
+          UNDO_BOUNDARY_REPAIR
+        );
+      }
+      const stackItem = room.undo.undoStack.at(-1);
+      room.undoIntent = { ...intent, stackItem: stackItem || null, manual: !stackItem };
+    }
+    return true;
+  }
   setComposing(view, state) {
     const path = this.paths.get(view);
     const room = path && this.rooms.get(path);
     if (!room)
       return;
+    if (state && !room.composing) {
+      const selection = view.state.selection.main;
+      room.imeGuard = { from: selection.from, to: selection.to };
+      this.publishCursor(room, view);
+    }
     room.composing = state || [...room.views].some((v) => v !== view && v.composing);
     if (!room.composing) {
+      room.imeGuard = null;
       for (const update of room.waiting.splice(0)) {
         if (room.doc && !room.blocked)
           applyUpdate(room.doc, update, REMOTE);
@@ -10872,6 +12182,51 @@ var NativeYjs = class {
         room.pendingHandshake = false;
         this.sendUpdate(room, encodeStateAsUpdate(room.doc));
       }
+      this.ensureCausalConvergence(room);
+    }
+    this.opts.compositionChanged?.(room.path);
+  }
+  trackImeRange(update) {
+    const room = this.bound.get(update.view);
+    if (!room?.composing || !room.imeGuard)
+      return;
+    const previous = room.imeGuard;
+    let from2 = update.changes.mapPos(previous.from, -1);
+    let to = update.changes.mapPos(previous.to, 1);
+    const local = !update.transactions.some((tx) => tx.annotation(ySyncAnnotation));
+    if (local)
+      update.changes.iterChanges((_a, _b, nextFrom, nextTo) => {
+        from2 = Math.min(from2, nextFrom);
+        to = Math.max(to, nextTo);
+      });
+    room.imeGuard = { from: Math.max(0, from2), to: Math.max(from2, to) };
+  }
+  applyRemoteDuringIme(room, bytes) {
+    if (!room.doc)
+      return;
+    if (!room.composing) {
+      applyUpdate(room.doc, bytes, REMOTE);
+      return;
+    }
+    if (!room.imeGuard) {
+      this.deferRemote(room, bytes);
+      return;
+    }
+    const candidate = new Doc();
+    let delta = null;
+    try {
+      applyUpdate(candidate, encodeStateAsUpdate(room.doc));
+      candidate.getText("content").observe((event) => {
+        delta = event.delta;
+      });
+      applyUpdate(candidate, bytes, REMOTE);
+      if (delta === null || independentCompositionDelta(delta, room.imeGuard)) {
+        applyUpdate(room.doc, bytes, REMOTE);
+      } else {
+        this.deferRemote(room, bytes);
+      }
+    } finally {
+      candidate.destroy();
     }
   }
   deferRemote(room, update) {
@@ -10890,10 +12245,12 @@ var NativeYjs = class {
         room.path,
         "Remote edits exceeded IME buffer; local draft preserved, restart Connector to reconcile"
       );
+      this.opts.compositionChanged?.(room.path);
       return;
     }
     room.waiting.push(update);
     room.waitingBytes += update.byteLength;
+    this.opts.compositionChanged?.(room.path);
   }
   join(room) {
     if (!this.online || room.blocked || !room.views.size)
@@ -10904,6 +12261,47 @@ var NativeYjs = class {
       path: room.path,
       name: this.opts.displayName?.() || "Native Obsidian"
     });
+  }
+  hasCausalGap(room) {
+    return hasMissingYjsAncestors(room.doc);
+  }
+  clearCausalRepair(room) {
+    if (room.causalRepairTimer !== null) {
+      clearTimeout(room.causalRepairTimer);
+      room.causalRepairTimer = null;
+    }
+    room.causalRepairAttempts = 0;
+  }
+  ensureCausalConvergence(room) {
+    if (!this.hasCausalGap(room)) {
+      this.clearCausalRepair(room);
+      return;
+    }
+    if (!this.online || !room.joined || room.blocked || room.composing || !room.views.size || room.causalRepairTimer !== null)
+      return;
+    if (room.causalRepairAttempts >= MAX_CAUSAL_REPAIR_ATTEMPTS) {
+      room.blocked = true;
+      room.joined = false;
+      this.opts.send({ channel: "collab", type: "leave", path: room.path });
+      this.opts.notify(
+        room.path,
+        "Server Yjs ancestry remained incomplete; native draft protected for review"
+      );
+      return;
+    }
+    const delay = causalRepairDelay(room.causalRepairAttempts);
+    room.causalRepairTimer = setTimeout(() => {
+      room.causalRepairTimer = null;
+      if (!this.hasCausalGap(room)) {
+        this.clearCausalRepair(room);
+        return;
+      }
+      if (!this.online || !room.joined || room.blocked || room.composing)
+        return;
+      room.causalRepairAttempts++;
+      this.join(room);
+      this.ensureCausalConvergence(room);
+    }, delay);
   }
   clearPeers(room) {
     room.peers.clear();
@@ -10934,39 +12332,45 @@ var NativeYjs = class {
       return;
     if (room.peers.size)
       this.refreshPeers(room);
-    if (!view.hasFocus) {
+    if (!view.hasFocus && !room.composing) {
       if (![...room.views].some((v) => v.hasFocus))
         this.sendCursorAway(room);
       return;
     }
-    if (!room.joined || !this.online || room.blocked || room.composing)
+    if (!room.joined || !this.online || room.blocked)
       return;
     if (room.cursorTimer !== null)
       clearTimeout(room.cursorTimer);
     room.cursorTimer = setTimeout(() => {
       room.cursorTimer = null;
       const focused = [...room.views].find((v) => v.hasFocus && this.bound.get(v) === room);
-      if (!focused || !room.text || !room.joined || room.composing || room.blocked || !this.online)
+      if (!focused || !room.text || !room.joined || room.blocked || !this.online)
         return;
-      const selection = focused.state.selection;
-      const encoded = encodeSelections(room.text, selection.ranges, selection.mainIndex);
-      if (!encoded) {
-        this.sendCursorAway(room);
-        this.opts.notify(room.path, "Shared cursors allow up to 32 selections; none were truncated");
-        return;
-      }
-      const signature = JSON.stringify([encoded.selections, encoded.mainIndex]);
-      if (room.lastCursor === signature)
-        return;
-      room.lastCursor = signature;
-      this.opts.send({
-        channel: "collab",
-        type: "cursor",
-        path: room.path,
-        documentId: room.documentId || void 0,
-        ...encoded
-      });
+      this.publishCursor(room, focused);
     }, 65);
+  }
+  publishCursor(room, view) {
+    if (!room.text || !room.joined || !this.online || room.blocked)
+      return;
+    if (view.state.doc.toString() !== room.text.toString())
+      return;
+    const selection = view.state.selection;
+    const encoded = encodeSelections(room.text, selection.ranges, selection.mainIndex);
+    if (!encoded) {
+      this.opts.notify(room.path, "Shared cursors allow up to 32 selections; none were truncated");
+      return;
+    }
+    const signature = JSON.stringify([encoded.selections, encoded.mainIndex]);
+    if (room.lastCursor === signature)
+      return;
+    room.lastCursor = signature;
+    this.opts.send({
+      channel: "collab",
+      type: "cursor",
+      path: room.path,
+      documentId: room.documentId || void 0,
+      ...encoded
+    });
   }
   refreshPeers(room) {
     for (const view of room.views) {
@@ -11008,6 +12412,9 @@ var NativeYjs = class {
       blocked: active.filter((room) => room.blocked).length
     };
   }
+  blockingPaths() {
+    return [...this.rooms.values()].filter((room) => room.blocked && room.views.size > 0).map((room) => room.path);
+  }
   jumpToParticipant(path, id2) {
     const room = this.rooms.get(path);
     const peer = room?.peers.get(id2);
@@ -11039,6 +12446,7 @@ var NativeYjs = class {
     this.online = false;
     for (const room of this.rooms.values()) {
       room.joined = false;
+      this.clearCausalRepair(room);
       this.clearPeers(room);
       if (room.retryTimer !== null) {
         clearTimeout(room.retryTimer);
@@ -11179,14 +12587,51 @@ var NativeYjs = class {
           return;
         }
         const preJoin = room.text.toString();
-        const expected = room.wasKnown ? preJoin : serverText;
-        if ([...room.views].some((view) => view.state.doc.toString() !== expected)) {
+        const wasKnownAtJoin = room.wasKnown;
+        const expected = wasKnownAtJoin ? preJoin : serverText;
+        const views = [...room.views];
+        let acceptedPrejoin = null;
+        let verifiedAncestor = false;
+        const divergentViews = views.filter((view) => view.state.doc.toString() !== expected);
+        if (!wasKnownAtJoin && !room.composing && typeof room.preJoinBase === "string") {
+          const baseline = this.opts.fileBaseline?.(room.path);
+          if (baseline?.generationId === message.documentId && /^[a-f0-9]{64}$/.test(baseline.hash)) {
+            const bytes = new TextEncoder().encode(room.preJoinBase);
+            const digest = await crypto.subtle.digest("SHA-256", bytes);
+            const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+            if (hash === baseline.hash) {
+              verifiedAncestor = true;
+              const input = views[0]?.state.doc.toString();
+              if (input !== void 0 && views.every((view) => view.state.doc.toString() === input)) {
+                const result = rebasePrejoinText(room.preJoinBase, input, serverText);
+                if (result.kind === "merged")
+                  acceptedPrejoin = result.text;
+              }
+            }
+          }
+        }
+        if (divergentViews.length && acceptedPrejoin === null && !verifiedAncestor) {
           room.blocked = true;
           this.opts.send({ channel: "collab", type: "leave", path: room.path });
           this.opts.notify(room.path, "Native draft differs from Yjs baseline; not merged automatically");
           return;
         }
-        if (room.wasKnown) {
+        if (!wasKnownAtJoin && verifiedAncestor && acceptedPrejoin === null) {
+          room.blocked = true;
+          this.opts.send({ channel: "collab", type: "leave", path: room.path });
+          this.opts.notify(
+            room.path,
+            "Competing edits to the same original span; native draft retained for review"
+          );
+          return;
+        }
+        if (acceptedPrejoin !== null && (this.disposed || room.blocked || room.composing || !room.views.size || views.some((view) => view.state.doc.toString() !== views[0]?.state.doc.toString()))) {
+          room.blocked = true;
+          this.opts.send({ channel: "collab", type: "leave", path: room.path });
+          this.opts.notify(room.path, "Native draft changed during safe rebase; retained for review");
+          return;
+        }
+        if (wasKnownAtJoin) {
           this.tryAttach(room);
           await new Promise((resolve) => queueMicrotask(resolve));
           if ([...room.views].some((view) => this.bound.get(view) !== room)) {
@@ -11196,21 +12641,51 @@ var NativeYjs = class {
             return;
           }
         }
-        room.joined = true;
         this.receivePeople(
           room,
           message.people,
           typeof message.self?.id === "string" ? message.self.id : null
         );
-        if (room.composing)
-          this.deferRemote(room, remote);
-        else
-          applyUpdate(room.doc, remote, REMOTE);
+        this.applyRemoteDuringIme(room, remote);
         if (room.blocked)
           return;
+        if (!wasKnownAtJoin && acceptedPrejoin !== null) {
+          if (room.text.toString() !== serverText) {
+            throw new Error("Server text changed during pre-join reconciliation");
+          }
+          const delta = deltaForText(serverText, acceptedPrejoin);
+          if (acceptedPrejoin !== serverText) {
+            room.doc.transact(() => room.text.applyDelta(delta), null);
+          }
+          for (const view of views) {
+            const current = view.state.doc.toString();
+            const result = rebasePrejoinText(room.preJoinBase, current, serverText);
+            if (!verifiedAncestor || result.kind === "review" || result.text !== acceptedPrejoin) {
+              throw new Error("Native edits changed during verified startup; draft kept for review");
+            }
+            const edits = textEdits(current, acceptedPrejoin);
+            if (edits.length) {
+              view.dispatch({ changes: edits });
+            }
+          }
+        }
+        if (!wasKnownAtJoin) {
+          this.tryAttach(room);
+          await new Promise((resolve) => queueMicrotask(resolve));
+          const attached = [...room.views].every((view) => view.dom.isConnected !== true || this.bound.get(view) === room && view.state.doc.toString() === room.text?.toString());
+          if (!attached) {
+            room.blocked = true;
+            this.opts.send({ channel: "collab", type: "leave", path: room.path });
+            this.opts.notify(
+              room.path,
+              "Editor was not attached to shared history; native draft retained for review"
+            );
+            return;
+          }
+        }
+        room.joined = true;
         await this.opts.rememberId(room.path, message.documentId);
         room.wasKnown = true;
-        this.tryAttach(room);
         for (const view of room.views)
           this.selectionChanged(view);
         if (!room.composing)
@@ -11219,7 +12694,11 @@ var NativeYjs = class {
           room.pendingHandshake = true;
           this.opts.notify(room.path, "IME composition: remote merge deferred");
         }
+        this.ensureCausalConvergence(room);
       } catch (e) {
+        room.blocked = true;
+        room.joined = false;
+        this.opts.send({ channel: "collab", type: "leave", path: room.path });
         this.opts.notify(room.path, "Could not initialize Yjs: " + String(e));
       }
       return;
@@ -11227,10 +12706,8 @@ var NativeYjs = class {
     if (message.type === "update" && room.doc && room.joined && !room.blocked) {
       try {
         const bytes = decode(message.update);
-        if (room.composing)
-          this.deferRemote(room, bytes);
-        else
-          applyUpdate(room.doc, bytes, REMOTE);
+        this.applyRemoteDuringIme(room, bytes);
+        this.ensureCausalConvergence(room);
       } catch {
         this.opts.notify(room.path, "Invalid remote Yjs update");
       }
@@ -11257,6 +12734,29 @@ var NativeYjs = class {
     const room = this.rooms.get(path);
     return !!room?.views.size;
   }
+  async retireDocument(path) {
+    const room = this.rooms.get(path);
+    if (!room)
+      return;
+    if (room.views.size || room.sentSeq > room.savedSeq || room.pendingHandshake || room.waiting.length) {
+      throw new Error("Close the old editor and finish pending collaboration writes");
+    }
+    if (room.joined) {
+      this.opts.send({ channel: "collab", type: "leave", path });
+      room.joined = false;
+    }
+    this.clearPeers(room);
+    this.rooms.delete(path);
+    this.clearCausalRepair(room);
+    if (room.retryTimer !== null)
+      clearTimeout(room.retryTimer);
+    room.retryTimer = null;
+    await room.hydration?.catch(() => {
+    });
+    await room.persistence?.destroy();
+    room.undo?.destroy();
+    room.doc?.destroy();
+  }
   async resetForConnection() {
     this.disconnected();
     const views = [...new Set(
@@ -11275,6 +12775,7 @@ var NativeYjs = class {
     for (const room of this.rooms.values()) {
       if (room.retryTimer !== null)
         clearTimeout(room.retryTimer);
+      this.clearCausalRepair(room);
       await room.persistence?.destroy().catch(() => {
       });
       room.undo?.destroy();
@@ -11365,8 +12866,9 @@ function queueDelete(state, path, opId) {
   return true;
 }
 function acknowledgePending(state, received) {
-  const pending = state.pending[0];
-  if (!pending || pending.fileId !== received.fileId || pending.generationId !== received.generationId || pending.opId !== received.opId || pending.type !== received.type || pending.path !== received.path || pending.type === "rename" && pending.toPath !== received.toPath) {
+  const index = state.pending.findIndex((item) => item.opId === received.opId);
+  const pending = state.pending[index];
+  if (!pending || !Number.isSafeInteger(received.seq) || received.seq < 1 || pending.fileId !== received.fileId || pending.generationId !== received.generationId || pending.opId !== received.opId || pending.type !== received.type || pending.path !== received.path || pending.type === "rename" && pending.toPath !== received.toPath) {
     throw new Error("Server acknowledged a different queued operation");
   }
   const tracked = state.baselines[pending.path];
@@ -11387,7 +12889,7 @@ function acknowledgePending(state, received) {
       generationId: received.generationId
     };
   }
-  state.pending.shift();
+  state.pending.splice(index, 1);
   return pending;
 }
 
@@ -11403,15 +12905,35 @@ function stageWrite(pending, request) {
   return request;
 }
 function acknowledgeWrite(pending, receipt) {
-  const staged = pending[0];
+  const index = pending.findIndex((item) => item.opId === receipt.opId);
+  const staged = pending[index];
   if (!staged || receipt.opId !== staged.opId || receipt.type !== staged.type || receipt.path !== staged.path || typeof receipt.fileId !== "string" || typeof receipt.generationId !== "string" || !Number.isSafeInteger(receipt.seq) || receipt.seq < 1 || receipt.hash !== staged.localHash) {
     throw new Error("Server acknowledged a different staged write");
   }
-  pending.shift();
+  pending.splice(index, 1);
   return staged;
 }
 
 // src/reconcile.ts
+function retainDeletionProofs(known, tracked, changes) {
+  const proofs = {};
+  for (const [name, base] of Object.entries(tracked)) {
+    const old = known[name];
+    if (old && old.fileId === base.fileId && old.generationId === base.generationId)
+      proofs[name] = old;
+  }
+  for (const change of changes) {
+    const base = tracked[change.path];
+    if (change.type === "delete" && base && change.fileId === base.fileId && change.generationId === base.generationId && (!proofs[change.path] || proofs[change.path].seq < change.seq)) {
+      proofs[change.path] = {
+        seq: change.seq,
+        fileId: change.fileId,
+        generationId: change.generationId
+      };
+    }
+  }
+  return proofs;
+}
 function classifyAbsence(path, baseline, currentRemotePaths, changes) {
   if (currentRemotePaths.has(path))
     return "present";
@@ -11419,6 +12941,15 @@ function classifyAbsence(path, baseline, currentRemotePaths, changes) {
     (change) => change.type === "delete" && change.path === path && change.fileId === baseline.fileId && change.generationId === baseline.generationId
   );
   return deleted ? "tombstone" : "unverified";
+}
+function classifySnapshotAbsence(path, current, atManifest, currentRemotePaths, changes, proof) {
+  if (!atManifest || atManifest.fileId !== current.fileId || atManifest.generationId !== current.generationId || atManifest.hash !== current.hash || atManifest.revision !== current.revision)
+    return "post-snapshot";
+  if (currentRemotePaths.has(path))
+    return "present";
+  if (proof?.fileId === atManifest.fileId && proof.generationId === atManifest.generationId)
+    return "tombstone";
+  return classifyAbsence(path, atManifest, currentRemotePaths, changes);
 }
 async function readChangesThrough(start, through, fetchPage) {
   if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(through) || through < start) {
@@ -11452,6 +12983,14 @@ async function readChangesThrough(start, through, fetchPage) {
 // src/connection-setup.ts
 var TOKEN = /^ignis_dev_[A-Za-z0-9_-]{43}$/;
 var VAULT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+async function scopedSecretId(scope) {
+  if (!scope || scope.length > 2048)
+    throw new Error("Invalid Vault scope");
+  const data = new TextEncoder().encode(scope);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return "ignis-connector-vault-" + hex.slice(0, 40);
+}
 function parseJoinLink(raw) {
   const input = raw.trim();
   let url;
@@ -11531,6 +13070,581 @@ function sessionError(status, body, expectedVaultId) {
   return null;
 }
 
+// ../../packages/server-core/src/vault-upload-path.ts
+function uniqueUploadPath(vault, folderPath, fileName) {
+  const name = String(fileName || "").split(/[\\/]/).pop();
+  if (!name || name === "." || name === "..") {
+    throw new Error("Invalid upload filename");
+  }
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  const normalizedFolder = String(folderPath || "").replace(/^\/+|\/+$/g, "");
+  const pathFor = (candidate) => normalizedFolder ? `${normalizedFolder}/${candidate}` : candidate;
+  const initial = pathFor(name);
+  if (!vault.getAbstractFileByPath(initial))
+    return initial;
+  for (let i = 1; i <= 9999; i++) {
+    const candidate = pathFor(`${stem} (${i})${ext}`);
+    if (!vault.getAbstractFileByPath(candidate))
+      return candidate;
+  }
+  throw new Error("No available filename for this upload");
+}
+
+// ../../packages/server-core/src/mobile-ui-copy.ts
+function mobileUiLanguage(storage = typeof localStorage === "undefined" ? null : localStorage, systemLanguage = typeof navigator === "undefined" ? "en" : navigator.language) {
+  let configured = null;
+  try {
+    configured = storage?.getItem("language") || null;
+  } catch {
+  }
+  return /^ja(?:-|$)/i.test(configured || systemLanguage || "en") ? "ja" : "en";
+}
+var strings = {
+  ja: {
+    status: "\u63A5\u7D9A\u30FB\u540C\u671F",
+    upload: "\u30D5\u30A1\u30A4\u30EB\u8FFD\u52A0",
+    chooseFile: "\u30D5\u30A1\u30A4\u30EB\u3092\u9078\u3076",
+    people: "\u53C2\u52A0\u8005\u30FB\u8868\u793A\u540D",
+    openPeople: "\u8A73\u7D30\u3092\u958B\u304F",
+    rename: "\u30D5\u30A1\u30A4\u30EB\u540D\u3092\u5909\u66F4",
+    noNote: "\u73FE\u5728\u30CE\u30FC\u30C8\u306F\u958B\u3044\u3066\u3044\u307E\u305B\u3093",
+    openActions: "\u63A5\u7D9A\u72B6\u614B\u30FB\u30D5\u30A1\u30A4\u30EB\u8FFD\u52A0\u30FB\u53C2\u52A0\u8005\u3092\u958B\u304F",
+    connecting: "\u63A5\u7D9A\u4E2D\u2026",
+    joining: "\u540C\u671F\u63A5\u7D9A\u4E2D\u2026",
+    offline: "\u30AA\u30D5\u30E9\u30A4\u30F3",
+    unconfigured: "\u672A\u63A5\u7D9A",
+    syncing: "\u540C\u671F\u4E2D\u2026",
+    synced: "\u540C\u671F\u6E08\u307F",
+    serverConnected: "\u30B5\u30FC\u30D0\u30FC\u63A5\u7D9A",
+    attention: "\u8981\u78BA\u8A8D"
+  },
+  en: {
+    status: "Connection & sync",
+    upload: "Add files",
+    chooseFile: "Choose files",
+    people: "Participants & display name",
+    openPeople: "View details",
+    rename: "Rename file",
+    noNote: "No note open",
+    openActions: "Open connection, files & participants",
+    connecting: "Connecting\u2026",
+    joining: "Connecting to note\u2026",
+    offline: "Offline",
+    unconfigured: "Not connected",
+    syncing: "Syncing\u2026",
+    synced: "Synced",
+    serverConnected: "Server connected",
+    attention: "Needs attention"
+  }
+};
+function mobileUiCopy(language = mobileUiLanguage()) {
+  return strings[language] || strings.en;
+}
+
+// src/mobile-controls.ts
+function nativeConnectionState(message, configured, socketOpen, language = "ja") {
+  const t = mobileUiCopy(language);
+  if (/revoked|rejected|unauthoriz|denied|not allowed|not available|error|failed|need.s? review|conflict|blocked|Undo\/Redo \d+件を確認|server history|sync paused|server update required|journal identity/i.test(message)) {
+    return { kind: "error", label: t.attention };
+  }
+  if (!configured)
+    return { kind: "offline", label: t.unconfigured };
+  if (!socketOpen)
+    return { kind: "offline", label: t.offline };
+  if (/IME not confirmed|IME未確定|変換未確定/i.test(message)) {
+    return { kind: "syncing", label: language === "ja" ? /peer edit waiting|競合保留/i.test(message) ? "\u7AF6\u5408\u4FDD\u7559\u4E2D\u30FBIME\u672A\u78BA\u5B9A" : "IME\u5909\u63DB\u4E2D\u30FB\u672A\u78BA\u5B9A" : /peer edit waiting/i.test(message) ? "Peer edit waiting \xB7 IME draft" : "Converting \xB7 not confirmed" };
+  }
+  if (/device token not saved/i.test(message)) {
+    return { kind: "syncing", label: language === "ja" ? "\u8A8D\u8A3C\u672A\u4FDD\u5B58\u30FB\u518D\u63A5\u7D9A\u304C\u5FC5\u8981" : "Session only \xB7 token not saved" };
+  }
+  if (/syncing|pending|waiting|offline|reconnect|awaiting/i.test(message)) {
+    return { kind: "syncing", label: t.syncing };
+  }
+  if (/^Synced · server acknowledged$/i.test(message)) {
+    return { kind: "connected", label: t.synced };
+  }
+  return { kind: "connected", label: t.serverConnected };
+}
+async function importNativeFiles(vault, files, isSafePath, maxFileBytes = 4 * 1024 * 1024) {
+  let imported = 0;
+  let failed = 0;
+  let tooLarge = 0;
+  for (const file of files) {
+    if (!Number.isFinite(file.size) || file.size > maxFileBytes) {
+      tooLarge++;
+      continue;
+    }
+    try {
+      const path = uniqueUploadPath(vault, vault.getRoot().path, file.name);
+      if (!isSafePath(path)) {
+        failed++;
+        continue;
+      }
+      await vault.createBinary(path, await file.arrayBuffer());
+      imported++;
+    } catch {
+      failed++;
+    }
+  }
+  return { imported, failed, tooLarge };
+}
+
+// src/connection-close.ts
+function classifySyncSocketClose(code, reason) {
+  if (code === 4001) {
+    return { terminal: true, status: "Vault is not available on this server" };
+  }
+  if (code === 4003) {
+    const status = reason === "Origin not allowed" ? "Obsidian app origin not allowed by server" : reason === "Tailnet identity not authorized" ? "Tailnet identity not authorized for this Vault" : reason === "Sync authorization failed" ? "Device token rejected or revoked" : "Realtime connection denied by server";
+    return { terminal: true, status };
+  }
+  if (code === 4002) {
+    return { terminal: false, status: "Vault changed \xB7 reconnecting" };
+  }
+  return { terminal: false, status: "Offline \xB7 local Vault retained" };
+}
+
+// src/credential-persistence.ts
+async function persistScopedDeviceCredential(store, secretId, token) {
+  if (!store?.setSecret)
+    return "session-only";
+  const backend = store.adapter;
+  if (backend && typeof backend.save === "function" && typeof backend.load === "function" && store.secrets && typeof store.secrets === "object") {
+    try {
+      const proposed = { ...store.secrets, [secretId]: token };
+      await backend.save(proposed);
+      const restored = await backend.load();
+      if (restored?.[secretId] !== token)
+        return "session-only";
+      await store.setSecret(secretId, token);
+      return "verified";
+    } catch {
+      return "session-only";
+    }
+  }
+  try {
+    await store.setSecret(secretId, token);
+    return "unverified";
+  } catch {
+    return "session-only";
+  }
+}
+
+// src/binary-quiescence.ts
+function sameStamp(a, b) {
+  return !!a && !!b && Number.isFinite(a.size) && Number.isFinite(a.mtime) && a.size === b.size && a.mtime === b.mtime;
+}
+function sameBytes(a, b) {
+  if (a.byteLength !== b.byteLength)
+    return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i])
+      return false;
+  }
+  return true;
+}
+async function readQuiescentBinary(options) {
+  const firstStart = await options.stat();
+  if (!firstStart || firstStart.size > options.maxBytes || firstStart.size < 0)
+    return null;
+  const first = await options.read();
+  const firstEnd = await options.stat();
+  if (first.byteLength !== firstStart.size || !sameStamp(firstStart, firstEnd))
+    return null;
+  await options.wait();
+  const secondStart = await options.stat();
+  if (!sameStamp(firstEnd, secondStart))
+    return null;
+  const second = await options.read();
+  const secondEnd = await options.stat();
+  if (second.byteLength !== secondStart.size || !sameStamp(secondStart, secondEnd) || !sameBytes(first, second)) {
+    return null;
+  }
+  return second;
+}
+
+// src/operation-replay.ts
+var SyncHttpError = class extends Error {
+  constructor(status, code) {
+    super("Ignis Sync HTTP " + status + (code ? " (" + code + ")" : ""));
+    this.status = status;
+    this.code = code;
+    this.name = "SyncHttpError";
+  }
+};
+var REVIEWABLE = /* @__PURE__ */ new Set([
+  "BASE_MISMATCH",
+  "GENERATION_MISMATCH",
+  "CREATE_CONFLICT",
+  "DESTINATION_EXISTS",
+  "RECOVERY_BLOCKED",
+  "COLLABORATIVE_FILE_OPERATION_CONFLICT",
+  "COLLABORATIVE_WRITE_CONFLICT"
+]);
+function isReviewableConflict(error) {
+  return error instanceof SyncHttpError && error.status === 409 && REVIEWABLE.has(error.code);
+}
+function pendingDependent(a, b) {
+  if (a.fileId === b.fileId)
+    return true;
+  const aPaths = [a.path, a.toPath].filter((v) => !!v);
+  const bPaths = [b.path, b.toPath].filter((v) => !!v);
+  return aPaths.some((path) => bPaths.includes(path));
+}
+
+// ../../packages/server-core/src/mobile-navbar.ts
+function mountMobileNavbarAction(action, doc2 = document) {
+  const attach = () => {
+    const navbar = doc2.querySelector(".mobile-navbar .mobile-navbar-actions");
+    const editing = doc2.querySelector(".mobile-toolbar .mobile-toolbar-options-list");
+    const useEditing = Boolean(editing && (doc2.body.classList.contains("mod-toolbar-open") || !navbar));
+    const target = useEditing ? editing : navbar;
+    if (!target || action.parentElement === target)
+      return;
+    action.classList.toggle("mobile-navbar-action", !useEditing);
+    action.classList.toggle("mobile-toolbar-option", useEditing);
+    if (useEditing) {
+      target.prepend(action);
+    } else {
+      target.appendChild(action);
+    }
+  };
+  const observer = new MutationObserver(attach);
+  observer.observe(doc2.body, { childList: true, subtree: true });
+  const modeObserver = new MutationObserver(attach);
+  modeObserver.observe(doc2.body, { attributes: true, attributeFilter: ["class"] });
+  attach();
+  return () => {
+    observer.disconnect();
+    modeObserver.disconnect();
+    action.remove();
+  };
+}
+
+// src/main.ts
+var import_content_scope2 = __toESM(require_content_scope());
+
+// src/sharing-settings.ts
+var import_content_scope = __toESM(require_content_scope());
+var import_media_bypass = __toESM(require_media_bypass());
+function formatLocalBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0)
+    return "0 B";
+  if (bytes < 1024)
+    return Math.floor(bytes) + " B";
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let index = -1;
+  do {
+    value /= 1024;
+    index += 1;
+  } while (value >= 1024 && index < units.length - 1);
+  return value.toFixed(1) + " " + units[index];
+}
+function effectiveContentScope(serverScope, deviceScope) {
+  if (serverScope === "markdown-only" || deviceScope === "markdown-only") {
+    return "markdown-only";
+  }
+  return "all";
+}
+function effectiveMediaBypassExtensions(serverScope, deviceScope, serverExtensions = [], selectedExtensions = []) {
+  const offered = (0, import_media_bypass.normalizeMediaBypassExtensions)(serverExtensions);
+  const selected = (0, import_media_bypass.normalizeMediaBypassExtensions)(selectedExtensions);
+  if (deviceScope !== "markdown-only")
+    return offered;
+  return selected.filter((extension) => serverScope === "all" || offered.includes(extension));
+}
+function sharingSummary(files, serverScope, deviceScope, pending = [], pendingWrites = [], serverBypassExtensions = [], deviceBypassExtensions = []) {
+  const effective = effectiveContentScope(serverScope, deviceScope);
+  const effectiveBypass = effectiveMediaBypassExtensions(
+    serverScope,
+    deviceScope,
+    serverBypassExtensions,
+    deviceBypassExtensions
+  );
+  const policy = (0, import_content_scope.createContentScope)(effective, effectiveBypass);
+  let sharedFiles = 0;
+  let localOnlyFiles = 0;
+  let oversizedFiles = 0;
+  let localOnlyBytes = 0;
+  for (const file of files) {
+    const bytes = Math.max(0, Number(file.stat?.size) || 0);
+    if (policy.allowsPath(file.path) && bytes <= 4 * 1024 * 1024) {
+      sharedFiles += 1;
+    } else if ((0, import_content_scope.createContentScope)("all").allowsPath(file.path)) {
+      localOnlyFiles += 1;
+      localOnlyBytes += bytes;
+      if (bytes > 4 * 1024 * 1024)
+        oversizedFiles += 1;
+    }
+  }
+  const blockedQueued = [...pending, ...pendingWrites].filter(
+    (item) => !policy.allowsPath(item.path) || item.toPath !== void 0 && !policy.allowsPath(item.toPath)
+  ).length;
+  return {
+    serverScope,
+    deviceScope,
+    effective,
+    effectiveBypass,
+    sharedFiles,
+    localOnlyFiles,
+    localOnlyBytes,
+    oversizedFiles,
+    pendingOperations: pending.length + pendingWrites.length,
+    blockedQueued
+  };
+}
+
+// src/main.ts
+var import_media_bypass2 = __toESM(require_media_bypass());
+
+// src/connection-recovery.ts
+function connectionRecoveryLabel(state, settings) {
+  if (state.ready) {
+    return "Connected to " + state.vaultId + (settings.authMode === "tailnet" ? " \xB7 Tailscale" : " \xB7 Device token");
+  }
+  if (state.vaultId && settings.serverUrl) {
+    if (settings.authMode === "device") {
+      return "Previously connected to " + state.vaultId + ". This device needs its verified token again after restart. Open Advanced: Vault ID or device-token connection, paste the device token and select Connect and verify. Your local notes are retained.";
+    }
+    return "Previously connected to " + state.vaultId + ". Reconnect through your trusted Tailscale identity. Your local notes are retained.";
+  }
+  return "Not connected. Paste your Ignis invite link to start.";
+}
+
+// src/migration.ts
+var HEX64 = /^[0-9a-f]{64}$/;
+var SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+function trimToByteLength(input, maxBytes) {
+  const encoder = new TextEncoder();
+  let output = "";
+  let used = 0;
+  for (const char of input) {
+    const length2 = encoder.encode(char).byteLength;
+    if (used + length2 > maxBytes)
+      break;
+    output += char;
+    used += length2;
+  }
+  return output;
+}
+function migrationVersionPath(original, role, identity, digest, ordinal = 0) {
+  if (!original || original.includes("\\") || original.startsWith("/") || original.split("/").some((part) => !part || part === "." || part === "..") || !HEX64.test(digest) || !SAFE_ID.test(identity) || !Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal > 99) {
+    throw new Error("Invalid migration filename");
+  }
+  const slash = original.lastIndexOf("/");
+  const parent = slash < 0 ? "" : original.slice(0, slash + 1);
+  const filename = original.slice(slash + 1);
+  const dot = filename.lastIndexOf(".");
+  const extension = dot > 0 ? filename.slice(dot) : "";
+  const stem = dot > 0 ? filename.slice(0, dot) : filename;
+  const suffix = " (Ignis " + role + " " + identity.slice(0, 12) + " " + digest.slice(0, 12) + (ordinal ? "-" + ordinal : "") + ")";
+  const allowance = 230 - new TextEncoder().encode(suffix + extension).byteLength;
+  if (allowance < 1)
+    throw new Error("Migration filename is too long");
+  const shortStem = trimToByteLength(stem, allowance) || "note";
+  const result = parent + shortStem + suffix + extension;
+  if (new TextEncoder().encode(result).byteLength > 2048) {
+    throw new Error("Migration path is too long");
+  }
+  return result;
+}
+function isMigrationRecordCurrent(record, scope, sourceHash, remote) {
+  return !!record && record.scope === scope && record.sourceHash === sourceHash && record.remoteHash === (remote?.hash ?? null) && record.remoteFileId === (remote?.fileId ?? null) && record.remoteGenerationId === (remote?.generationId ?? null);
+}
+function migrationNeedsPreservation(reason) {
+  return /Existing on both devices|Concurrent edit|Replaced document generation|Live editor blocked|Remote deleted|Remote missing/i.test(reason);
+}
+function migrationCardLabel(path) {
+  const filename = path.split("/").at(-1) || path;
+  return [...filename].length > 28 ? "\u2026" + [...filename].slice(-25).join("") : filename;
+}
+
+// src/migration-ui-copy.ts
+var strings2 = {
+  ja: {
+    eyebrow: "IGNIS / \u30D0\u30FC\u30B8\u30E7\u30F3\u306E\u4FDD\u8B77\u3068\u79FB\u884C",
+    title: "\u3059\u3079\u3066\u6B8B\u3057\u3066\u3001\u3042\u3068\u304B\u3089\u9078\u3076",
+    intro: "\u540C\u3058\u540D\u524D\u3067\u3082\u3001\u5225\u3005\u306B\u4F5C\u3063\u305F\u6587\u66F8\u306F\u5225\u7269\u3067\u3059\u3002\u5148\u306B\u3059\u3079\u3066\u306E\u7248\u3092\u5225\u540D\u3067\u4FDD\u5B58\u3057\u3001\u5185\u5BB9\u3092\u6BD4\u3079\u3066\u304B\u3089\u79FB\u884C\u3067\u304D\u307E\u3059\u3002\u5143\u306E\u30D5\u30A1\u30A4\u30EB\u306F\u81EA\u52D5\u3067\u4E0A\u66F8\u304D\u3057\u307E\u305B\u3093\u3002",
+    stages: ["01 \xB7 \u5168\u7248\u3092\u4FDD\u5B58", "02 \xB7 \u6BD4\u8F03", "03 \xB7 \u6C7A\u5B9A"],
+    count: (issues, saved) => `${issues}\u4EF6\u306E\u78BA\u8A8D\u5F85\u3061 \xB7 ${saved}\u4EF6\u3092\u4FDD\u8B77\u6E08\u307F`,
+    saveAll: "\u3059\u3079\u3066\u306E\u7248\u3092\u4FDD\u5B58",
+    saving: "\u4FDD\u5B58\u4E2D\u2026",
+    initialStatus: "\u5143\u306E\u6587\u66F8\u306F\u5909\u66F4\u3057\u307E\u305B\u3093\u3002",
+    saveProgress: "\u5225\u540D\u3067\u4FDD\u5B58\u3057\u3001\u30B5\u30FC\u30D0\u30FC\u306E\u78BA\u8A8D\u3092\u5F85\u3063\u3066\u3044\u307E\u3059\u2026",
+    verified: "\u4FDD\u5B58\u3092\u78BA\u8A8D\u3057\u307E\u3057\u305F\u3002\u5143\u306E\u6587\u66F8\u306F\u305D\u306E\u307E\u307E\u3067\u3059\u3002",
+    missingCopies: (count2) => `${count2}\u4EF6\u306F\u307E\u3060\u4FDD\u5B58\u3067\u304D\u3066\u3044\u307E\u305B\u3093\u3002\u4FDD\u5B58\u6E08\u307F\u306E\u7248\u306F\u4FDD\u6301\u3057\u3066\u3044\u307E\u3059\u3002`,
+    noIssues: "\u78BA\u8A8D\u304C\u5FC5\u8981\u306A\u6587\u66F8\u306F\u3042\u308A\u307E\u305B\u3093\u3002",
+    listLabel: "\u78BA\u8A8D\u304C\u5FC5\u8981\u306A\u6587\u66F8",
+    savedEarlier: "\u5225\u540D\u306E\u4FDD\u8B77\u30B3\u30D4\u30FC\u304C\u3042\u308A\u307E\u3059",
+    preservedPair: "\u4E21\u65B9\u306E\u7248\u3092\u30B5\u30FC\u30D0\u30FC\u306B\u4FDD\u5B58\u6E08\u307F",
+    preservedLocal: "\u7AEF\u672B\u5074\u306E\u7248\u3092\u30B5\u30FC\u30D0\u30FC\u306B\u4FDD\u5B58\u6E08\u307F",
+    savingItem: "\u4FDD\u5B58\u30FB\u691C\u8A3C\u4E2D\u2026",
+    needsAttention: "\u672A\u5B8C\u4E86\uFF1A",
+    savedHeading: "\u5225\u3005\u306E\u540D\u524D\u3067\u4FDD\u5B58\u3057\u307E\u3057\u305F",
+    openCopy: "\u958B\u304F",
+    saveSelected: "\u3053\u306E2\u3064\u306E\u7248\u3092\u4FDD\u5B58",
+    verifying: "\u4E21\u65B9\u306E\u4FDD\u5B58\u7D50\u679C\u3092\u691C\u8A3C\u3057\u3066\u3044\u307E\u3059\u2026",
+    original: "\u5143\u306E\u6587\u66F8\u3092\u958B\u304F",
+    comparisonLabel: "\u6587\u66F8\u306E\u30D0\u30FC\u30B8\u30E7\u30F3\u6BD4\u8F03",
+    localLabel: "\u3053\u306E\u7AEF\u672B\u306E\u539F\u7A3F",
+    remoteLabel: "\u30B5\u30FC\u30D0\u30FC\u306E\u539F\u7A3F",
+    loading: "\u5185\u5BB9\u3092\u8AAD\u307F\u8FBC\u3093\u3067\u3044\u307E\u3059\u2026",
+    localUnavailable: "\u539F\u7A3F\u306E\u30D7\u30EC\u30D3\u30E5\u30FC\u306F\u3042\u308A\u307E\u305B\u3093\u3002",
+    serverUnavailable: "\u30B5\u30FC\u30D0\u30FC\u5074\u306E\u539F\u7A3F\u304C\u3042\u308A\u307E\u305B\u3093\uFF08\u307E\u305F\u306F\u30D0\u30A4\u30CA\u30EA\u30D5\u30A1\u30A4\u30EB\u3067\u3059\uFF09\u3002",
+    previewTruncated: "\u2026\u30D7\u30EC\u30D3\u30E5\u30FC\u306F\u3053\u3053\u307E\u3067\u3002\u5168\u6587\u306F\u4FDD\u5B58\u6E08\u307F\u30D5\u30A1\u30A4\u30EB\u3067\u78BA\u8A8D\u3067\u304D\u307E\u3059\u3002",
+    previewFailure: "\u30D7\u30EC\u30D3\u30E5\u30FC\u306B\u5931\u6557\u3057\u307E\u3057\u305F\u304C\u3001\u5143\u306E\u539F\u7A3F\u306F\u4FDD\u6301\u3055\u308C\u3066\u3044\u307E\u3059\u3002",
+    finishNote: "\u4E21\u65B9\u306E\u7248\u3092\u78BA\u8A8D\u3057\u305F\u3089\u3001\u5143\u306E\u540D\u524D\u3092\u30B5\u30FC\u30D0\u30FC\u7248\u3078\u5207\u308A\u66FF\u3048\u3089\u308C\u307E\u3059\u3002\u7AEF\u672B\u5074\u306E\u539F\u7A3F\u306F\u5225\u540D\u3067\u6B8B\u308A\u307E\u3059\u3002\u5207\u308A\u66FF\u3048\u308B\u524D\u306B\u5143\u306E\u30CE\u30FC\u30C8\u3092\u9589\u3058\u3066\u304F\u3060\u3055\u3044\u3002",
+    finish: "\u4E21\u65B9\u6B8B\u3057\u3066\u79FB\u884C\u3059\u308B",
+    confirm: "\u78BA\u8A8D\uFF1A\u5143\u306E\u540D\u524D\u3092\u30B5\u30FC\u30D0\u30FC\u7248\u3078\u5207\u308A\u66FF\u3048\u308B",
+    back: "\u623B\u308B",
+    finishProgress: "\u4FDD\u5B58\u5185\u5BB9\u3068\u6587\u66F8\u4E16\u4EE3\u3092\u518D\u78BA\u8A8D\u3057\u3066\u3044\u307E\u3059\u2026",
+    finished: "\u79FB\u884C\u5B8C\u4E86\u3002\u4E21\u65B9\u306E\u4FDD\u8B77\u30B3\u30D4\u30FC\u306F\u6B8B\u3057\u3066\u3044\u307E\u3059\u3002",
+    historyTitle: "\u30B5\u30FC\u30D0\u30FC\u306E\u540C\u671F\u5C65\u6B74\u3092\u78BA\u8A8D\u3067\u304D\u307E\u305B\u3093",
+    recheckHistory: "\u5C65\u6B74\u3092\u518D\u78BA\u8A8D\u3057\u3066\u540C\u671F\u3092\u518D\u958B",
+    recheckingHistory: "\u63A5\u7D9A\u5148\u306E\u540C\u671F\u5C65\u6B74\u3092\u7167\u5408\u4E2D\u2026",
+    historyRestored: "\u5143\u306E\u540C\u671F\u5C65\u6B74\u3092\u78BA\u8A8D\u3057\u307E\u3057\u305F\u3002\u540C\u671F\u3092\u518D\u958B\u3057\u307E\u3059\u3002"
+  },
+  en: {
+    eyebrow: "IGNIS / VERSION MIGRATION",
+    title: "Keep every version. Decide when ready.",
+    intro: "The same filename does not prove the same document. Save every version under a distinct name before comparing. Originals are never overwritten automatically.",
+    stages: ["01 \xB7 Preserve", "02 \xB7 Compare", "03 \xB7 Decide"],
+    count: (issues, saved) => `${issues} items to review \xB7 ${saved} saved version pairs`,
+    saveAll: "Save all versions",
+    saving: "Saving versions\u2026",
+    initialStatus: "Original files are unchanged.",
+    saveProgress: "Saving separate copies and verifying server receipts\u2026",
+    verified: "Copies verified. Originals remain untouched.",
+    missingCopies: (count2) => `${count2} versions still need attention. Completed copies were kept.`,
+    noIssues: "No unresolved migrations.",
+    listLabel: "Files needing review",
+    savedEarlier: "Saved copies available",
+    preservedPair: "Both versions saved on server",
+    preservedLocal: "Device version saved on server",
+    savingItem: "Saving and verifying\u2026",
+    needsAttention: "Needs attention: ",
+    savedHeading: "Saved as independent files",
+    openCopy: "Open",
+    saveSelected: "Save separate copies",
+    verifying: "Verifying both server copies\u2026",
+    original: "Open original",
+    comparisonLabel: "Version comparison",
+    localLabel: "This device",
+    remoteLabel: "Server original",
+    loading: "Loading a read-only preview\u2026",
+    localUnavailable: "No local text preview available.",
+    serverUnavailable: "No server text preview available (missing or binary).",
+    previewTruncated: "\u2026Preview truncated; complete versions are preserved.",
+    previewFailure: "Preview unavailable. The original draft is still retained.",
+    finishNote: "After comparing both copies, use the server version at the original filename. The device version remains saved separately. Close the original note first.",
+    finish: "Finish with both versions kept",
+    confirm: "Confirm: use server version at original name",
+    back: "Go back",
+    finishProgress: "Rechecking saved bytes and document generation\u2026",
+    finished: "Migration completed. Both copies retained.",
+    historyTitle: "Server sync history is not verified",
+    recheckHistory: "Recheck history and resume sync",
+    recheckingHistory: "Comparing the original server history\u2026",
+    historyRestored: "Original server history verified. Sync is resuming."
+  }
+};
+function migrationUiCopy(language = mobileUiLanguage()) {
+  return strings2[language];
+}
+function migrationReason(reason, language = mobileUiLanguage()) {
+  if (language === "en")
+    return reason;
+  if (/Existing on both devices/i.test(reason))
+    return "\u540C\u3058\u540D\u524D\u306E\u5225\u6587\u66F8\u304C\u3042\u308A\u307E\u3059";
+  if (/Replaced document generation/i.test(reason))
+    return "\u6587\u66F8\u306E\u4E16\u4EE3\u304C\u5909\u308F\u3063\u3066\u3044\u307E\u3059";
+  if (/Live editor blocked/i.test(reason))
+    return "\u7DE8\u96C6\u4E2D\u306E\u5C65\u6B74\u304C\u7570\u306A\u308B\u305F\u3081\u3001\u539F\u7A3F\u3092\u4FDD\u8B77\u4E2D";
+  if (/Concurrent edit/i.test(reason))
+    return "\u5909\u66F4\u304C\u7AF6\u5408\u3057\u3066\u3044\u307E\u3059";
+  if (/Server journal identity requires review/i.test(reason)) {
+    return "\u63A5\u7D9A\u5148\u306E\u540C\u671F\u5C65\u6B74\u304C\u4EE5\u524D\u306E\u5C65\u6B74\u3068\u4E00\u81F4\u3059\u308B\u304B\u78BA\u8A8D\u3067\u304D\u307E\u305B\u3093\u3002\u7AEF\u672B\u306E\u539F\u7A3F\u306F\u4FDD\u6301\u4E2D\u3067\u3059";
+  }
+  if (/Open editor has uncommitted or unverified text/i.test(reason)) {
+    return "\u958B\u3044\u3066\u3044\u308B\u30CE\u30FC\u30C8\u306B\u672A\u4FDD\u5B58\u306E\u5185\u5BB9\u304C\u3042\u308A\u307E\u3059\u3002\u4FDD\u5B58\u5F8C\u306B\u518D\u540C\u671F\u3067\u304D\u307E\u3059";
+  }
+  if (/Attachment exceeds preview size limit|Size limit/i.test(reason)) {
+    return "\u30D5\u30A1\u30A4\u30EB\u304C\u73FE\u5728\u306E\u8EE2\u9001\u4E0A\u9650\uFF081\u4EF64MiB\uFF09\u3092\u8D85\u3048\u3066\u3044\u307E\u3059\u3002\u7AEF\u672B\u5074\u306E\u30D5\u30A1\u30A4\u30EB\u306F\u4FDD\u6301\u4E2D\u3067\u3059";
+  }
+  if (/Unsent (?:create|modify|rename|delete)/i.test(reason)) {
+    return "\u30B5\u30FC\u30D0\u30FC\u306E\u4FDD\u5B58\u78BA\u8A8D\u304C\u307E\u3060\u3042\u308A\u307E\u305B\u3093\u3002\u7AEF\u672B\u306B\u5909\u66F4\u3092\u4FDD\u6301\u3057\u3066\u3044\u307E\u3059";
+  }
+  if (/Remote missing|Remote deleted/i.test(reason))
+    return "\u30B5\u30FC\u30D0\u30FC\u5074\u3067\u524A\u9664\u3055\u308C\u305F\u53EF\u80FD\u6027\u304C\u3042\u308A\u307E\u3059";
+  return reason;
+}
+
+// src/journal-lineage.ts
+var LINEAGE_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+function assessJournalTrust(evidence) {
+  const {
+    pinnedLineage,
+    remoteLineage,
+    cursor,
+    remoteSeq,
+    tracked,
+    liveGenerations,
+    remoteFiles
+  } = evidence;
+  if (!remoteLineage || !LINEAGE_ID.test(remoteLineage)) {
+    return { state: "hold", reason: "unsupported" };
+  }
+  if (pinnedLineage && pinnedLineage !== remoteLineage) {
+    return { state: "hold", reason: "changed" };
+  }
+  if (!Number.isSafeInteger(remoteSeq) || remoteSeq < 0 || !Number.isSafeInteger(cursor) || cursor < 0 || remoteSeq < cursor) {
+    return { state: "hold", reason: "behind" };
+  }
+  if (pinnedLineage) {
+    return { state: "trusted", lineage: remoteLineage, newlyPinned: false };
+  }
+  const priorHistory = cursor > 0 || tracked.length > 0 || liveGenerations.length > 0;
+  if (!priorHistory) {
+    return { state: "trusted", lineage: remoteLineage, newlyPinned: true };
+  }
+  const continuity = tracked.some((local) => remoteFiles.some((remote) => local.fileId === remote.fileId && local.generationId === remote.generationId)) || liveGenerations.some((id2) => remoteFiles.some((remote) => remote.generationId === id2));
+  return continuity ? { state: "trusted", lineage: remoteLineage, newlyPinned: true } : { state: "hold", reason: "legacy-unproven" };
+}
+function journalProofMatches(pinned, observed) {
+  return /^[a-f0-9]{64}$/.test(pinned) && typeof observed === "string" && pinned === observed;
+}
+function journalHoldMessage(reason) {
+  switch (reason) {
+    case "unsupported":
+      return "Server update required \xB7 local notes retained";
+    case "changed":
+      return "Server history changed \xB7 sync paused \xB7 local notes retained";
+    case "behind":
+      return "Server history is behind \xB7 sync paused \xB7 local notes retained";
+    case "legacy-unproven":
+      return "Server history cannot be verified \xB7 local notes retained";
+    case "diverged":
+      return "Server history diverged \xB7 sync paused \xB7 local notes retained";
+  }
+}
+function journalHoldExplanation(reason) {
+  switch (reason) {
+    case "unsupported":
+      return "This server does not provide a durable Sync history identity. Update Ignis Server, then recheck. Local drafts and queued edits are unchanged.";
+    case "changed":
+      return "This Vault name now points to a different Sync history. Restore the former server journal, or explicitly connect to a new Vault and review both versions. No automatic upload or deletion was attempted.";
+    case "behind":
+      return "The server has fewer journal events than this Connector already acknowledged. Restore the complete server journal and recheck. Your local originals and pending operations remain intact.";
+    case "legacy-unproven":
+      return "The Connector knows older document generations, but cannot prove that this is their original server after the upgrade. Verify the old journal or use an explicitly separate Vault. Nothing was overwritten.";
+    case "diverged":
+      return "This server has different operations at a previously confirmed history checkpoint. Restore the original journal or explicitly migrate to another Vault. No queued writes or collaborative edits were sent to the divergent history.";
+  }
+}
+
 // src/main.ts
 var DEFAULT = {
   displayName: "",
@@ -11540,19 +13654,36 @@ var DEFAULT = {
   serverDeviceId: "",
   vaultId: "",
   deviceId: "",
+  contentScope: "all",
+  deviceContentScope: "follow-server",
+  serverMediaBypassExtensions: [],
+  deviceMediaBypassExtensions: [],
   cursor: 0,
+  journalLineage: "",
+  journalProof: "",
+  tombstoneProofs: {},
   baselines: {},
   pending: [],
   pendingWrites: [],
   applyRemoteDeletes: false,
   syncIssues: [],
+  undoReviews: [],
+  migrations: {},
   yjsIds: {},
   scope: "",
   archivedScopes: []
 };
-var SECRET_PREFIX = "ignis-connector-vault-";
 var MAX_FILE_BYTES = 4 * 1024 * 1024;
+var AttachmentStillWriting = class extends Error {
+};
 var textEncoder = new TextEncoder();
+function safeBypassList(value) {
+  try {
+    return [...(0, import_media_bypass2.normalizeMediaBypassExtensions)(value)];
+  } catch {
+    return [];
+  }
+}
 function isSyncablePath(path) {
   const parts = path.split("/");
   return !!path && !path.includes("\\") && !path.includes("\0") && !path.startsWith("/") && !parts.some((part) => {
@@ -11599,15 +13730,243 @@ async function discover(discoveryUrl, serverDeviceId) {
     }
   });
 }
+var NativeMobileActionsModal = class extends import_obsidian.Modal {
+  constructor(app, currentStatus, addFiles, showPeople) {
+    super(app);
+    this.currentStatus = currentStatus;
+    this.addFiles = addFiles;
+    this.showPeople = showPeople;
+  }
+  stateText = null;
+  onOpen() {
+    const t = mobileUiCopy();
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Ignis" });
+    this.stateText = contentEl.createEl("p");
+    this.refreshStatus();
+    new import_obsidian.Setting(contentEl).setName(t.upload).addButton((button) => button.setButtonText(t.chooseFile).onClick(() => {
+      this.close();
+      this.addFiles();
+    }));
+    new import_obsidian.Setting(contentEl).setName(t.people).addButton((button) => button.setButtonText(t.openPeople).onClick(() => {
+      this.close();
+      this.showPeople();
+    }));
+  }
+  refreshStatus() {
+    if (this.stateText)
+      this.stateText.textContent = mobileUiCopy().status + ": " + this.currentStatus();
+  }
+  onClose() {
+    this.stateText = null;
+  }
+};
 var IgnisConnector = class extends import_obsidian.Plugin {
+  fileScope = (0, import_content_scope2.createContentScope)();
+  devicePolicy(deviceScope = this.settings.deviceContentScope || "follow-server", deviceBypass = this.settings.deviceMediaBypassExtensions || [], serverScope = this.settings.contentScope || "all", serverBypass = this.settings.serverMediaBypassExtensions || []) {
+    return (0, import_content_scope2.createContentScope)(
+      effectiveContentScope(serverScope, deviceScope),
+      effectiveMediaBypassExtensions(
+        serverScope,
+        deviceScope,
+        serverBypass,
+        deviceBypass
+      )
+    );
+  }
+  canShare(path) {
+    return this.fileScope.allowsPath(path);
+  }
+  rebuildFileScope() {
+    this.fileScope = this.devicePolicy();
+  }
+  getSharingDetails() {
+    const files = typeof this.app?.vault?.getFiles === "function" ? this.app.vault.getFiles() : [];
+    return { ...sharingSummary(
+      files,
+      this.settings.contentScope || "all",
+      this.settings.deviceContentScope || "follow-server",
+      this.settings.pending || [],
+      this.settings.pendingWrites || [],
+      this.settings.serverMediaBypassExtensions || [],
+      this.settings.deviceMediaBypassExtensions || []
+    ), emptyFolders: this.emptyLocalFolders().length };
+  }
+  emptyLocalFolders() {
+    const entries = typeof this.app?.vault?.getAllLoadedFiles === "function" ? this.app.vault.getAllLoadedFiles() : [];
+    return entries.filter(
+      (entry) => entry && typeof entry.path === "string" && isSyncablePath(entry.path) && Array.isArray(entry.children) && entry.children.length === 0
+    ).map((entry) => entry.path);
+  }
+  getServerMediaBypassExtensions() {
+    return (0, import_media_bypass2.normalizeMediaBypassExtensions)(
+      this.settings.serverMediaBypassExtensions || []
+    );
+  }
+  getDeviceMediaBypassExtensions() {
+    return (0, import_media_bypass2.normalizeMediaBypassExtensions)(
+      this.settings.deviceMediaBypassExtensions || []
+    );
+  }
+  async setDeviceMediaBypassExtensions(value) {
+    let proposed;
+    try {
+      proposed = (0, import_media_bypass2.normalizeMediaBypassExtensions)(value);
+    } catch {
+      return { ok: false, message: "Unsupported file extension selection." };
+    }
+    if (!this.ready())
+      return { ok: false, message: "Verify the Ignis connection before changing media bypass." };
+    if (this.syncing)
+      return { ok: false, message: "A sync is running. Retry when it finishes." };
+    const scope = this.settings.deviceContentScope || "follow-server";
+    if (scope !== "markdown-only")
+      return { ok: false, message: "Enable Keep attachments on this device to choose individual exceptions." };
+    const selected = effectiveMediaBypassExtensions(
+      this.settings.contentScope || "all",
+      scope,
+      this.settings.serverMediaBypassExtensions || [],
+      proposed
+    );
+    if (selected.length !== proposed.length)
+      return { ok: false, message: "The server has not authorized those file types. Ask the Mac owner to approve them." };
+    const target = this.devicePolicy(scope, proposed);
+    if ([...this.settings.pending || [], ...this.settings.pendingWrites || []].some((item) => !target.allowsPath(item.path) || "toPath" in item && typeof item.toPath === "string" && !target.allowsPath(item.toPath))) {
+      return { ok: false, message: "Unsent operations for excluded files need review first." };
+    }
+    const previous = [...this.settings.deviceMediaBypassExtensions || []];
+    this.settings.deviceMediaBypassExtensions = [...proposed];
+    this.rebuildFileScope();
+    try {
+      await this.persistSettings();
+    } catch {
+      this.settings.deviceMediaBypassExtensions = previous;
+      this.rebuildFileScope();
+      return { ok: false, message: "Could not save bypass; previous choice restored." };
+    }
+    this.schedule();
+    return { ok: true, message: proposed.length ? "Selected types now use IGNIS Sync independently of Syncthing (4 MiB maximum)." : "Document/media exceptions disabled on this device." };
+  }
+  async setDeviceContentScope(value) {
+    if (value !== "markdown-only" && value !== "follow-server") {
+      return { ok: false, message: "Unsupported device sharing preference." };
+    }
+    if (this.settings.deviceContentScope === value) {
+      return { ok: true, message: "Device sharing preference is unchanged." };
+    }
+    if (this.syncing) {
+      return { ok: false, message: "A sync is in progress. Retry this change after it finishes." };
+    }
+    const target = this.devicePolicy(value);
+    const previousEffective = effectiveContentScope(
+      this.settings.contentScope || "all",
+      this.settings.deviceContentScope || "follow-server"
+    );
+    const queued = [
+      ...this.settings.pending || [],
+      ...this.settings.pendingWrites || []
+    ];
+    const blocked = queued.filter(
+      (op) => !target.allowsPath(op.path) || op.toPath && !target.allowsPath(op.toPath)
+    );
+    if (blocked.length && (previousEffective !== target.mode || blocked.some((op) => this.fileScope.allowsPath(op.path) || op.toPath && this.fileScope.allowsPath(op.toPath)))) {
+      return { ok: false, message: blocked.length + " unsent attachment operation(s) require review. The previous setting was preserved." };
+    }
+    const previous = this.settings.deviceContentScope || "follow-server";
+    this.settings.deviceContentScope = value;
+    this.rebuildFileScope();
+    try {
+      await this.persistSettings();
+    } catch {
+      this.settings.deviceContentScope = previous;
+      this.rebuildFileScope();
+      return { ok: false, message: "Could not save the device preference. The previous setting was restored." };
+    }
+    this.schedule();
+    return { ok: true, message: value === "markdown-only" ? "Attachments stay on this device. Markdown remains shared." : "Using the server's allowed file types on this device." };
+  }
+  async recheckSharingScope() {
+    if (!this.ready()) {
+      return { ok: false, message: "Verify your Ignis connection before checking server sharing rules." };
+    }
+    if (this.syncing) {
+      return { ok: false, message: "Finish the current sync before rechecking the server's sharing rules." };
+    }
+    const scope = this.settings.scope;
+    const deviceId = this.settings.deviceId;
+    const vaultId = this.settings.vaultId;
+    const attempt = this.connectionAttempt;
+    try {
+      const reply = await this.deviceRequest(
+        "/vaults/" + encodeURIComponent(vaultId) + "/session"
+      );
+      const session = reply.json;
+      if (scope !== this.settings.scope || deviceId !== this.settings.deviceId || vaultId !== this.settings.vaultId || attempt !== this.connectionAttempt || session?.vaultId !== vaultId || session?.deviceId !== deviceId || !["all", "markdown-only"].includes(session.contentScope)) {
+        return { ok: false, message: "Server identity or sharing rules could not be verified; settings unchanged." };
+      }
+      let serverBypass;
+      try {
+        serverBypass = [...(0, import_media_bypass2.normalizeMediaBypassExtensions)(
+          session.mediaBypassExtensions || []
+        )];
+      } catch {
+        return { ok: false, message: "Server returned invalid file sharing exceptions; settings unchanged." };
+      }
+      const target = this.devicePolicy(
+        this.settings.deviceContentScope || "follow-server",
+        this.settings.deviceMediaBypassExtensions || [],
+        session.contentScope,
+        serverBypass
+      );
+      const pending = [
+        ...this.settings.pending || [],
+        ...this.settings.pendingWrites || []
+      ];
+      if (pending.some((item) => !target.allowsPath(item.path) || item.toPath && !target.allowsPath(item.toPath))) {
+        return { ok: false, message: "Unsent attachment operations conflict with the server's rules. Resolve those operations before changing the sharing scope." };
+      }
+      if (session.contentScope !== this.settings.contentScope || JSON.stringify(serverBypass) !== JSON.stringify(this.settings.serverMediaBypassExtensions || [])) {
+        const previousScope = this.settings.contentScope;
+        const previousBypass = this.settings.serverMediaBypassExtensions || [];
+        this.settings.contentScope = session.contentScope;
+        this.settings.serverMediaBypassExtensions = serverBypass;
+        this.rebuildFileScope();
+        try {
+          await this.persistSettings();
+        } catch {
+          this.settings.contentScope = previousScope;
+          this.settings.serverMediaBypassExtensions = previousBypass;
+          this.rebuildFileScope();
+          return { ok: false, message: "Could not save verified sharing rules; previous state retained." };
+        }
+        this.schedule();
+      }
+      return { ok: true, message: (session.contentScope === "markdown-only" ? "Server: Markdown only." : "Server: Markdown + small attachments.") + (this.settings.deviceContentScope === "markdown-only" ? " This device keeps attachments locally except selected bypass types." : "") + (serverBypass.length ? " Allowed bypass: " + serverBypass.join(", ") + "." : "") };
+    } catch {
+      return { ok: false, message: "Could not check current sharing rules. Local files remain unchanged." };
+    }
+  }
   incomingLink = "";
   token = "";
+  // Whether a verified *session* also has a verified restart-safe token.
+  credentialDurability = "verified";
   socket = null;
   syncing = false;
+  syncDrain = null;
+  releaseSyncDrain = null;
+  migrationBusy = false;
   queued = false;
   quiet = /* @__PURE__ */ new Set();
   status = null;
   collaborationRibbon = null;
+  mobileActions = null;
+  mobileConnection = null;
+  mobileConnectionDot = null;
+  mobileMenu = null;
+  migrationModal = null;
+  undoReviewModal = null;
+  unmountMobileNavbar = null;
   statusText = "Not connected";
   timer = null;
   lastError = "";
@@ -11619,6 +13978,21 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   retryCount = 0;
   persistTail = Promise.resolve();
   connectionAttempt = 0;
+  // Highest durable server sequence evidenced by this client's operation
+  // receipts. A manifest below this frontier cannot certify a full sync.
+  latestOperationReceipt = null;
+  // Explanations are a projection of durable pending opIds, not another
+  // authority. Recomputed on replay after restart; never used to drop data.
+  outboundFailures = /* @__PURE__ */ new Map();
+  historyHold = null;
+  observeOperationReceipt(seq) {
+    const scope = this.settings.scope;
+    const previous = this.latestOperationReceipt;
+    this.latestOperationReceipt = {
+      scope,
+      seq: previous?.scope === scope ? Math.max(previous.seq, seq) : seq
+    };
+  }
   persistSettings() {
     const snapshot = JSON.parse(JSON.stringify(this.settings));
     const next = this.persistTail.catch(() => {
@@ -11631,17 +14005,27 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings = {
       ...DEFAULT,
       ...saved,
+      contentScope: saved?.contentScope === "markdown-only" ? "markdown-only" : "all",
+      deviceContentScope: saved?.deviceContentScope === "markdown-only" ? "markdown-only" : "follow-server",
+      serverMediaBypassExtensions: safeBypassList(saved?.serverMediaBypassExtensions),
+      deviceMediaBypassExtensions: safeBypassList(saved?.deviceMediaBypassExtensions),
       displayName: normalizeDisplayName(
         typeof saved?.displayName === "string" ? saved.displayName : ""
       ),
       baselines: saved?.baselines || {},
+      journalLineage: typeof saved?.journalLineage === "string" ? saved.journalLineage : "",
+      journalProof: typeof saved?.journalProof === "string" ? saved.journalProof : "",
+      tombstoneProofs: saved?.tombstoneProofs || {},
       pending: saved?.pending || [],
       pendingWrites: saved?.pendingWrites || [],
       applyRemoteDeletes: saved?.applyRemoteDeletes === true,
       syncIssues: saved?.syncIssues || [],
+      undoReviews: Array.isArray(saved?.undoReviews) ? saved.undoReviews.filter((entry) => typeof entry?.scope === "string" && typeof entry?.path === "string" && typeof entry?.deleted === "string" && entry.deleted.length <= MAX_FILE_BYTES && (entry?.operation === "undo" || entry?.operation === "redo") && (entry?.reason === "boundary-removed" || entry?.reason === "target-changed") && typeof entry?.context === "string" && (entry?.documentId === null || typeof entry?.documentId === "string") && typeof entry?.capturedAt === "number") : [],
+      migrations: saved?.migrations || {},
       yjsIds: saved?.yjsIds || {},
       archivedScopes: saved?.archivedScopes || []
     };
+    this.rebuildFileScope();
     if (!this.settings.scope && this.settings.serverUrl && this.settings.vaultId) {
       try {
         this.settings.scope = this.currentScope();
@@ -11653,6 +14037,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       origin: () => this.settings.serverUrl,
       pathForView: (view) => view.state.field(import_obsidian.editorInfoField, false)?.file?.path || null,
       knownId: (path) => this.settings.yjsIds[path] || null,
+      fileBaseline: (path) => this.settings.baselines[path] || null,
       rememberId: async (path, id2) => {
         this.settings.yjsIds[path] = id2;
         await this.persistSettings();
@@ -11660,13 +14045,24 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       displayName: () => this.getDisplayName(),
       mobile: import_obsidian.Platform.isMobile,
       send: (message) => {
-        if (this.socket?.readyState === WebSocket.OPEN) {
+        if (!this.historyHold && this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify(message));
         }
       },
       notify: (path, status) => {
         this.lastError = path + ": " + status;
-        this.showStatus(status);
+        if (/\b(?:Undo|Redo) needs review\b/.test(status)) {
+          this.rememberUndoReviews();
+          new import_obsidian.Notice(mobileUiLanguage() === "ja" ? "\u5143\u306B\u623B\u3059\u4F4D\u7F6E\u3092\u78BA\u5B9A\u3067\u304D\u307E\u305B\u3093\u3002Ignis\u306E\u5171\u540C\u7DE8\u96C6\u8005\u304B\u3089\u64CD\u4F5C\u3092\u78BA\u8A8D\u3067\u304D\u307E\u3059\u3002" : "Cannot safely place the edit. Open Ignis collaborators to review.", 7e3);
+          this.showStatus(this.statusText);
+        } else {
+          this.showStatus(status);
+        }
+      },
+      compositionChanged: (path) => {
+        if (this.app.workspace.getActiveFile()?.path === path) {
+          this.renderStatus();
+        }
       }
     });
     this.registerEditorExtension(this.live.extension());
@@ -11679,16 +14075,33 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       "Ignis collaborators and display name",
       () => this.openCollaborators()
     );
+    this.addRibbonIcon("upload", "Import files to this Obsidian Vault", () => this.openFilePicker());
+    if (import_obsidian.Platform.isMobile)
+      this.createMobileActions();
     this.showStatus(this.statusText);
+    this.registerEvent(this.app.workspace.on(
+      "active-leaf-change",
+      () => this.renderStatus()
+    ));
     this.addCommand({
       id: "show-collaborators",
       name: "Show collaborators and display name",
       callback: () => this.openCollaborators()
     });
     this.addCommand({
+      id: "review-undo",
+      name: "Review pending Undo / Redo edits",
+      callback: () => this.openUndoReview()
+    });
+    this.addCommand({
       id: "change-display-name",
       name: "Change my Ignis display name",
       callback: () => this.openDisplayName()
+    });
+    this.addCommand({
+      id: "import-files-to-vault",
+      name: "Import files into this Obsidian Vault",
+      callback: () => this.openFilePicker()
     });
     this.registerObsidianProtocolHandler("ignis-connector", (params2) => {
       if (typeof params2.link !== "string")
@@ -11718,12 +14131,17 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       callback: () => this.openSyncIssues()
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof import_obsidian.TFile && isSyncablePath(file.path) && !this.quiet.has(file.path)) {
+      if (file instanceof import_obsidian.TFile && this.canShare(file.path) && !this.quiet.has(file.path)) {
+        this.schedule();
+      }
+    }));
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (file instanceof import_obsidian.TFile && this.canShare(file.path) && !this.quiet.has(file.path)) {
         this.schedule();
       }
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(oldPath) || !isSyncablePath(file.path))
+      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !this.canShare(oldPath) || !this.canShare(file.path))
         return;
       if (!this.live.relocate(oldPath, file.path))
         return;
@@ -11741,7 +14159,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       void this.persistSettings().then(() => this.schedule());
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !isSyncablePath(file.path))
+      if (!(file instanceof import_obsidian.TFile) || this.quiet.has(file.path) || !this.canShare(file.path))
         return;
       queueDelete(this.settings, file.path, crypto.randomUUID());
       void this.persistSettings().then(() => this.schedule());
@@ -11754,10 +14172,13 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     });
     this.registerDomEvent(window, "pageshow", () => this.recoverConnection());
     this.registerDomEvent(window, "online", () => this.recoverConnection());
-    this.token = this.getSavedSecret();
+    this.token = await this.getSavedSecret();
+    this.credentialDurability = this.token ? "verified" : "session-only";
     if (this.ready()) {
       this.connectSocket();
       this.schedule();
+    } else if (this.settings.vaultId && this.settings.serverUrl && this.settings.authMode === "device") {
+      this.showStatus("Reconnect \xB7 device token required \xB7 local notes retained");
     }
   }
   takeIncomingLink() {
@@ -11785,11 +14206,421 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   openCollaborators() {
     new CollaboratorsModal(this.app, this).open();
   }
+  getUndoReviews() {
+    const scope = this.settings?.scope;
+    const reviews = /* @__PURE__ */ new Map();
+    for (const stored of this.settings?.undoReviews || []) {
+      if (stored.scope === scope) {
+        reviews.set([stored.path, stored.documentId, stored.operation].join("|"), stored);
+      }
+    }
+    for (const review of this.live?.pendingUndoReviews?.() || []) {
+      reviews.set([review.path, review.documentId, review.operation].join("|"), review);
+    }
+    return [...reviews.values()];
+  }
+  rememberUndoReviews() {
+    const scope = this.settings.scope;
+    if (!scope)
+      return;
+    const reviews = this.live?.pendingUndoReviews?.() || [];
+    if (!reviews.length)
+      return;
+    const current = this.settings.undoReviews || [];
+    const retained = current.filter((entry) => !reviews.some((review) => review.path === entry.path && review.documentId === entry.documentId && review.operation === entry.operation && entry.scope === scope));
+    this.settings.undoReviews = [
+      ...retained,
+      ...reviews.map((review) => ({ ...review, scope, capturedAt: Date.now() }))
+    ];
+    void this.persistSettings().catch(() => {
+      new import_obsidian.Notice("Ignis could not save the Undo review. Copy its text before closing Obsidian.");
+    });
+  }
+  dismissUndoReview(review) {
+    const scope = this.settings?.scope;
+    const previous = this.settings?.undoReviews || [];
+    const retained = previous.filter((entry) => !(entry.scope === scope && entry.path === review.path && entry.documentId === review.documentId && entry.operation === review.operation));
+    const removedSaved = retained.length !== previous.length;
+    const removedLive = this.live?.dismissUndoReview?.(review.path, review.documentId) || false;
+    if (!removedSaved && !removedLive)
+      return false;
+    this.settings.undoReviews = retained;
+    void this.persistSettings().catch(() => new import_obsidian.Notice("Could not save the acknowledgement. Review may reappear after restart."));
+    this.showStatus(this.statusText);
+    return true;
+  }
+  openUndoReview() {
+    if (!this.getUndoReviews().length) {
+      new import_obsidian.Notice(mobileUiLanguage() === "ja" ? "\u78BA\u8A8D\u304C\u5FC5\u8981\u306AUndo\u30FBRedo\u306F\u3042\u308A\u307E\u305B\u3093\u3002" : "No Undo or Redo edits need review.");
+      return;
+    }
+    if (this.undoReviewModal) {
+      this.undoReviewModal.refresh();
+      return;
+    }
+    this.undoReviewModal = new UndoReviewModal(this.app, this);
+    this.undoReviewModal.open();
+  }
+  undoReviewModalClosed(modal) {
+    if (this.undoReviewModal === modal)
+      this.undoReviewModal = null;
+  }
   getCurrentStatus() {
-    return this.statusText;
+    const currentPath = this.app?.workspace?.getActiveFile?.()?.path || null;
+    const composition = this.live?.compositionState?.(currentPath);
+    const count2 = this.getUndoReviews().length;
+    const status = this.historyHold ? journalHoldMessage(this.historyHold) : composition?.composing ? this.statusText.replace(
+      /^(?:Synced · server acknowledged|Server persisted collaborative edits)$/,
+      "Server has received provisional text"
+    ) + " \xB7 IME not confirmed" + (composition.peerEditWaiting ? " \xB7 peer edit waiting" : "") : this.statusText;
+    const credentialWarning = this.ready() && this.settings.authMode === "device" && this.credentialDurability !== "verified" ? " \xB7 device token not saved" : "";
+    return status + credentialWarning + (count2 ? mobileUiLanguage() === "ja" ? " \xB7 Undo/Redo " + count2 + "\u4EF6\u3092\u78BA\u8A8D" : " \xB7 " + count2 + " Undo/Redo need review" : "");
+  }
+  createMobileActions() {
+    const action = document.createElement("div");
+    action.className = "mobile-navbar-action ignis-connector-navbar-action";
+    action.style.position = "relative";
+    action.style.minWidth = "36px";
+    const connection = document.createElement("button");
+    connection.type = "button";
+    connection.className = "ignis-connector-navbar-trigger";
+    connection.setAttribute("aria-haspopup", "dialog");
+    Object.assign(connection.style, {
+      position: "relative",
+      border: "0",
+      padding: "0",
+      background: "transparent",
+      color: "var(--text-normal)",
+      touchAction: "manipulation",
+      width: "100%",
+      height: "100%",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center"
+    });
+    (0, import_obsidian.setIcon)(connection, "flame");
+    const dot = document.createElement("span");
+    Object.assign(dot.style, {
+      position: "absolute",
+      top: "calc(50% - 20px)",
+      left: "calc(50% + 8px)",
+      width: "9px",
+      height: "9px",
+      borderRadius: "50%",
+      border: "2px solid var(--background-primary)",
+      background: "var(--text-muted)",
+      pointerEvents: "none"
+    });
+    dot.setAttribute("aria-hidden", "true");
+    connection.appendChild(dot);
+    connection.addEventListener("click", () => {
+      this.mobileMenu?.close();
+      this.mobileMenu = new NativeMobileActionsModal(
+        this.app,
+        () => nativeConnectionState(
+          this.getCurrentStatus(),
+          this.ready(),
+          this.socket?.readyState === WebSocket.OPEN,
+          mobileUiLanguage()
+        ).label,
+        () => this.openFilePicker(),
+        () => this.openCollaborators()
+      );
+      this.mobileMenu.open();
+    });
+    action.appendChild(connection);
+    this.unmountMobileNavbar = mountMobileNavbarAction(action);
+    this.mobileActions = action;
+    this.mobileConnection = connection;
+    this.mobileConnectionDot = dot;
+  }
+  openFilePicker() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.className = "ignis-native-upload-input";
+    input.setAttribute("aria-label", "Choose files for Obsidian Vault");
+    Object.assign(input.style, {
+      position: "fixed",
+      width: "1px",
+      height: "1px",
+      opacity: "0",
+      left: "-100px",
+      top: "0"
+    });
+    const cleanup = () => input.remove();
+    input.addEventListener("cancel", cleanup, { once: true });
+    input.addEventListener("change", async () => {
+      const files = Array.from(input.files || []);
+      if (!files.length) {
+        cleanup();
+        return;
+      }
+      try {
+        new import_obsidian.Notice("Importing " + files.length + " file(s) into Obsidian\u2026");
+        const outcome = await importNativeFiles(
+          this.app.vault,
+          files,
+          isSyncablePath,
+          MAX_FILE_BYTES
+        );
+        if (outcome.imported) {
+          this.showStatus(this.ready() ? "Syncing" : "Pending \xB7 locally retained");
+          this.schedule();
+          new import_obsidian.Notice("Imported " + outcome.imported + " file(s)." + (effectiveContentScope(
+            this.settings.contentScope,
+            this.settings.deviceContentScope || "follow-server"
+          ) === "markdown-only" ? " Markdown files sync; attachments stay on this device." : " Ignis sync queued."));
+        }
+        if (outcome.failed || outcome.tooLarge) {
+          new import_obsidian.Notice("Skipped " + (outcome.failed + outcome.tooLarge) + " file(s); Ignis Sync supports attachments up to 4 MiB.", 6e3);
+        }
+      } finally {
+        cleanup();
+      }
+    });
+    document.body.appendChild(input);
+    input.click();
   }
   openSyncIssues() {
-    new SyncIssuesModal(this.app, this.settings.syncIssues, this.lastError).open();
+    const queued = [
+      ...(this.settings.pending || []).map((operation) => ({
+        path: operation.path,
+        reason: "Unsent " + operation.type + (operation.toPath ? " to " + operation.toPath : "") + (this.outboundFailures.has(operation.opId) ? "; server conflict: " + this.outboundFailures.get(operation.opId) + ". Local operation retained for review." : "; retained until the server acknowledges it.")
+      })),
+      ...(this.settings.pendingWrites || []).map((operation) => ({
+        path: operation.path,
+        reason: "Unsent " + operation.type + (this.outboundFailures.has(operation.opId) ? "; server conflict: " + this.outboundFailures.get(operation.opId) + ". Staged bytes retained for review." : "; staged bytes are retained for safe retry.")
+      }))
+    ];
+    const issues = [...this.settings.syncIssues || [], ...queued];
+    if (this.migrationModal) {
+      this.migrationModal.refresh(issues, this.lastError);
+      return;
+    }
+    this.migrationModal = new MigrationModal(this.app, this, issues, this.lastError);
+    this.migrationModal.open();
+  }
+  migrationModalClosed(modal) {
+    if (this.migrationModal === modal)
+      this.migrationModal = null;
+  }
+  getMigrationIssues() {
+    const issues = [...this.settings.syncIssues || []];
+    const seen = new Set(issues.map((issue) => issue.path));
+    for (const path of this.live.blockingPaths()) {
+      if (!seen.has(path)) {
+        issues.push({ path, reason: "Live editor blocked; local draft retained" });
+      }
+    }
+    return issues.filter((issue) => migrationNeedsPreservation(issue.reason));
+  }
+  getPreservedMigration(path) {
+    const record = this.settings.migrations?.[path];
+    return record?.scope === this.settings.scope ? record : void 0;
+  }
+  async snapshotMigrationSource(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian.TFile))
+      throw new Error("Local version is no longer available");
+    let data;
+    if (isMarkdown(path)) {
+      const pane = this.app.workspace.getLeavesOfType("markdown").find((leaf) => leaf.view.file?.path === path);
+      const editor = pane?.view?.editor;
+      data = typeof editor?.getValue === "function" ? editor.getValue() : await this.app.vault.read(file);
+    } else {
+      data = await this.app.vault.readBinary(file);
+    }
+    const bytes = typeof data === "string" ? textEncoder.encode(data) : new Uint8Array(data);
+    if (bytes.byteLength > MAX_FILE_BYTES) {
+      throw new Error("This version exceeds the 4 MiB sync limit; local original is retained");
+    }
+    return { data, hash: await sha256(bytes) };
+  }
+  async ensureMigrationCopy(original, role, identity, value, digest, remoteFiles) {
+    for (let index = 0; index < 100; index++) {
+      const candidate = migrationVersionPath(original, role, identity, digest, index);
+      if (!this.canShare(candidate))
+        throw new Error("Saved version is outside the sharing policy");
+      const local = this.app.vault.getAbstractFileByPath(candidate);
+      const remote = remoteFiles.find((file) => file.path === candidate);
+      if (local && !(local instanceof import_obsidian.TFile))
+        continue;
+      if (local && await this.localHash(local) !== digest)
+        continue;
+      if (remote && remote.hash !== digest)
+        continue;
+      if (!local) {
+        await this.writeLocal(candidate, value);
+      }
+      const saved = this.app.vault.getAbstractFileByPath(candidate);
+      if (!(saved instanceof import_obsidian.TFile) || await this.localHash(saved) !== digest) {
+        throw new Error("Could not verify the saved local copy: " + candidate);
+      }
+      if (remote) {
+        this.saveBase(candidate, remote);
+        await this.persistSettings();
+      } else {
+        await this.stageAndSend("create", saved);
+      }
+      if (this.settings.baselines[candidate]?.hash !== digest) {
+        throw new Error("Server has not acknowledged the saved version");
+      }
+      return candidate;
+    }
+    throw new Error("Could not allocate an independent version filename");
+  }
+  async previewMigration(path) {
+    if (!this.ready() || !this.canShare(path)) {
+      throw new Error("Verify the Vault connection before comparing versions");
+    }
+    const manifest = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/manifest");
+    const remote = manifest.files.find((file) => file.path === path) || null;
+    const localFile = this.app.vault.getAbstractFileByPath(path);
+    const local = localFile instanceof import_obsidian.TFile ? await this.snapshotMigrationSource(path) : null;
+    const remoteBytes = remote ? await this.remoteBytes(remote) : null;
+    return {
+      local: local && typeof local.data === "string" ? local.data : null,
+      remote: remoteBytes && isMarkdown(path) ? new TextDecoder().decode(remoteBytes) : null,
+      sourceHash: local?.hash || null,
+      remoteHash: remote?.hash || null,
+      saved: local && isMigrationRecordCurrent(
+        this.settings.migrations?.[path],
+        this.settings.scope,
+        local.hash,
+        remote
+      ) ? this.settings.migrations[path] : null
+    };
+  }
+  async withMigrationLock(work) {
+    while (this.syncing) {
+      const active = this.syncDrain;
+      if (!active)
+        throw new Error("Cannot verify completion of the active sync");
+      await active;
+    }
+    if (this.migrationBusy) {
+      throw new Error("Another version preservation operation is in progress");
+    }
+    this.migrationBusy = true;
+    try {
+      return await work();
+    } finally {
+      this.migrationBusy = false;
+      if (this.queued) {
+        this.queued = false;
+        this.schedule();
+      }
+    }
+  }
+  async preserveMigration(path) {
+    return this.withMigrationLock(() => this.preserveMigrationUnlocked(path));
+  }
+  async preserveMigrationUnlocked(path) {
+    if (this.historyHold) {
+      throw new Error("Server history is not verified. Restore or reconnect to the original journal before saving copies.");
+    }
+    if (!this.ready() || !this.canShare(path) || this.syncing || this.settings.pending.some((operation) => operation.path === path || operation.toPath === path)) {
+      throw new Error("Connection or a rename/delete of this document is busy; retry after sync");
+    }
+    if (!this.getMigrationIssues().some((issue) => issue.path === path)) {
+      throw new Error("No unresolved collision on this path");
+    }
+    const source = await this.snapshotMigrationSource(path);
+    const manifest = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/manifest");
+    const remote = manifest.files.find((file) => file.path === path) || null;
+    const existing = this.settings.migrations?.[path];
+    const verifiedCopy = async (copyPath, expected) => {
+      const file = this.app.vault.getAbstractFileByPath(copyPath);
+      const serverCopy = manifest.files.find((item) => item.path === copyPath);
+      return file instanceof import_obsidian.TFile && await this.localHash(file) === expected && serverCopy?.hash === expected && this.settings.baselines[copyPath]?.hash === expected;
+    };
+    if (isMigrationRecordCurrent(existing, this.settings.scope, source.hash, remote) && await verifiedCopy(existing.sourceCopy, source.hash) && (!remote || existing.remoteCopy && await verifiedCopy(existing.remoteCopy, remote.hash))) {
+      return existing;
+    }
+    const remoteData = remote ? await this.remoteBytes(remote) : null;
+    const sourceCopy = await this.ensureMigrationCopy(
+      path,
+      "device",
+      this.settings.deviceId,
+      source.data,
+      source.hash,
+      manifest.files
+    );
+    const remoteCopy = remote && remoteData ? await this.ensureMigrationCopy(
+      path,
+      "server",
+      remote.generationId,
+      isMarkdown(path) ? new TextDecoder().decode(remoteData) : remoteData,
+      remote.hash,
+      manifest.files
+    ) : null;
+    const record = {
+      scope: this.settings.scope,
+      path,
+      sourceHash: source.hash,
+      sourceCopy,
+      remoteHash: remote?.hash || null,
+      remoteCopy,
+      remoteFileId: remote?.fileId || null,
+      remoteGenerationId: remote?.generationId || null
+    };
+    this.settings.migrations ||= {};
+    this.settings.migrations[path] = record;
+    await this.persistSettings();
+    return record;
+  }
+  async finishMigration(path) {
+    return this.withMigrationLock(() => this.finishMigrationUnlocked(path));
+  }
+  async finishMigrationUnlocked(path) {
+    if (this.historyHold) {
+      throw new Error("Server history is not verified. The previous originals remain protected.");
+    }
+    const record = this.settings.migrations?.[path];
+    if (!record || record.scope !== this.settings.scope || !record.remoteFileId || !record.remoteCopy || this.syncing || !this.ready() || this.openInEditor(path) || this.live.isManaged(path)) {
+      throw new Error("Save both versions and close the original editor first");
+    }
+    const original = await this.snapshotMigrationSource(path);
+    const backup = this.app.vault.getAbstractFileByPath(record.sourceCopy);
+    const remoteBackup = this.app.vault.getAbstractFileByPath(record.remoteCopy);
+    if (original.hash !== record.sourceHash || !(backup instanceof import_obsidian.TFile) || !(remoteBackup instanceof import_obsidian.TFile) || await this.localHash(backup) !== record.sourceHash || await this.localHash(remoteBackup) !== record.remoteHash || this.settings.baselines[record.sourceCopy]?.hash !== record.sourceHash || this.settings.baselines[record.remoteCopy]?.hash !== record.remoteHash) {
+      throw new Error("A version changed; save both again before migrating");
+    }
+    const manifest = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/manifest");
+    const remote = manifest.files.find((file) => file.path === path);
+    const serverSourceCopy = manifest.files.find((file) => file.path === record.sourceCopy);
+    const serverRemoteCopy = manifest.files.find((file) => file.path === record.remoteCopy);
+    if (!remote || !isMigrationRecordCurrent(
+      record,
+      this.settings.scope,
+      original.hash,
+      remote
+    ) || serverSourceCopy?.hash !== record.sourceHash || serverRemoteCopy?.hash !== record.remoteHash) {
+      throw new Error("Server version changed; preserve the new version first");
+    }
+    await this.retireObsoleteStages(path);
+    const afterRetirement = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/manifest");
+    const stillCurrent = afterRetirement.files.find((file) => file.path === path);
+    if (!stillCurrent || !isMigrationRecordCurrent(
+      record,
+      this.settings.scope,
+      original.hash,
+      stillCurrent
+    )) {
+      throw new Error("Server original changed during migration; copies retained for review");
+    }
+    const data = await this.remoteBytes(remote);
+    await this.live.retireDocument?.(path);
+    await this.writeLocal(path, isMarkdown(path) ? new TextDecoder().decode(data) : data);
+    const changed = this.app.vault.getAbstractFileByPath(path);
+    if (!(changed instanceof import_obsidian.TFile) || await this.localHash(changed) !== remote.hash) {
+      throw new Error("Server original could not be verified after migration");
+    }
+    delete this.settings.yjsIds[path];
+    this.saveBase(path, remote);
+    await this.persistSettings();
+    this.schedule();
   }
   currentParticipants() {
     const path = this.app.workspace.getActiveFile()?.path || null;
@@ -11802,6 +14633,13 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     return this.live.jumpToParticipant(path, id2);
   }
   onunload() {
+    this.migrationModal?.close();
+    this.migrationModal = null;
+    this.undoReviewModal?.close();
+    this.undoReviewModal = null;
+    this.mobileMenu?.close();
+    this.unmountMobileNavbar?.();
+    this.mobileActions = null;
     this.stopped = true;
     this.live.disconnected();
     void this.live.dispose();
@@ -11811,11 +14649,15 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     if (this.reconnectTimer !== null)
       window.clearTimeout(this.reconnectTimer);
   }
-  getSavedSecret() {
+  async getSavedSecret() {
     const secrets = this.app.secretStorage;
     if (!secrets || !this.settings.vaultId || !this.matchesScope())
       return "";
-    return secrets.getSecret(SECRET_PREFIX + this.settings.scope) || "";
+    try {
+      return secrets.getSecret(await scopedSecretId(this.settings.scope)) || "";
+    } catch {
+      return "";
+    }
   }
   async connectToServer(draft) {
     const attempt = ++this.connectionAttempt;
@@ -11865,7 +14707,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         headers: token ? { Authorization: "Bearer " + token } : {}
       });
       let response = await verify(selectedToken);
-      const fallback = target.scope === this.settings.scope ? this.token || this.getSavedSecret() : "";
+      const fallback = target.scope === this.settings.scope ? this.token || await this.getSavedSecret() : "";
       if (response.status === 401 && !selectedToken && /^ignis_dev_[A-Za-z0-9_-]{43}$/.test(fallback)) {
         selectedToken = fallback;
         response = await verify(selectedToken);
@@ -11875,8 +14717,27 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         return { ok: false, message: response.status === 401 && !selectedToken ? "Tailscale identity was not recognized for this Vault. Check Tailscale, or use a device token under Advanced settings." : error };
       }
       session = response.json;
+      if (!session.journalLineage) {
+        if (!switching && this.settings.journalLineage) {
+          await this.pauseJournal("unsupported");
+        }
+        return {
+          ok: false,
+          message: "Ignis Server must be updated before a safe synchronization connection. Local files remain unchanged."
+        };
+      }
       if (!selectedToken && session.auth !== "tailnet") {
         return { ok: false, message: "Server did not confirm Tailscale authentication." };
+      }
+      if (session.contentScope !== void 0 && !["all", "markdown-only"].includes(session.contentScope)) {
+        return { ok: false, message: "Server returned an unsupported content scope." };
+      }
+      if (session.mediaBypassExtensions !== void 0) {
+        try {
+          (0, import_media_bypass2.normalizeMediaBypassExtensions)(session.mediaBypassExtensions);
+        } catch {
+          return { ok: false, message: "Server returned unsupported media bypass extensions." };
+        }
       }
     } catch {
       return {
@@ -11887,6 +14748,20 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     if (this.stopped || attempt !== this.connectionAttempt) {
       return { ok: false, message: "The connection check was interrupted. Try again." };
     }
+    if (!switching && this.settings.journalLineage && session.journalLineage !== this.settings.journalLineage) {
+      await this.pauseJournal("changed");
+      return { ok: false, message: journalHoldExplanation("changed") };
+    }
+    const incomingScope = session.contentScope || "all";
+    if (incomingScope !== this.settings.contentScope && !switching) {
+      const ineligible = [
+        ...(this.settings.pending || []).map((entry) => entry.path),
+        ...(this.settings.pendingWrites || []).map((entry) => entry.path)
+      ].filter((file) => !(0, import_content_scope2.createContentScope)(incomingScope).allowsPath(file));
+      if (ineligible.length) {
+        return { ok: false, message: "The server's file scope changed while local operations are pending. Review unsent files before switching." };
+      }
+    }
     const oldSocket = this.socket;
     this.socket = null;
     oldSocket?.close();
@@ -11894,7 +14769,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     if (switching) {
       this.settings.archivedScopes.push({
         scope: this.settings.scope,
+        journalLineage: this.settings.journalLineage,
+        journalProof: this.settings.journalProof,
         cursor: this.settings.cursor,
+        tombstoneProofs: this.settings.tombstoneProofs,
         baselines: this.settings.baselines,
         pending: this.settings.pending,
         pendingWrites: this.settings.pendingWrites,
@@ -11902,6 +14780,9 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         yjsIds: this.settings.yjsIds
       });
       this.settings.cursor = 0;
+      this.settings.journalLineage = "";
+      this.settings.journalProof = "";
+      this.settings.tombstoneProofs = {};
       this.settings.baselines = {};
       this.settings.pending = [];
       this.settings.pendingWrites = [];
@@ -11912,19 +14793,25 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings.authMode = selectedToken ? "device" : "tailnet";
     this.settings.vaultId = target.vaultId;
     this.settings.scope = target.scope;
+    if (switching || !this.settings.journalLineage && this.settings.cursor === 0 && !Object.keys(this.settings.baselines).length && !Object.keys(this.settings.yjsIds).length) {
+      this.settings.journalLineage = session.journalLineage;
+    }
     this.settings.deviceId = session.deviceId;
+    this.settings.contentScope = incomingScope;
+    this.settings.serverMediaBypassExtensions = [
+      ...(0, import_media_bypass2.normalizeMediaBypassExtensions)(session.mediaBypassExtensions || [])
+    ];
+    this.rebuildFileScope();
     this.token = selectedToken;
     if (switching)
       await this.live.resetForConnection();
-    const secrets = this.app.secretStorage;
-    let memoryOnly = !!selectedToken && !secrets?.setSecret;
-    if (selectedToken && secrets?.setSecret) {
-      try {
-        await secrets.setSecret(SECRET_PREFIX + target.scope, selectedToken);
-      } catch {
-        memoryOnly = true;
-      }
-    }
+    const durability = selectedToken ? await persistScopedDeviceCredential(
+      this.app.secretStorage,
+      await scopedSecretId(target.scope),
+      selectedToken
+    ) : "verified";
+    const memoryOnly = durability !== "verified";
+    this.credentialDurability = durability;
     await this.persistSettings();
     this.authBlocked = false;
     this.needsReload = false;
@@ -11934,7 +14821,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.showStatus("Connected \xB7 " + target.vaultId);
     return {
       ok: true,
-      message: (selectedToken ? "Connected" : "Connected through Tailscale") + " to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (memoryOnly ? ". Device token is held only until Obsidian closes." : "."),
+      message: (selectedToken ? "Connected" : "Connected through Tailscale") + " to " + target.vaultId + " as " + (session.label || session.deviceId.slice(0, 8)) + (durability === "session-only" ? ". Secure storage did not confirm the token; keep a safe copy for reconnecting after restart." : durability === "unverified" ? ". Token storage could not be verified across restart; keep a safe copy." : ".") + (effectiveContentScope(
+        incomingScope,
+        this.settings.deviceContentScope || "follow-server"
+      ) === "markdown-only" ? " Markdown-only sharing; images and videos stay local." : ""),
       memoryOnly
     };
   }
@@ -11947,6 +14837,32 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       vaultId: this.settings.vaultId,
       deviceId: this.settings.deviceId
     };
+  }
+  journalRecoveryInfo() {
+    return this.historyHold ? {
+      message: journalHoldMessage(this.historyHold),
+      explanation: journalHoldExplanation(this.historyHold)
+    } : null;
+  }
+  async recheckJournal() {
+    if (!this.ready())
+      return {
+        ok: false,
+        message: "Verify the Vault connection before checking server history."
+      };
+    try {
+      const manifest = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/manifest");
+      if (!await this.verifyJournal(manifest, this.settings.cursor)) {
+        return { ok: false, message: this.journalRecoveryInfo()?.explanation || "Server history is not verified. Local originals are retained." };
+      }
+      if (!this.socket)
+        this.connectSocket();
+      this.schedule();
+      return { ok: true, message: "Server history verified. Checking pending files and collaborative save receipts." };
+    } catch {
+      this.showStatus(this.historyHold ? journalHoldMessage(this.historyHold) : "Offline \xB7 local Vault retained");
+      return { ok: false, message: this.authBlocked ? "The server rejected this device identity. Reauthorize the Connector; local originals and pending work are retained." : "Cannot reach the server to verify its history. Local files are unchanged." };
+    }
   }
   currentScope() {
     return validServerUrl(this.settings.serverUrl) + "|" + this.settings.vaultId;
@@ -11963,10 +14879,43 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   }
   showStatus(status) {
     this.statusText = status;
-    if (this.status)
-      this.status.setText("Ignis: " + status);
-    this.collaborationRibbon?.setAttribute("aria-label", "Ignis: " + status + " \xB7 open collaborators and sync status");
-    this.collaborationRibbon?.setAttribute("title", "Ignis: " + status);
+    this.renderStatus();
+  }
+  renderStatus() {
+    const shown = this.getCurrentStatus();
+    const path = this.app?.workspace?.getActiveFile?.()?.path || null;
+    const composition = this.live?.compositionState?.(path);
+    const compact = this.historyHold ? shown : composition?.composing ? mobileUiLanguage() === "ja" ? composition.peerEditWaiting ? "\u7AF6\u5408\u4FDD\u7559\u4E2D \xB7 IME\u672A\u78BA\u5B9A" : "IME\u5909\u63DB\u4E2D \xB7 \u672A\u78BA\u5B9A" : composition.peerEditWaiting ? "Peer edit waiting \xB7 IME draft" : "IME draft \xB7 not confirmed" : shown;
+    if (this.status) {
+      this.status.setText("Ignis: " + compact);
+      this.status.setAttribute?.("aria-label", "Ignis: " + shown);
+      this.status.setAttribute?.("title", "Ignis: " + shown);
+    }
+    this.collaborationRibbon?.setAttribute("aria-label", "Ignis: " + shown + " \xB7 open collaborators and sync status");
+    this.collaborationRibbon?.setAttribute("title", "Ignis: " + shown);
+    if (this.mobileConnection) {
+      const projection = nativeConnectionState(
+        shown,
+        this.ready(),
+        this.socket?.readyState === WebSocket.OPEN,
+        mobileUiLanguage()
+      );
+      this.mobileActions?.setAttribute("data-connection", projection.kind);
+      this.mobileConnection.setAttribute(
+        "aria-label",
+        "Ignis: " + projection.label + " \xB7 " + mobileUiCopy().openActions
+      );
+      this.mobileConnection.setAttribute("title", "Ignis: " + shown);
+      if (this.mobileConnectionDot) {
+        this.mobileConnectionDot.style.backgroundColor = {
+          connected: "#28a46e",
+          syncing: "#d3a440",
+          offline: "var(--text-muted)",
+          error: "#da5b5b"
+        }[projection.kind];
+      }
+      this.mobileMenu?.refreshStatus();
+    }
   }
   schedule() {
     if (this.timer !== null)
@@ -11986,6 +14935,11 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       throw: false,
       headers: {
         ...this.settings.authMode !== "tailnet" ? { Authorization: "Bearer " + this.token } : {},
+        ...method !== "GET" && this.settings.journalLineage ? { "X-Ignis-Journal-Lineage": this.settings.journalLineage } : {},
+        ...method !== "GET" && this.settings.journalLineage && /^[a-f0-9]{64}$/.test(this.settings.journalProof || "") && Number.isSafeInteger(this.settings.cursor) ? {
+          "X-Ignis-Journal-Cursor": String(this.settings.cursor),
+          "X-Ignis-Journal-Proof": this.settings.journalProof
+        } : {},
         ...body ? { "Content-Type": "application/json" } : {}
       },
       ...body ? { body: JSON.stringify(body) } : {}
@@ -11998,7 +14952,13 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       throw new Error("Sync device authorization rejected");
     }
     if (response.status >= 400 && !(allowNotFound && response.status === 404)) {
-      throw new Error("Ignis Sync HTTP " + response.status);
+      const code = typeof response.json?.code === "string" ? response.json.code : "";
+      if (code === "JOURNAL_LINEAGE_MISMATCH") {
+        await this.pauseJournal("changed");
+      } else if (code === "JOURNAL_CHECKPOINT_MISMATCH") {
+        await this.pauseJournal("diverged");
+      }
+      throw new SyncHttpError(response.status, code);
     }
     return response;
   }
@@ -12052,7 +15012,7 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         try {
           const message = JSON.parse(event.data);
           if (message.channel === "collab") {
-            if (authorized)
+            if (authorized && !this.historyHold)
               void this.live.handle(message);
           } else if (message.channel === "sync") {
             if (message.type === "ready") {
@@ -12068,10 +15028,33 @@ var IgnisConnector = class extends import_obsidian.Plugin {
                 socket.close();
                 return;
               }
-              authorized = true;
-              this.retryCount = 0;
-              this.live.connected();
-              this.schedule();
+              void (async () => {
+                if (!message.journalLineage || this.settings.journalLineage && message.journalLineage !== this.settings.journalLineage) {
+                  await this.pauseJournal(message.journalLineage ? "changed" : "unsupported");
+                  return;
+                }
+                const manifest = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/manifest");
+                if (this.socket !== socket || this.stopped || this.settings.scope !== scope || this.token !== token)
+                  return;
+                if (manifest.journalLineage !== message.journalLineage) {
+                  await this.pauseJournal("changed");
+                  return;
+                }
+                if (!await this.verifyJournal(manifest, this.settings.cursor))
+                  return;
+                if (this.socket !== socket || this.stopped)
+                  return;
+                authorized = true;
+                this.retryCount = 0;
+                this.live.connected();
+                this.schedule();
+              })().catch((error) => {
+                if (this.socket !== socket)
+                  return;
+                this.lastError = String(error);
+                this.showStatus("Server identity verification failed \xB7 local notes retained");
+                socket.close(1e3, "Identity verification failed");
+              });
             }
             if (message.type === "changed")
               this.schedule();
@@ -12093,12 +15076,17 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         if (this.socket === socket) {
           this.live.disconnected();
           this.socket = null;
-          if (event.code === 4003 || event.code === 4001) {
-            this.authBlocked = true;
-            this.showStatus("Device revoked or no longer authorized");
+          if (this.historyHold) {
+            this.showStatus(journalHoldMessage(this.historyHold));
             return;
           }
-          if (!this.stopped && this.ready() && !document.hidden)
+          const result = classifySyncSocketClose(event.code, event.reason);
+          this.showStatus(result.status);
+          if (result.terminal) {
+            this.authBlocked = true;
+            return;
+          }
+          if (!this.stopped && this.ready())
             this.retryConnection();
         }
       };
@@ -12121,8 +15109,18 @@ var IgnisConnector = class extends import_obsidian.Plugin {
   openInEditor(path) {
     return this.app.workspace.getLeavesOfType("markdown").some((leaf) => leaf.view.file?.path === path);
   }
+  async openOriginalMatchesDisk(path, file) {
+    const leaves = this.app.workspace.getLeavesOfType("markdown").filter((leaf) => leaf.view.file?.path === path);
+    if (!leaves.length)
+      return !this.live.isManaged(path);
+    const buffers = leaves.map((leaf) => leaf.view.editor?.getValue?.());
+    if (buffers.some((value) => typeof value !== "string"))
+      return false;
+    const saved = await this.app.vault.read(file);
+    return buffers.every((value) => value === saved);
+  }
   localFiles() {
-    return new Map(this.app.vault.getFiles().filter((file) => isSyncablePath(file.path)).map((file) => [file.path, file]));
+    return new Map(this.app.vault.getFiles().filter((file) => this.canShare(file.path)).map((file) => [file.path, file]));
   }
   async localHash(file) {
     if (file.stat.size > MAX_FILE_BYTES)
@@ -12147,9 +15145,22 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     if (isMarkdown(file.path)) {
       return { content: await this.app.vault.read(file) };
     }
-    return { contentBase64: encodeBase64(
-      new Uint8Array(await this.app.vault.readBinary(file))
-    ) };
+    const stat = async () => {
+      const current = this.app.vault.getAbstractFileByPath(file.path);
+      if (!(current instanceof import_obsidian.TFile))
+        return null;
+      const actual = typeof this.app.vault.adapter?.stat === "function" ? await this.app.vault.adapter.stat(file.path) : current.stat;
+      return actual && typeof actual.size === "number" && typeof actual.mtime === "number" ? { size: actual.size, mtime: actual.mtime } : null;
+    };
+    const bytes = await readQuiescentBinary({
+      stat,
+      read: async () => new Uint8Array(await this.app.vault.readBinary(file)),
+      wait: () => new Promise((resolve) => window.setTimeout(resolve, 700)),
+      maxBytes: MAX_FILE_BYTES
+    });
+    if (!bytes)
+      throw new AttachmentStillWriting("Attachment is still changing: " + file.path);
+    return { contentBase64: encodeBase64(bytes) };
   }
   async writeLocal(path, data) {
     this.quiet.add(path);
@@ -12190,53 +15201,124 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     };
   }
   async replayPending() {
+    const deferred = [];
     for (const pending of [...this.settings.pending]) {
-      const result = await this.sendOperation(pending);
-      acknowledgePending(this.settings, result);
-      if (pending.toPath) {
-        this.live.rejoinPath(pending.toPath);
+      if (!this.settings.pending.some((item) => item.opId === pending.opId))
+        continue;
+      if (deferred.some((item) => pendingDependent(item, pending))) {
+        deferred.push(pending);
+        continue;
       }
-      await this.persistSettings();
+      if (!this.canShare(pending.path) || pending.toPath && !this.canShare(pending.toPath)) {
+        throw new Error("An excluded file has an unsent rename/delete; review before syncing");
+      }
+      try {
+        const result = await this.sendOperation(pending);
+        acknowledgePending(this.settings, result);
+        this.observeOperationReceipt(result.seq);
+        if (pending.toPath) {
+          this.live.rejoinPath(pending.toPath);
+        }
+        this.outboundFailures.delete(pending.opId);
+        await this.persistSettings();
+      } catch (error) {
+        if (!isReviewableConflict(error))
+          throw error;
+        this.outboundFailures.set(pending.opId, error.code);
+        deferred.push(pending);
+      }
+    }
+  }
+  async retireObsoleteStages(path) {
+    const vaultId = encodeURIComponent(this.settings.vaultId);
+    for (const staged of [...this.settings.pendingWrites]) {
+      if (staged.path !== path)
+        continue;
+      const result = await this.api(
+        "/vaults/" + vaultId + "/operations/" + encodeURIComponent(staged.opId) + "/abandon",
+        "POST"
+      );
+      if (result.status !== "abandoned" || result.opId !== staged.opId) {
+        throw new Error("A queued operation reached the server; resync and compare versions again");
+      }
+      const index = this.settings.pendingWrites.findIndex((item) => item.opId === staged.opId);
+      if (index >= 0) {
+        this.settings.pendingWrites.splice(index, 1);
+        this.outboundFailures.delete(staged.opId);
+        await this.persistSettings();
+      }
     }
   }
   async replayWrites() {
     const vaultId = encodeURIComponent(this.settings.vaultId);
-    while (this.settings.pendingWrites.length) {
-      const staged = this.settings.pendingWrites[0];
-      const receiptResponse = await this.deviceRequest(
-        "/vaults/" + vaultId + "/operations/" + encodeURIComponent(staged.opId),
-        "GET",
-        void 0,
-        true
-      );
-      let receipt;
-      if (receiptResponse.status === 200) {
-        receipt = receiptResponse.json;
-      } else if (receiptResponse.status === 404) {
-        const local = this.app.vault.getAbstractFileByPath(staged.path);
-        if (!(local instanceof import_obsidian.TFile) || await this.localHash(local) !== staged.localHash) {
-          throw new Error("Staged write differs from current local file; review before replay: " + staged.path);
-        }
-        receipt = await this.sendOperation({
-          opId: staged.opId,
-          type: staged.type,
-          path: staged.path,
-          ...staged.content !== void 0 ? { content: staged.content } : { contentBase64: staged.contentBase64 },
-          ...staged.type === "modify" ? {
-            fileId: staged.fileId,
-            generationId: staged.generationId,
-            baseHash: staged.baseHash
-          } : {}
-        });
-      } else {
-        throw new Error("Could not verify staged write receipt: HTTP " + receiptResponse.status);
+    for (const staged of [...this.settings.pendingWrites]) {
+      if (!this.settings.pendingWrites.some((item) => item.opId === staged.opId))
+        continue;
+      if (!this.canShare(staged.path)) {
+        throw new Error("An excluded file has an unsent write; review before syncing");
       }
-      acknowledgeWrite(this.settings.pendingWrites, receipt);
-      this.saveBase(staged.path, receipt);
-      await this.persistSettings();
+      try {
+        const receiptResponse = await this.deviceRequest(
+          "/vaults/" + vaultId + "/operations/" + encodeURIComponent(staged.opId),
+          "GET",
+          void 0,
+          true
+        );
+        let receipt;
+        if (receiptResponse.status === 200) {
+          receipt = receiptResponse.json;
+        } else if (receiptResponse.status === 404) {
+          const local = this.app.vault.getAbstractFileByPath(staged.path);
+          if (!(local instanceof import_obsidian.TFile) || await this.localHash(local) !== staged.localHash) {
+            const outcome = await this.api(
+              "/vaults/" + vaultId + "/operations/" + encodeURIComponent(staged.opId) + "/abandon",
+              "POST"
+            );
+            if (outcome.status === "committed" && outcome.receipt) {
+              receipt = outcome.receipt;
+            } else if (outcome.status === "abandoned" && outcome.opId === staged.opId) {
+              this.settings.pendingWrites.splice(
+                this.settings.pendingWrites.findIndex((item) => item.opId === staged.opId),
+                1
+              );
+              this.outboundFailures.delete(staged.opId);
+              await this.persistSettings();
+              this.queued = true;
+              continue;
+            } else {
+              throw new Error("Server did not confirm the obsolete operation was rejected");
+            }
+          } else {
+            receipt = await this.sendOperation({
+              opId: staged.opId,
+              type: staged.type,
+              path: staged.path,
+              ...staged.content !== void 0 ? { content: staged.content } : { contentBase64: staged.contentBase64 },
+              ...staged.type === "modify" ? {
+                fileId: staged.fileId,
+                generationId: staged.generationId,
+                baseHash: staged.baseHash
+              } : {}
+            });
+          }
+        } else {
+          throw new Error("Could not verify staged write receipt: HTTP " + receiptResponse.status);
+        }
+        acknowledgeWrite(this.settings.pendingWrites, receipt);
+        this.observeOperationReceipt(receipt.seq);
+        this.saveBase(staged.path, receipt);
+        this.outboundFailures.delete(staged.opId);
+        await this.persistSettings();
+      } catch (error) {
+        if (!isReviewableConflict(error))
+          throw error;
+        this.outboundFailures.set(staged.opId, error.code);
+      }
     }
   }
   async stageAndSend(type, file, base) {
+    if (!this.canShare(file.path))
+      return;
     const payload = await this.payloadFor(file);
     const bytes = "content" in payload ? textEncoder.encode(payload.content) : Uint8Array.from(atob(payload.contentBase64), (ch) => ch.charCodeAt(0));
     const digest = await sha256(bytes);
@@ -12258,32 +15340,126 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     }
     await this.replayWrites();
   }
+  async verifyJournal(manifest, startingCursor) {
+    const tracked = Object.entries(this.settings.baselines).filter(([path]) => this.canShare(path)).map(([path, entry]) => ({
+      path,
+      fileId: entry.fileId,
+      generationId: entry.generationId
+    }));
+    const liveGenerations = Object.entries(this.settings.yjsIds).filter(([path]) => this.canShare(path)).map(([, id2]) => id2);
+    const assessment = assessJournalTrust({
+      pinnedLineage: this.settings.journalLineage,
+      remoteLineage: manifest.journalLineage,
+      cursor: startingCursor,
+      remoteSeq: manifest.vaultSeq,
+      tracked,
+      liveGenerations,
+      remoteFiles: manifest.files
+    });
+    if (assessment.state === "trusted") {
+      if (this.settings.journalProof) {
+        let witness = manifest.headProof;
+        if (manifest.vaultSeq !== startingCursor) {
+          const exact = await this.api("/vaults/" + encodeURIComponent(this.settings.vaultId) + "/checkpoint?seq=" + startingCursor);
+          witness = exact.journalLineage === manifest.journalLineage && exact.seq === startingCursor ? exact.proof : null;
+        }
+        if (!journalProofMatches(this.settings.journalProof, witness)) {
+          await this.pauseJournal("diverged");
+          return false;
+        }
+      }
+      const priorHold = this.historyHold;
+      this.historyHold = null;
+      if (assessment.newlyPinned)
+        this.settings.journalLineage = assessment.lineage;
+      if (priorHold) {
+        this.settings.syncIssues = (this.settings.syncIssues || []).filter((issue) => !issue.reason.startsWith("Server journal identity requires review"));
+      }
+      if (assessment.newlyPinned || priorHold)
+        await this.persistSettings();
+      if (priorHold)
+        this.showStatus("History verified \xB7 waiting for sync confirmation");
+      return true;
+    }
+    await this.pauseJournal(assessment.reason);
+    return false;
+  }
+  async pauseJournal(reason) {
+    this.historyHold = reason;
+    this.live.disconnected();
+    const tracked = Object.keys(this.settings.baselines).filter((path) => this.canShare(path));
+    const affected = /* @__PURE__ */ new Set([
+      ...tracked,
+      ...Object.keys(this.settings.yjsIds).filter((path) => this.canShare(path)),
+      ...(this.settings.pending || []).map((entry) => entry.path),
+      ...(this.settings.pendingWrites || []).map((entry) => entry.path)
+    ]);
+    const previousIssues = (this.settings.syncIssues || []).filter((issue) => !issue.reason.startsWith("Server journal identity requires review"));
+    this.settings.syncIssues = [
+      ...previousIssues,
+      ...[...affected].filter((path) => !previousIssues.some((issue) => issue.path === path)).map((path) => ({
+        path,
+        reason: "Server journal identity requires review; local original retained"
+      }))
+    ];
+    this.lastError = journalHoldExplanation(reason);
+    this.showStatus(journalHoldMessage(reason));
+    await this.persistSettings();
+    this.socket?.close(1e3, "Server history review required");
+  }
   async syncNow() {
     if (!this.ready())
       return;
+    if (this.migrationBusy) {
+      this.queued = true;
+      return;
+    }
     if (this.syncing) {
       this.queued = true;
       return;
     }
     this.syncing = true;
+    this.syncDrain = new Promise((resolve) => {
+      this.releaseSyncDrain = resolve;
+    });
+    let unsettledAttachments = 0;
     this.showStatus("Syncing");
     try {
       const startingCursor = this.settings.cursor;
+      const vaultId = encodeURIComponent(this.settings.vaultId);
+      if (this.settings.pending.length || this.settings.pendingWrites.length) {
+        const preflight = await this.api("/vaults/" + vaultId + "/manifest");
+        if (!await this.verifyJournal(preflight, startingCursor))
+          return;
+      }
       await this.replayWrites();
       await this.replayPending();
-      const vaultId = encodeURIComponent(this.settings.vaultId);
+      const baselineAtManifest = Object.fromEntries(
+        Object.entries(this.settings.baselines).map(([path, base]) => [path, { ...base }])
+      );
       const manifest = await this.api("/vaults/" + vaultId + "/manifest");
+      if (!await this.verifyJournal(manifest, startingCursor))
+        return;
       const changes = await readChangesThrough(
         startingCursor,
         manifest.vaultSeq,
         (since, limit) => this.api("/vaults/" + vaultId + "/changes?since=" + since + "&limit=" + limit)
       );
+      this.settings.tombstoneProofs = retainDeletionProofs(
+        this.settings.tombstoneProofs || {},
+        baselineAtManifest,
+        changes
+      );
+      await this.persistSettings();
       const local = this.localFiles();
       const remotePaths = /* @__PURE__ */ new Set();
       const conflicts = [];
       const report = (path, reason) => conflicts.push({ path, reason });
+      const protectedOriginals = new Set(
+        (this.settings.syncIssues || []).filter((issue) => migrationNeedsPreservation(issue.reason)).map((issue) => issue.path)
+      );
       for (const remote of manifest.files) {
-        if (!isSyncablePath(remote.path))
+        if (!this.canShare(remote.path))
           continue;
         remotePaths.add(remote.path);
         if (remote.size > MAX_FILE_BYTES) {
@@ -12341,9 +15517,12 @@ var IgnisConnector = class extends import_obsidian.Plugin {
           await this.writeLocal(remote.path, isMarkdown(remote.path) ? new TextDecoder().decode(data) : data);
           this.saveBase(remote.path, remote);
         } else if (!base) {
-          if (localDigest === remote.hash)
+          if (localDigest === remote.hash) {
+            if (this.settings.pendingWrites.some((item) => item.path === remote.path && item.type === "create")) {
+              await this.retireObsoleteStages(remote.path);
+            }
             this.saveBase(remote.path, remote);
-          else
+          } else
             report(remote.path, "Existing on both devices");
         } else if (localDigest === null) {
           report(remote.path, "Size limit");
@@ -12356,7 +15535,13 @@ var IgnisConnector = class extends import_obsidian.Plugin {
             report(remote.path, "Open editor; file-level write deferred");
             continue;
           }
-          await this.stageAndSend("modify", existing, base);
+          try {
+            await this.stageAndSend("modify", existing, base);
+          } catch (error) {
+            if (!(error instanceof AttachmentStillWriting))
+              throw error;
+            unsettledAttachments++;
+          }
         } else {
           if (this.openInEditor(remote.path)) {
             report(remote.path, "Open editor");
@@ -12368,9 +15553,15 @@ var IgnisConnector = class extends import_obsidian.Plugin {
         }
         await this.persistSettings();
       }
+      const firstShareTotal = manifest.vaultSeq === 0 && !manifest.files.length ? [...local.keys()].filter((path) => !this.settings.baselines[path] && !this.settings.pending.some((operation) => operation.toPath === path)).length : 0;
+      let firstShareCompleted = 0;
+      if (firstShareTotal)
+        this.showStatus("Sharing local originals \xB7 0/" + firstShareTotal + " \xB7 original files retained until acknowledged");
       for (const [path, file] of local) {
-        if (this.live.isManaged(path))
+        if (protectedOriginals.has(path) && !remotePaths.has(path) && !this.settings.baselines[path]) {
+          report(path, "Remote missing; retained locally");
           continue;
+        }
         if (!this.settings.baselines[path] && this.settings.yjsIds[path] && !remotePaths.has(path)) {
           report(path, "Collaborative move has no confirmed file identity");
           continue;
@@ -12382,15 +15573,40 @@ var IgnisConnector = class extends import_obsidian.Plugin {
           report(path, "Attachment exceeds preview size limit");
           continue;
         }
-        if (this.openInEditor(path))
+        const managed = this.live.isManaged(path);
+        if ((managed || this.openInEditor(path)) && !await this.openOriginalMatchesDisk(path, file)) {
+          report(path, "Open editor has uncommitted or unverified text; local original retained");
           continue;
-        await this.stageAndSend("create", file);
+        }
+        try {
+          await this.stageAndSend("create", file);
+          if (firstShareTotal && this.settings.baselines[path]) {
+            firstShareCompleted++;
+            this.showStatus("Sharing local originals \xB7 " + firstShareCompleted + "/" + firstShareTotal + " confirmed by server");
+          }
+          if (managed && this.settings.baselines[path])
+            this.live.rejoinPath(path);
+        } catch (error) {
+          if (!(error instanceof AttachmentStillWriting))
+            throw error;
+          unsettledAttachments++;
+          continue;
+        }
         await this.persistSettings();
       }
       for (const path of Object.keys(this.settings.baselines)) {
+        if (!this.canShare(path))
+          continue;
         const base = this.settings.baselines[path];
-        const absence = classifyAbsence(path, base, remotePaths, changes);
-        if (absence === "present")
+        const absence = classifySnapshotAbsence(
+          path,
+          base,
+          baselineAtManifest[path],
+          remotePaths,
+          changes,
+          this.settings.tombstoneProofs[path]
+        );
+        if (absence === "present" || absence === "post-snapshot")
           continue;
         if (absence !== "tombstone" || !this.settings.applyRemoteDeletes || this.live.isManaged(path) || this.openInEditor(path)) {
           report(path, "Remote missing; retained locally");
@@ -12411,35 +15627,73 @@ var IgnisConnector = class extends import_obsidian.Plugin {
           window.setTimeout(() => this.quiet.delete(path), 1e3);
         }
       }
-      if (conflicts.length) {
+      const reportedPaths = new Set(conflicts.map((issue) => issue.path));
+      for (const path of this.live.blockingPaths()) {
+        if (!reportedPaths.has(path)) {
+          report(path, "Live editor blocked; local draft retained");
+        }
+      }
+      this.settings.cursor = manifest.vaultSeq;
+      if (typeof manifest.headProof === "string" && /^[a-f0-9]{64}$/.test(manifest.headProof)) {
+        this.settings.journalProof = manifest.headProof;
+      }
+      const unsent = this.settings.pending.length + this.settings.pendingWrites.length;
+      if (conflicts.length || unsent) {
         this.lastError = conflicts.slice(0, 4).map((issue) => issue.path + ": " + issue.reason).join("; ");
-        this.showStatus(conflicts.length + " items need review");
+        const affectedPaths = /* @__PURE__ */ new Set([
+          ...conflicts.map((issue) => issue.path),
+          ...this.settings.pending.map((op) => op.path),
+          ...this.settings.pendingWrites.map((op) => op.path)
+        ]);
+        const affected = affectedPaths.size;
+        this.showStatus(affected + (affected === 1 ? " item needs review" : " items need review") + (unsent ? " \xB7 " + unsent + (unsent === 1 ? " unsent change" : " unsent changes") : ""));
+        if (this.latestOperationReceipt?.scope === this.settings.scope && this.latestOperationReceipt.seq > manifest.vaultSeq) {
+          this.queued = true;
+        }
+      } else if (unsettledAttachments) {
+        this.showStatus("Waiting for " + unsettledAttachments + " attachment(s) to finish copying \xB7 local files retained");
       } else {
-        this.settings.cursor = manifest.vaultSeq;
-        const live = this.live.saveState();
-        if (live.blocked) {
-          this.showStatus("Files synced \xB7 " + live.blocked + " collaborative notes need review");
-        } else if (live.active && !live.online) {
-          this.showStatus("Files synced \xB7 live collaboration offline");
-        } else if (live.reconnecting) {
-          this.showStatus("Files synced \xB7 " + live.reconnecting + " collaborative notes reconnecting");
-        } else if (live.awaitingServer) {
-          this.showStatus("Files synced \xB7 " + live.awaitingServer + " collaborative notes await server save");
+        if (this.latestOperationReceipt?.scope === this.settings.scope && this.latestOperationReceipt.seq > manifest.vaultSeq) {
+          this.showStatus("Confirming recent server writes");
+          this.queued = true;
         } else {
-          this.showStatus("Synced \xB7 server acknowledged");
+          const live = this.live.saveState();
+          const emptyFolders = this.emptyLocalFolders().length;
+          if (live.blocked) {
+            this.showStatus("Files synced \xB7 " + live.blocked + " collaborative notes need review");
+          } else if (live.active && !live.online) {
+            this.showStatus("Files synced \xB7 live collaboration offline");
+          } else if (live.reconnecting) {
+            this.showStatus("Files synced \xB7 " + live.reconnecting + " collaborative notes reconnecting");
+          } else if (live.awaitingServer) {
+            this.showStatus("Files synced \xB7 " + live.awaitingServer + " collaborative notes await server save");
+          } else if (emptyFolders) {
+            this.showStatus("Files synced \xB7 " + emptyFolders + (emptyFolders === 1 ? " empty folder" : " empty folders") + (emptyFolders === 1 ? " remains local (not shared)" : " remain local (not shared)"));
+          } else {
+            this.showStatus("Synced \xB7 server acknowledged");
+          }
         }
       }
       this.settings.syncIssues = conflicts;
       await this.persistSettings();
     } catch (error) {
       this.lastError = String(error);
-      this.showStatus("Pending \xB7 locally retained");
+      this.showStatus(this.historyHold ? journalHoldMessage(this.historyHold) : "Pending \xB7 locally retained");
       console.warn("[ignis-connector] Sync failed:", error);
     } finally {
       this.syncing = false;
+      this.releaseSyncDrain?.();
+      this.releaseSyncDrain = null;
+      this.syncDrain = null;
       if (this.queued) {
         this.queued = false;
         this.schedule();
+      }
+      if (unsettledAttachments && !this.stopped) {
+        window.setTimeout(() => {
+          if (!this.stopped)
+            this.schedule();
+        }, 1500);
       }
     }
   }
@@ -12517,6 +15771,14 @@ var CollaboratorsModal = class extends import_obsidian.Modal {
       this.close();
       this.plugin.openSyncIssues();
     }));
+    const reviews = this.plugin.getUndoReviews();
+    if (reviews.length) {
+      const ja = mobileUiLanguage() === "ja";
+      new import_obsidian.Setting(contentEl).setName(ja ? "\u5143\u306B\u623B\u3059\u64CD\u4F5C\u306E\u78BA\u8A8D\u5F85\u3061\uFF1A" + reviews.length + "\u4EF6" : reviews.length + " Undo / Redo edit" + (reviews.length === 1 ? "" : "s") + " need review").setDesc(ja ? "\u4ED6\u7AEF\u672B\u306E\u5909\u66F4\u3067\u5143\u306E\u4F4D\u7F6E\u304C\u5206\u304B\u3089\u306A\u304F\u306A\u308A\u307E\u3057\u305F\u3002\u6587\u5B57\u5217\u3092\u52DD\u624B\u306B\u5FA9\u5143\u3057\u3066\u3044\u307E\u305B\u3093\u3002" : "A collaborator replaced the original edit boundary. No automatic restore was attempted.").addButton((b) => b.setButtonText(ja ? "\u5185\u5BB9\u3092\u78BA\u8A8D" : "Review edits").onClick(() => {
+        this.close();
+        this.plugin.openUndoReview();
+      }));
+    }
     new import_obsidian.Setting(contentEl).setName("Your display name").setDesc(this.plugin.getDisplayName()).addButton((b) => b.setButtonText("Change name").onClick(() => {
       this.close();
       this.plugin.openDisplayName();
@@ -12536,35 +15798,323 @@ var CollaboratorsModal = class extends import_obsidian.Modal {
     }
   }
 };
-var SyncIssuesModal = class extends import_obsidian.Modal {
-  constructor(app, issues, lastError) {
+var UndoReviewModal = class extends import_obsidian.Modal {
+  constructor(app, plugin) {
     super(app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    this.render();
+  }
+  onClose() {
+    this.plugin.undoReviewModalClosed(this);
+  }
+  refresh() {
+    this.render();
+  }
+  render() {
+    const ja = mobileUiLanguage() === "ja";
+    const { contentEl } = this;
+    contentEl.empty();
+    this.modalEl?.classList.add("ignis-undo-review-modal");
+    contentEl.createEl("h2", { text: ja ? "\u5143\u306B\u623B\u3059\u64CD\u4F5C\u306E\u78BA\u8A8D" : "Review Undo / Redo" });
+    contentEl.createEl("p", { text: ja ? "\u5225\u306E\u7AEF\u672B\u304C\u5143\u306E\u7DE8\u96C6\u4F4D\u7F6E\u3092\u5909\u66F4\u3057\u307E\u3057\u305F\u3002\u52DD\u624B\u306B\u6587\u7AE0\u3092\u66F8\u304D\u63DB\u3048\u305A\u3001\u78BA\u8A8D\u3067\u304D\u308B\u3088\u3046\u306B\u6B8B\u3057\u3066\u3044\u307E\u3059\u3002" : "Another editor changed the original boundary. We have not guessed or applied the edit." });
+    const reviews = this.plugin.getUndoReviews();
+    if (!reviews.length) {
+      contentEl.createEl("p", { text: ja ? "\u78BA\u8A8D\u5F85\u3061\u306E\u64CD\u4F5C\u306F\u3042\u308A\u307E\u305B\u3093\u3002" : "Nothing needs review." });
+      return;
+    }
+    for (const review of reviews) {
+      const group = contentEl.createDiv({ cls: "ignis-undo-review-item" });
+      group.createEl("h3", { text: review.path });
+      group.createEl("p", { text: (review.operation === "undo" ? "Undo" : "Redo") + " \xB7 " + (ja ? "\u5143\u306E\u7DE8\u96C6\u4F4D\u7F6E\u3092\u78BA\u8A8D\u3067\u304D\u307E\u305B\u3093" : "Original edit position no longer exists") });
+      group.createEl("p", { text: ja ? "\u5143\u306B\u623B\u305B\u306A\u304B\u3063\u305F\u6587\u5B57\u5217\uFF08\u6539\u884C\u3082\u542B\u307F\u307E\u3059\uFF09" : "Text to review, including line breaks" });
+      const input = group.createEl("textarea", {
+        cls: "ignis-undo-review-original"
+      });
+      input.value = review.deleted;
+      input.readOnly = true;
+      input.rows = Math.min(8, Math.max(3, review.deleted.split("\n").length + 1));
+      input.style.width = "100%";
+      input.setAttribute("aria-label", ja ? "\u5FA9\u5143\u5019\u88DC\u306E\u5143\u306E\u6587\u5B57\u5217" : "Original text");
+      const breaks = (review.deleted.match(/\n/g) || []).length;
+      if (breaks)
+        group.createEl("small", { text: ja ? "\u6539\u884C " + breaks + " \u500B\uFF08\u7A7A\u6B04\u306B\u898B\u3048\u3066\u3082\u6539\u884C\u304C\u3042\u308A\u307E\u3059\uFF09" : breaks + " line break(s) included" });
+      const details = group.createEl("details");
+      details.createEl("summary", { text: ja ? "\u64CD\u4F5C\u3092\u8A66\u307F\u305F\u6642\u70B9\u306E\u6587\u7AE0\u3092\u898B\u308B" : "Document excerpt at the time of the edit" });
+      details.createEl("pre", { text: review.context });
+      const feedback = group.createEl("p", { cls: "ignis-undo-review-feedback" });
+      feedback.setAttribute("role", "status");
+      feedback.setAttribute("aria-live", "polite");
+      new import_obsidian.Setting(group).addButton((button) => button.setButtonText(ja ? "\u5143\u306E\u6587\u5B57\u5217\u3092\u30B3\u30D4\u30FC" : "Copy original text").onClick(async () => {
+        try {
+          await navigator.clipboard.writeText(review.deleted);
+          feedback.setText(ja ? "\u30B3\u30D4\u30FC\u3057\u307E\u3057\u305F\u3002\u633F\u5165\u4F4D\u7F6E\u3092\u78BA\u8A8D\u3057\u3066\u8CBC\u308A\u4ED8\u3051\u3066\u304F\u3060\u3055\u3044\u3002" : "Copied. Choose the insertion point before pasting.");
+        } catch {
+          input.focus();
+          input.select();
+          feedback.setText(ja ? "\u6587\u5B57\u5217\u3092\u9078\u629E\u3057\u307E\u3057\u305F\u3002\u624B\u52D5\u3067\u30B3\u30D4\u30FC\u3067\u304D\u307E\u3059\u3002" : "Text selected. Copy it manually.");
+        }
+      })).addButton((button) => button.setButtonText(ja ? "\u78BA\u8A8D\u6E08\u307F\u306B\u3059\u308B" : "Dismiss review").onClick(() => {
+        if (this.plugin.dismissUndoReview(review))
+          this.render();
+      }));
+    }
+  }
+};
+var MigrationModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, issues, lastError) {
+    super(app);
+    this.plugin = plugin;
     this.issues = issues;
     this.lastError = lastError;
   }
+  selected = null;
+  busy = false;
+  feedback = "";
+  itemFeedback = /* @__PURE__ */ new Map();
+  confirmPath = null;
+  previewEpoch = 0;
+  languageOverride = (() => {
+    try {
+      const value = localStorage.getItem("ignis-migration-language");
+      return value === "ja" || value === "en" ? value : null;
+    } catch {
+      return null;
+    }
+  })();
+  refresh(issues, lastError) {
+    this.issues = issues;
+    this.lastError = lastError;
+    this.render();
+  }
+  allIssues() {
+    const issues = /* @__PURE__ */ new Map();
+    for (const issue of [...this.issues, ...this.plugin.getMigrationIssues()]) {
+      if (!issues.has(issue.path))
+        issues.set(issue.path, issue);
+    }
+    return [...issues.values()];
+  }
+  button(parent, text2, action, primary = false, disabled = false) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ignis-migration-button" + (primary ? " mod-cta" : "");
+    button.textContent = text2;
+    button.disabled = this.busy || disabled;
+    button.addEventListener("click", action);
+    parent.appendChild(button);
+    return button;
+  }
+  async perform(work, workingMessage, successMessage) {
+    if (this.busy)
+      return;
+    this.busy = true;
+    this.feedback = workingMessage;
+    this.render();
+    try {
+      await work();
+      this.feedback = successMessage ?? migrationUiCopy(this.languageOverride || mobileUiLanguage()).verified;
+    } catch (error) {
+      this.feedback = error instanceof Error ? error.message : "Could not save the copies. Original versions have been retained.";
+    } finally {
+      this.busy = false;
+      this.render();
+    }
+  }
   onOpen() {
+    this.modalEl.classList.add("ignis-migration-modal");
+    this.render();
+  }
+  onClose() {
+    this.previewEpoch++;
+    this.plugin.migrationModalClosed(this);
+  }
+  render() {
     const { contentEl } = this;
+    const language = this.languageOverride || mobileUiLanguage();
+    const t = migrationUiCopy(language);
     contentEl.empty();
-    contentEl.createEl("h3", { text: "Ignis sync review" });
-    if (!this.issues.length) {
+    const issues = this.allIssues();
+    const preservable = issues.filter((issue2) => migrationNeedsPreservation(issue2.reason));
+    if (!this.selected || !issues.some((issue2) => issue2.path === this.selected)) {
+      this.selected = preservable[0]?.path || issues[0]?.path || null;
+    }
+    const header = contentEl.createDiv({ cls: "ignis-migration-header" });
+    const eyebrow = header.createDiv({ cls: "ignis-migration-eyebrow" });
+    eyebrow.setText(t.eyebrow);
+    const switchLanguage = this.button(header, language === "ja" ? "English" : "\u65E5\u672C\u8A9E", () => {
+      this.languageOverride = language === "ja" ? "en" : "ja";
+      try {
+        localStorage.setItem("ignis-migration-language", this.languageOverride);
+      } catch {
+      }
+      this.render();
+    });
+    switchLanguage.classList.add("ignis-migration-language");
+    switchLanguage.setAttribute("aria-label", language === "ja" ? "Display migration in English" : "\u79FB\u884C\u753B\u9762\u3092\u65E5\u672C\u8A9E\u3067\u8868\u793A");
+    contentEl.createEl("h2", { text: t.title });
+    contentEl.createEl("p", {
+      cls: "ignis-migration-intro",
+      text: t.intro
+    });
+    const history = this.plugin.journalRecoveryInfo();
+    if (history) {
+      const panel = contentEl.createDiv({ cls: "ignis-migration-history-review" });
+      panel.setAttr("role", "alert");
+      panel.createEl("h3", { text: t.historyTitle });
+      panel.createEl("p", { text: history.explanation });
+      this.button(panel, t.recheckHistory, () => void this.perform(async () => {
+        const result = await this.plugin.recheckJournal();
+        if (!result.ok)
+          throw new Error(result.message);
+        this.issues = this.issues.filter((issue2) => !issue2.reason.startsWith("Server journal identity requires review"));
+      }, t.recheckingHistory, t.historyRestored), true);
+    }
+    const progress = contentEl.createDiv({ cls: "ignis-migration-steps" });
+    for (const title of t.stages) {
+      const chip = document.createElement("span");
+      chip.textContent = title;
+      progress.appendChild(chip);
+    }
+    const toolbar = contentEl.createDiv({ cls: "ignis-migration-toolbar" });
+    const count2 = preservable.filter((issue2) => !!this.plugin.getPreservedMigration(issue2.path)).length;
+    toolbar.createEl("strong", { text: t.count(issues.length, count2) });
+    this.button(
+      toolbar,
+      this.busy ? t.saving : t.saveAll,
+      () => void this.perform(async () => {
+        let failed = 0;
+        for (const issue2 of preservable) {
+          this.itemFeedback.set(issue2.path, t.savingItem);
+          try {
+            const result = await this.plugin.preserveMigration(issue2.path);
+            this.itemFeedback.set(
+              issue2.path,
+              result.remoteCopy ? t.preservedPair : t.preservedLocal
+            );
+          } catch (error) {
+            failed++;
+            this.itemFeedback.set(
+              issue2.path,
+              t.needsAttention + (error instanceof Error ? error.message : String(error))
+            );
+            if (this.plugin.settings.pendingWrites.length)
+              throw error;
+          }
+        }
+        if (failed)
+          throw new Error(t.missingCopies(failed));
+      }, t.saveProgress),
+      true,
+      !preservable.length || !!history
+    );
+    const status = contentEl.createDiv({ cls: "ignis-migration-feedback" });
+    status.setAttr("role", "status");
+    status.setAttr("aria-live", "polite");
+    status.setText(this.feedback || t.initialStatus);
+    if (!issues.length) {
       contentEl.createEl("p", {
-        text: this.lastError || "No unresolved file conflicts from the last completed sync."
+        text: this.lastError || t.noIssues
       });
       return;
     }
-    contentEl.createEl("p", {
-      text: "No conflicting content has been overwritten. Review each local file before deciding how to reconcile it."
+    const layout = contentEl.createDiv({ cls: "ignis-migration-layout" });
+    const aside = layout.createDiv({ cls: "ignis-migration-list" });
+    aside.setAttr("aria-label", t.listLabel);
+    for (const issue2 of issues) {
+      const entry = aside.createDiv({ cls: "ignis-migration-item" });
+      if (this.selected === issue2.path)
+        entry.classList.add("is-selected");
+      const select = this.button(entry, migrationCardLabel(issue2.path), () => {
+        this.selected = issue2.path;
+        this.confirmPath = null;
+        this.render();
+      });
+      select.classList.add("ignis-migration-select");
+      select.setAttribute("aria-pressed", String(this.selected === issue2.path));
+      select.setAttribute("aria-label", issue2.path);
+      select.setAttribute("title", issue2.path);
+      const detail = entry.createDiv({ cls: "ignis-migration-item-note" });
+      detail.setText(this.itemFeedback.get(issue2.path) || (this.plugin.getPreservedMigration(issue2.path) ? t.savedEarlier : migrationReason(issue2.reason, language)));
+    }
+    const main = layout.createDiv({ cls: "ignis-migration-detail" });
+    const issue = issues.find((item) => item.path === this.selected);
+    main.createEl("h3", { text: issue.path });
+    main.createEl("p", {
+      cls: "ignis-migration-reason",
+      text: migrationReason(issue.reason, language)
     });
-    const list = contentEl.createEl("ul");
-    for (const issue of this.issues) {
-      const item = list.createEl("li");
-      item.createEl("strong", { text: issue.path });
-      item.appendText(" \u2014 " + issue.reason);
-      if (this.app.vault.getAbstractFileByPath(issue.path) instanceof import_obsidian.TFile) {
-        new import_obsidian.Setting(item).addButton((button) => button.setButtonText("Open local").onClick(async () => {
-          await this.app.workspace.openLinkText(issue.path, "", false);
+    const copy2 = this.plugin.getPreservedMigration(issue.path);
+    if (copy2) {
+      const saved = main.createDiv({ cls: "ignis-migration-saved" });
+      saved.setAttr("role", "status");
+      saved.createEl("strong", { text: t.savedHeading });
+      const paths = [copy2.sourceCopy, copy2.remoteCopy].filter(Boolean);
+      for (const target of paths) {
+        const row = saved.createDiv({ cls: "ignis-migration-path" });
+        row.setText(target);
+        this.button(row, t.openCopy, () => {
+          void this.app.workspace.openLinkText(target, "", false);
           this.close();
-        }));
+        });
+      }
+    }
+    const controls = main.createDiv({ cls: "ignis-migration-actions" });
+    if (!history && migrationNeedsPreservation(issue.reason)) {
+      this.button(controls, t.saveSelected, () => void this.perform(async () => {
+        const record = await this.plugin.preserveMigration(issue.path);
+        this.itemFeedback.set(
+          issue.path,
+          record.remoteCopy ? t.preservedPair : t.preservedLocal
+        );
+      }, t.verifying), true);
+    }
+    if (this.app.vault.getAbstractFileByPath(issue.path) instanceof import_obsidian.TFile) {
+      this.button(controls, t.original, () => {
+        void this.app.workspace.openLinkText(issue.path, "", false);
+        this.close();
+      });
+    }
+    const comparison = main.createDiv({ cls: "ignis-migration-comparison" });
+    comparison.setAttr("aria-label", t.comparisonLabel);
+    const source = comparison.createDiv({ cls: "ignis-migration-version" });
+    source.createEl("h4", { text: t.localLabel });
+    const localBody = source.createEl("pre", { text: t.loading });
+    const server = comparison.createDiv({ cls: "ignis-migration-version" });
+    server.createEl("h4", { text: t.remoteLabel });
+    const remoteBody = server.createEl("pre", { text: t.loading });
+    const epoch = ++this.previewEpoch;
+    void this.plugin.previewMigration(issue.path).then((data) => {
+      if (epoch !== this.previewEpoch)
+        return;
+      const preview = (value, empty) => value === null ? empty : value.length > 2200 ? value.slice(0, 2200) + "\n" + t.previewTruncated : value;
+      localBody.textContent = preview(data.local, t.localUnavailable);
+      remoteBody.textContent = preview(data.remote, t.serverUnavailable);
+    }).catch((error) => {
+      if (epoch !== this.previewEpoch)
+        return;
+      localBody.textContent = t.previewFailure;
+      remoteBody.textContent = error instanceof Error ? error.message : t.previewFailure;
+    });
+    if (copy2?.remoteCopy) {
+      const resolve = main.createDiv({ cls: "ignis-migration-finish" });
+      resolve.createEl("p", { text: t.finishNote });
+      if (this.confirmPath === issue.path) {
+        this.button(resolve, t.confirm, () => void this.perform(async () => {
+          await this.plugin.finishMigration(issue.path);
+          this.confirmPath = null;
+          this.itemFeedback.set(issue.path, t.finished);
+        }, t.finishProgress, t.finished), true);
+        this.button(resolve, t.back, () => {
+          this.confirmPath = null;
+          this.render();
+        });
+      } else {
+        this.button(resolve, t.finish, () => {
+          this.confirmPath = issue.path;
+          this.render();
+        });
       }
     }
   }
@@ -12574,7 +16124,25 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  sharingEvents = [];
+  sharingTimer = null;
+  viewEpoch = 0;
+  stopSharingUpdates() {
+    this.viewEpoch++;
+    if (this.sharingTimer !== null)
+      window.clearTimeout(this.sharingTimer);
+    this.sharingTimer = null;
+    for (const ref of this.sharingEvents)
+      this.app?.vault?.offref?.(ref);
+    this.sharingEvents = [];
+  }
+  hide() {
+    this.stopSharingUpdates();
+    super.hide?.();
+  }
   display() {
+    this.stopSharingUpdates();
+    const epoch = this.viewEpoch;
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Your display name").setDesc(this.plugin.getDisplayName() + " \xB7 Visible beside your cursor on other devices").addButton((b) => b.setButtonText("Change name").onClick(() => this.plugin.openDisplayName()));
@@ -12595,10 +16163,116 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
       }
     }
     const state = this.plugin.connectionSummary();
+    let recheckButton;
     const feedback = containerEl.createDiv({ cls: "ignis-connection-feedback" });
     feedback.setAttr("role", "status");
     feedback.setAttr("aria-live", "polite");
-    feedback.setText(state.ready ? "Connected to " + state.vaultId + (this.plugin.settings.authMode === "tailnet" ? " \xB7 Tailscale" : " \xB7 Device token") : "Not connected. Paste your Ignis invite link to start.");
+    feedback.setText(connectionRecoveryLabel(state, this.plugin.settings));
+    const journalIssue = this.plugin.journalRecoveryInfo();
+    const historyFeedback = containerEl.createDiv({ cls: "ignis-journal-feedback" });
+    historyFeedback.setAttr("role", "status");
+    historyFeedback.setAttr("aria-live", "polite");
+    const historySetting = new import_obsidian.Setting(containerEl).setName(journalIssue ? "Server history needs review" : "Server sync history").setDesc(journalIssue?.explanation || (this.plugin.settings.journalLineage ? "This Vault's journal identity is pinned on this device. A replacement server will not silently receive the old edits." : "The server's journal will be verified before any local drafts are shared."));
+    historySetting.addButton((button) => button.setButtonText("Recheck and resume").setDisabled(!state.ready).onClick(async () => {
+      button.setDisabled(true).setButtonText("Checking history\u2026");
+      try {
+        const result = await this.plugin.recheckJournal();
+        historyFeedback.setText(result.message);
+      } finally {
+        button.setDisabled(false).setButtonText("Recheck and resume");
+      }
+    }));
+    const sharingMode = new import_obsidian.Setting(containerEl).setName("Files allowed by server");
+    const renderMode = () => {
+      const bypass = this.plugin.getServerMediaBypassExtensions();
+      sharingMode.setDesc(
+        (this.plugin.settings.contentScope === "markdown-only" ? "Markdown (.md)" + (bypass.length ? " + authorized bypass types: " + bypass.join(", ") : " only; attachments stay local") : "Markdown and attachments") + ". IGNIS Sync uses a 4 MiB per-file limit, independent of Syncthing."
+      );
+    };
+    renderMode();
+    const sharingFeedback = containerEl.createDiv({ cls: "ignis-sharing-feedback" });
+    sharingFeedback.setAttr("role", "status");
+    sharingFeedback.setAttr("aria-live", "polite");
+    const sharingSummaryEl = containerEl.createDiv({ cls: "ignis-sharing-summary" });
+    sharingSummaryEl.setAttr("aria-live", "polite");
+    const renderSharing = () => {
+      const summary = this.plugin.getSharingDetails();
+      sharingSummaryEl.setText(
+        summary.sharedFiles + " file(s) eligible \xB7 " + summary.localOnlyFiles + " file(s) kept on this device (" + formatLocalBytes(summary.localOnlyBytes) + ") \xB7 " + summary.pendingOperations + " unsent operation(s)." + (summary.blockedQueued ? " " + summary.blockedQueued + " queued operation(s) need review before syncing." : "") + (summary.oversizedFiles ? " " + summary.oversizedFiles + " file(s) exceed the 4 MiB transfer limit." : "") + (summary.emptyFolders ? " " + summary.emptyFolders + " empty folder(s) are not synchronized and stay on this device." : "")
+      );
+    };
+    renderSharing();
+    if (this.app?.vault) {
+      const scheduleSharing = () => {
+        if (epoch !== this.viewEpoch || this.sharingTimer !== null)
+          return;
+        this.sharingTimer = window.setTimeout(() => {
+          this.sharingTimer = null;
+          if (epoch === this.viewEpoch)
+            renderSharing();
+        }, 100);
+      };
+      this.sharingEvents.push(
+        this.app.vault.on("create", scheduleSharing),
+        this.app.vault.on("delete", scheduleSharing),
+        this.app.vault.on("rename", scheduleSharing),
+        this.app.vault.on("modify", scheduleSharing)
+      );
+    }
+    new import_obsidian.Setting(containerEl).setName("Keep attachments on this device").setDesc("Share only Markdown, plus any individual bypass types you select below. Existing local files are not deleted.").addToggle((toggle) => toggle.setValue(this.plugin.settings.deviceContentScope === "markdown-only").onChange(async (enabled) => {
+      const outcome = await this.plugin.setDeviceContentScope(
+        enabled ? "markdown-only" : "follow-server"
+      );
+      if (!outcome.ok)
+        toggle.setValue(!enabled);
+      sharingFeedback.setText(outcome.message);
+      renderSharing();
+    }));
+    const bypassDetails = containerEl.createEl("details", {
+      cls: "ignis-media-bypass-details"
+    });
+    bypassDetails.createEl("summary", { text: "PDFs and media Bypass" });
+    bypassDetails.createEl("p", {
+      text: "When Keep attachments is enabled, choose the document/media types that IGNIS Sync may still transfer. Syncthing's running or stopped state does not change this rule. Each file must be at most 4 MiB. The Mac server must also authorize these types.",
+      cls: "setting-item-description"
+    });
+    const bypassFeedback = bypassDetails.createDiv({
+      cls: "ignis-media-bypass-feedback"
+    });
+    bypassFeedback.setAttr("role", "status");
+    bypassFeedback.setAttr("aria-live", "polite");
+    const pretty = (extension) => ({
+      pdf: "PDF document",
+      docx: "Word document",
+      xlsx: "Excel workbook",
+      pptx: "PowerPoint presentation"
+    })[extension] || "." + extension + " media";
+    for (const extension of import_media_bypass2.MEDIA_BYPASS_TYPES) {
+      new import_obsidian.Setting(bypassDetails).setName(pretty(extension) + " (." + extension + ")").addToggle((toggle) => toggle.setValue(this.plugin.getDeviceMediaBypassExtensions().includes(extension)).onChange(async (selected) => {
+        const current = this.plugin.getDeviceMediaBypassExtensions();
+        const proposed = selected ? [...current, extension] : current.filter((item) => item !== extension);
+        const result = await this.plugin.setDeviceMediaBypassExtensions(proposed);
+        if (!result.ok)
+          toggle.setValue(!selected);
+        bypassFeedback.setText(result.message);
+        renderSharing();
+      }));
+    }
+    new import_obsidian.Setting(containerEl).setName("Check sharing rules").setDesc("Read the server's current scope without restarting live editing. No file content is uploaded.").addButton((button) => {
+      recheckButton = button;
+      button.setButtonText("Recheck").setDisabled(!state.ready).onClick(async () => {
+        button.setDisabled(true).setButtonText("Checking\u2026");
+        try {
+          const outcome = await this.plugin.recheckSharingScope();
+          sharingFeedback.setText(outcome.message);
+          renderMode();
+          renderSharing();
+        } finally {
+          button.setDisabled(false).setButtonText("Recheck");
+        }
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Review unsent changes").setDesc("Inspect pending paths and sync conflicts. Nothing is discarded or uploaded by opening this view.").addButton((button) => button.setButtonText("Review").onClick(() => this.plugin.openSyncIssues()));
     const availableVaults = containerEl.createDiv({ cls: "ignis-vault-picker" });
     availableVaults.setAttr("aria-live", "polite");
     let serverInput;
@@ -12673,6 +16347,9 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
           tokenInput.value = "";
           button.setButtonText("Connected");
           syncButton?.setDisabled(false);
+          recheckButton?.setDisabled(false);
+          renderMode();
+          renderSharing();
         } else {
           button.setButtonText("Retry connection");
         }

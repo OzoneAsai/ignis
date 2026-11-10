@@ -16,6 +16,7 @@ import {
   visibleContentObstacles
 } from
   "../../../packages/bridge/src/cursor-label-layout.js";
+import { observeCursorViewport } from "../../../packages/server-core/src/cursor-viewport";
 import type { LabelItem, LabelPlacement, LabelRect } from
   "../../../packages/bridge/src/cursor-label-layout.js";
 import {
@@ -107,7 +108,7 @@ export class CursorOverlay {
   private peers: Peer[] = [];
   private text: Y.Text | null = null;
   private raf = 0;
-  private readonly originalPosition: string;
+  private readonly detachGeometry: () => void;
   private readonly scroll = () => this.schedule();
   private readonly contentMutation: MutationObserver | null;
   private readonly mobileViewportChange = () => {
@@ -126,10 +127,8 @@ export class CursorOverlay {
       position: "absolute", inset: "0", overflow: "hidden",
       pointerEvents: "none", zIndex: "8"
     });
-    this.originalPosition = view.dom.style.position;
-    if (getComputedStyle(view.dom).position === "static") {
-      view.dom.style.position = "relative";
-    }
+    this.detachGeometry = observeCursorViewport(view.dom, view.scrollDOM,
+      this.scroll, this.mobile ? this.mobileViewportChange : this.scroll);
     view.dom.appendChild(this.root);
     this.roster = document.createElement("details");
     this.roster.className = "ignis-native-people-roster";
@@ -178,14 +177,9 @@ export class CursorOverlay {
     if (mobile) {
       document.body.appendChild(this.roster);
       this.positionMobileRoster();
-      window.visualViewport?.addEventListener("resize", this.mobileViewportChange);
-      window.visualViewport?.addEventListener("scroll", this.mobileViewportChange);
     } else {
       view.dom.appendChild(this.roster);
     }
-    view.scrollDOM.addEventListener("scroll", this.scroll, { passive: true });
-    window.addEventListener("resize", this.scroll);
-    if (mobile) window.addEventListener("resize", this.mobileViewportChange);
     this.contentMutation = typeof MutationObserver !== "undefined" && view.contentDOM
       ? new MutationObserver(this.scroll) : null;
     this.contentMutation?.observe(view.contentDOM, {
@@ -430,17 +424,10 @@ export class CursorOverlay {
 
   destroy() {
     this.clear();
-    this.view.scrollDOM.removeEventListener("scroll", this.scroll);
-    window.removeEventListener("resize", this.scroll);
+    this.detachGeometry();
     this.contentMutation?.disconnect();
     document.fonts?.removeEventListener?.("loadingdone", this.scroll);
-    if (this.mobile) {
-      window.visualViewport?.removeEventListener("resize", this.mobileViewportChange);
-      window.visualViewport?.removeEventListener("scroll", this.mobileViewportChange);
-      window.removeEventListener("resize", this.mobileViewportChange);
-    }
     this.root.remove();
     this.roster.remove();
-    this.view.dom.style.position = this.originalPosition;
   }
 }

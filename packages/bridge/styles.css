@@ -357,6 +357,7 @@
 
 .ignis-collab-people-roster {
   position: absolute;
+  pointer-events: auto;
   right: 6px;
   top: 6px;
   z-index: 46;
@@ -424,6 +425,123 @@
 
 .ignis-collaboration-status {
   cursor: pointer;
+}
+
+/* IME is an editing state, not a disconnection or a completed user choice.
+   Keep the status visible without a toast covering the conversion candidates. */
+.ignis-collaboration-status.ignis-composition-active {
+  font-weight: 600;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--text-muted);
+}
+
+/* Ignis occupies one native Obsidian navbar slot, never a fixed overlay. */
+.ignis-navbar-action {
+  position: relative;
+  min-width: 36px;
+}
+.ignis-navbar-action .ignis-navbar-trigger {
+  position: relative;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-normal);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.ignis-navbar-action.mobile-toolbar-option {
+  flex: 0 0 var(--toolbar-option-width, 40px);
+  width: var(--toolbar-option-width, 40px);
+  height: var(--touch-size-m, 44px);
+  min-width: var(--toolbar-option-width, 40px);
+}
+.ignis-navbar-action.mobile-toolbar-option .ignis-navbar-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+.ignis-navbar-trigger:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -3px;
+}
+.ignis-navbar-connection-dot {
+  position: absolute;
+  top: calc(50% - 20px);
+  left: calc(50% + 8px);
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--background-primary);
+  border-radius: 50%;
+  background: var(--text-muted);
+  pointer-events: none;
+}
+.ignis-navbar-action[data-connection="connected"] .ignis-navbar-connection-dot {
+  background: #28a46e;
+}
+.ignis-navbar-action[data-connection="connecting"] .ignis-navbar-connection-dot,
+.ignis-navbar-action[data-connection="syncing"] .ignis-navbar-connection-dot {
+  background: #d3a440;
+}
+.ignis-navbar-action[data-connection="error"] .ignis-navbar-connection-dot {
+  background: #da5b5b;
+}
+.ignis-mobile-action-menu .ignis-mobile-action-state {
+  font-weight: 600;
+}
+.ignis-mobile-action-menu .ignis-mobile-action-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+.ignis-mobile-action-menu > button {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  margin-top: 10px;
+  border-radius: var(--radius-m);
+  text-align: left;
+  padding: 10px 14px;
+  color: var(--text-normal);
+  background: var(--background-secondary);
+}
+
+.ignis-file-rename-modal .ignis-rename-file-search,
+.ignis-file-rename-modal .ignis-rename-form input {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  margin: 10px 0;
+  font-size: 16px;
+}
+.ignis-rename-file-results {
+  max-height: min(52dvh, 440px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ignis-rename-file-select {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.ignis-file-rename-modal .ignis-rename-back {
+  margin-bottom: 12px;
+}
+.ignis-rename-form label {
+  display: block;
+}
+.ignis-rename-form button[type="submit"] {
+  min-height: 44px;
+  margin-top: 12px;
+}
+.ignis-rename-feedback {
+  color: var(--text-error);
+  min-height: 1em;
 }
 
 .ignis-collab-person {

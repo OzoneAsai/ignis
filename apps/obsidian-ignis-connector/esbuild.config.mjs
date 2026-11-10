@@ -1,10 +1,11 @@
 import { build } from "esbuild";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const pkg = JSON.parse(readFileSync(new URL("./manifest.json", import.meta.url), "utf8"));
 await build({
-  entryPoints: [new URL("./src/main.ts", import.meta.url).pathname],
-  outfile: new URL("./main.js", import.meta.url).pathname,
+  entryPoints: [fileURLToPath(new URL("./src/main.ts", import.meta.url))],
+  outfile: fileURLToPath(new URL("./main.js", import.meta.url)),
   bundle: true,
   platform: "browser",
   format: "cjs",
