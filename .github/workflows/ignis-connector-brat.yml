@@ -6,7 +6,12 @@ name: Publish Ignis Connector BRAT beta
       - brat-preview
     paths:
       - ".github/workflows/ignis-connector-brat.yml"
-      - "apps/obsidian-ignis-connector/manifest.json"
+      - "apps/obsidian-ignis-connector/**"
+      - "apps/ignis-server/server/sync/**"
+      - "apps/ignis-server/server/collab/**"
+      - "packages/bridge/**"
+      - "packages/shim/**"
+      - "release/brat/**"
   pull_request:
     branches:
       - brat-preview
