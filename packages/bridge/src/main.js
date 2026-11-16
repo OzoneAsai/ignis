@@ -25,6 +25,7 @@ import { installReadingLock } from "./reading-lock.js";
 import { initCollaboration } from "./collaboration.js";
 import { installMobileToolbarPlacement } from "../../server-core/src/mobile-toolbar-preference.js";
 import { showPdfPreview } from "./pdf-preview.js";
+import { installMobileDrawerHydration } from "./mobile-drawer-hydration.js";
 
 class IgnisBridgePlugin extends Plugin {
   async onload() {
@@ -47,6 +48,7 @@ class IgnisBridgePlugin extends Plugin {
     this._proxyBlockUnsub = initProxyBlockNotice(this.app);
     this._imageRetryUnsub = initImageRetry();
     this._collaborationUnsub = initCollaboration(this);
+    this._drawerHydrationUnsub = installMobileDrawerHydration(this.app);
 
     const flags = window.__ignis.flags || {};
 
@@ -127,6 +129,7 @@ class IgnisBridgePlugin extends Plugin {
     if (this._collaborationUnsub) {
       this._collaborationUnsub();
     }
+    this._drawerHydrationUnsub?.();
 
     if (this._pluginTogglesUnsub) {
       this._pluginTogglesUnsub();

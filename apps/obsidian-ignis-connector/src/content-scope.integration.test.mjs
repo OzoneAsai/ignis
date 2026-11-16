@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContentScope } from "../../../packages/sync-policy/src/content-scope";
+const JOURNAL_ID = "00000000-0000-4000-8000-000000000044";
 
 vi.mock("obsidian", () => ({
   Plugin: class {}, PluginSettingTab: class {}, Modal: class {},
@@ -30,6 +31,7 @@ function makeConnector() {
     serverUrl: "https://ignis.example",
     vaultId: "MarkdownLab",
     scope: "https://ignis.example|MarkdownLab",
+    journalLineage: JOURNAL_ID,
     authMode: "device",
     deviceId: "test-sls-device",
     contentScope: "markdown-only",
@@ -42,6 +44,7 @@ function makeConnector() {
   plugin.token = "ignis_dev_" + "a".repeat(43);
   plugin.status = { setText: vi.fn() };
   plugin.live = {
+    blockingPaths: vi.fn(() => []),
     isManaged: vi.fn(() => false),
     saveState: vi.fn(() => ({
       online: true, active: 0, awaitingServer: 0,
@@ -55,7 +58,8 @@ function makeConnector() {
   };
   plugin.api = vi.fn(async (url) => {
     if (url.endsWith("/manifest")) {
-      return { vaultId: "MarkdownLab", vaultSeq: 0, files: [] };
+      return { vaultId: "MarkdownLab", vaultSeq: 0,
+        journalLineage: JOURNAL_ID, files: [] };
     }
     throw new Error("Unexpected API request: " + url);
   });

@@ -22,6 +22,37 @@ describe("native Obsidian iOS mobile parity status", () => {
       .toBe("error");
     expect(nativeConnectionState("Concurrent edit needs review", true, true).kind)
       .toBe("error");
+    expect(nativeConnectionState("Synced · server acknowledged · Undo/Redo 1件を確認",
+      true, true).kind).toBe("error");
+    expect(nativeConnectionState(
+      "Server has received provisional text · IME not confirmed",
+      true, true)).toEqual({
+      kind:"syncing",label:"IME変換中・未確定"
+    });
+    expect(nativeConnectionState(
+      "Server has received provisional text · IME not confirmed · peer edit waiting",
+      true, true)).toEqual({
+      kind:"syncing",label:"競合保留中・IME未確定"
+    });
+    expect(nativeConnectionState(
+      "Synced · server acknowledged · device token not saved",
+      true, true)).toEqual({
+      kind: "syncing", label: "認証未保存・再接続が必要"
+    });
+    expect(nativeConnectionState("Server save failed · IME not confirmed",
+      true, true).kind).toBe("error");
+  });
+  it("never paints a green mobile indicator for divergent or unverified history",()=>{
+    for (const message of [
+      "Server history changed · sync paused · local notes retained",
+      "Server history diverged · sync paused · local notes retained",
+      "Server history is behind · sync paused · local notes retained",
+      "Server update required · local notes retained",
+      "Server history cannot be verified · local notes retained"
+    ]) {
+      expect(nativeConnectionState(message,true,true,"ja").kind).toBe("error");
+      expect(nativeConnectionState(message,true,true,"en").kind).toBe("error");
+    }
   });
 });
 

@@ -56,7 +56,9 @@ jobs:
         run: node scripts/sync-smoke.mjs
 
       - name: Verify versioned BRAT assets and SHA-256 checksums
-        run: node scripts/validate-brat-release.mjs
+        run: |
+          node scripts/validate-brat-release.mjs
+          node scripts/validate-brat-release.mjs --check
 
       - name: Publish immutable GitHub prerelease with BRAT assets
         if: github.event_name == 'push' && github.ref == 'refs/heads/brat-preview'
@@ -100,6 +102,7 @@ jobs:
               const assets = [
                 ["main.js", "application/javascript"],
                 ["manifest.json", "application/json"],
+                ["styles.css", "text/css"],
                 ["SHA256SUMS.txt", "text/plain"]
               ];
               for (const [name, mime] of assets) {

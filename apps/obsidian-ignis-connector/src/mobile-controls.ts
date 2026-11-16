@@ -12,11 +12,22 @@ export function nativeConnectionState(
   language: "ja" | "en" = "ja"
 ): NativeStatus {
   const t = mobileUiCopy(language);
-  if (/revoked|unauthoriz|error|failed|need.s? review|conflict|blocked/i.test(message)) {
+  if (/revoked|rejected|unauthoriz|denied|not allowed|not available|error|failed|need.s? review|conflict|blocked|Undo\/Redo \d+件を確認|server history|sync paused|server update required|journal identity/i.test(message)) {
     return { kind: "error", label: t.attention };
   }
   if (!configured) return { kind: "offline", label: t.unconfigured };
   if (!socketOpen) return { kind: "offline", label: t.offline };
+  if (/IME not confirmed|IME未確定|変換未確定/i.test(message)) {
+    return { kind: "syncing", label: language === "ja"
+      ? (/peer edit waiting|競合保留/i.test(message)
+        ? "競合保留中・IME未確定" : "IME変換中・未確定")
+      : (/peer edit waiting/i.test(message)
+        ? "Peer edit waiting · IME draft" : "Converting · not confirmed") };
+  }
+  if (/device token not saved/i.test(message)) {
+    return { kind: "syncing", label: language === "ja"
+      ? "認証未保存・再接続が必要" : "Session only · token not saved" };
+  }
   if (/syncing|pending|waiting|offline|reconnect|awaiting/i.test(message)) {
     return { kind: "syncing", label: t.syncing };
   }

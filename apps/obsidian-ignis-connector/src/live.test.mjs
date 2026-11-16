@@ -12,7 +12,12 @@ function makeView(path, value) {
     composing: false,
     state: {
       field: () => ({ file: { path: currentPath } }),
-      doc: { toString: () => content }
+      doc: { toString: () => content },
+      get selection() {
+        const at = content.length;
+        return { main: {from:at,to:at,anchor:at,head:at},
+          ranges:[{anchor:at,head:at}],mainIndex:0 };
+      }
     },
     dispatch: () => {}
   };
@@ -79,6 +84,7 @@ describe("Native Obsidian offline Yjs bridge", () => {
     expect(s.manager.saveState().awaitingServer).toBe(0);
     room.blocked = true;
     expect(s.manager.saveState().blocked).toBe(1);
+    expect(s.manager.blockingPaths()).toEqual(["test.md"]);
     s.manager.disconnected();
     expect(s.manager.saveState().online).toBe(false);
   });
@@ -190,7 +196,7 @@ describe("Native Obsidian offline Yjs bridge", () => {
     expect(s.notices.at(-1).status).toMatch(/not merged/);
   });
 
-  it("defers remote state while an IME composition is active", async () => {
+  it("receives a disjoint peer edit while an IME composition is active", async () => {
     const s = harness();
     s.manager.connected();
     await s.manager.handle(serverInit("test.md", ID, "Initial"));
@@ -205,7 +211,7 @@ describe("Native Obsidian offline Yjs bridge", () => {
       channel: "collab", type: "update", path: "test.md",
       update: encodeYjs(Y.encodeStateAsUpdate(remote))
     });
-    expect(room.text.toString()).toBe("Initial");
+    expect(room.text.toString()).toBe("日本語Initial");
     s.manager.setComposing(s.view.view, false);
     expect(room.text.toString()).toBe("日本語Initial");
     remote.destroy();

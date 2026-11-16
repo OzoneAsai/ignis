@@ -1,0 +1,340 @@
+/* Ignis version migration: accessible on native Obsidian desktop and iOS. */
+.ignis-migration-modal {
+  width: min(1080px, calc(100vw - 28px));
+  max-width: 1080px;
+  max-height: min(90vh, 1000px);
+  overflow: auto;
+  border-radius: 18px;
+}
+
+.ignis-migration-modal .modal-content { padding: 24px; }
+.ignis-migration-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.ignis-migration-language {
+  font-size: var(--font-smaller);
+  min-height: 32px;
+  padding: 4px 11px;
+  border-radius: 100px;
+}
+.ignis-migration-eyebrow {
+  color: var(--interactive-accent);
+  font-size: var(--font-smallest);
+  font-weight: 750;
+  letter-spacing: 0.11em;
+  margin-bottom: 10px;
+}
+.ignis-migration-modal h2 {
+  margin: 0 0 8px;
+  font-size: clamp(21px, 3.2vw, 29px);
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+}
+.ignis-migration-intro {
+  color: var(--text-muted);
+  max-width: 75ch;
+  line-height: 1.65;
+  margin: 0 0 20px;
+}
+.ignis-migration-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.ignis-migration-steps > span {
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  border-radius: 100px;
+  padding: 7px 12px;
+  font-size: var(--font-smaller);
+  font-weight: 600;
+}
+.ignis-migration-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 16px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 13px;
+}
+.ignis-migration-button {
+  min-height: 36px;
+  max-width: 100%;
+  white-space: normal;
+  text-wrap: balance;
+  cursor: pointer;
+}
+.ignis-migration-button:focus-visible,
+.ignis-migration-select:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 3px;
+}
+.ignis-migration-feedback {
+  font-size: var(--font-small);
+  color: var(--text-muted);
+  margin: 10px 2px 16px;
+  min-height: 1.6em;
+}
+.ignis-migration-layout {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.34fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 18px;
+}
+.ignis-migration-list {
+  display: grid;
+  gap: 8px;
+  max-height: 58vh;
+  overflow-y: auto;
+  padding: 3px;
+}
+.ignis-migration-item {
+  padding: 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+}
+.ignis-migration-item.is-selected {
+  border-color: var(--interactive-accent);
+  box-shadow: inset 3px 0 0 var(--interactive-accent);
+}
+.ignis-migration-select {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  text-align: left;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ignis-migration-item-note {
+  color: var(--text-muted);
+  font-size: var(--font-smaller);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.ignis-migration-detail { min-width: 0; }
+.ignis-migration-detail h3 {
+  margin: 4px 0 8px;
+  font-size: var(--font-ui-medium);
+  overflow-wrap: anywhere;
+}
+.ignis-migration-reason { color: var(--text-muted); margin: 0 0 13px; }
+.ignis-migration-saved {
+  padding: 12px;
+  margin-bottom: 13px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 11px;
+  background: var(--background-secondary);
+}
+.ignis-migration-saved strong { display: block; margin-bottom: 7px; }
+.ignis-migration-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--background-modifier-border);
+  overflow-wrap: anywhere;
+  font-size: var(--font-small);
+}
+.ignis-migration-actions, .ignis-migration-finish {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.ignis-migration-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 15px 0;
+}
+.ignis-migration-version {
+  min-width: 0;
+  border-radius: 12px;
+  border: 1px solid var(--background-modifier-border);
+  overflow: hidden;
+}
+.ignis-migration-version h4 {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--background-secondary);
+  font-size: var(--font-ui-small);
+}
+.ignis-migration-version pre {
+  margin: 0;
+  padding: 12px;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-smaller);
+  line-height: 1.6;
+  user-select: text;
+}
+.ignis-migration-finish {
+  padding: 14px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+}
+.ignis-migration-finish > p {
+  width: 100%;
+  margin: 0 0 5px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+@media (max-width: 720px) {
+  .ignis-migration-modal {
+    width: calc(100vw - 12px);
+    max-height: calc(100dvh - 16px);
+    border-radius: 13px;
+  }
+  .ignis-migration-modal .modal-content { padding: 14px; }
+  .ignis-migration-modal h2 { font-size: 22px; line-height: 1.3; }
+  .ignis-migration-intro { font-size: var(--font-ui-small); line-height: 1.5; margin-bottom: 14px; }
+  .ignis-migration-steps { gap: 5px; margin-bottom: 12px; }
+  .ignis-migration-steps > span { padding: 5px 8px; font-size: 11px; }
+  .ignis-migration-layout { grid-template-columns: minmax(0, 1fr); gap: 13px; }
+  .ignis-migration-list {
+    max-height: 150px;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(155px, 72%);
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x proximity;
+    padding-bottom: 10px;
+  }
+  .ignis-migration-item { scroll-snap-align: start; }
+  .ignis-migration-comparison { grid-template-columns: minmax(0, 1fr); }
+  .ignis-migration-toolbar > .ignis-migration-button { width: 100%; }
+  .ignis-migration-version pre { max-height: 170px; }
+  .ignis-migration-actions > button { flex: 1 1 150px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ignis-migration-modal *, .ignis-migration-modal *::before,
+  .ignis-migration-modal *::after { scroll-behavior: auto !important; }
+}
+
+/* An ambiguous undo must be reviewable without hiding the current note,
+   replacing the editor buffer, or requiring a precise touch target. */
+.ignis-undo-review-modal {
+  width: min(680px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+}
+.ignis-undo-review-modal .modal-content {
+  overflow-y: auto;
+  padding: 22px;
+}
+.ignis-undo-review-modal h2 {
+  font-size: 21px;
+  line-height: 1.3;
+  margin: 0 0 12px;
+}
+.ignis-undo-review-modal > .modal-content > p {
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+.ignis-undo-review-item {
+  min-width: 0;
+  margin: 18px 0;
+  padding: 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-secondary);
+}
+.ignis-undo-review-item h3 {
+  font-size: var(--font-ui-medium);
+  line-height: 1.4;
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+.ignis-undo-review-item > p {
+  margin: 8px 0;
+  line-height: 1.5;
+}
+.ignis-undo-review-original {
+  box-sizing: border-box;
+  display: block;
+  resize: vertical;
+  min-height: 92px;
+  max-height: 32dvh;
+  margin: 10px 0 8px;
+  padding: 12px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+}
+.ignis-undo-review-original:focus-visible,
+.ignis-undo-review-modal button:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+.ignis-undo-review-item small {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--text-muted);
+}
+.ignis-undo-review-item details {
+  margin: 12px 0;
+}
+.ignis-undo-review-item details > summary {
+  cursor: pointer;
+  min-height: 36px;
+  padding: 6px 0;
+}
+.ignis-undo-review-item pre {
+  max-height: 190px;
+  padding: 12px;
+  border-radius: 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.ignis-undo-review-feedback {
+  min-height: 1.4em;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+.ignis-undo-review-item .setting-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-top: 10px;
+}
+.ignis-undo-review-item .setting-item-control {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+@media (max-width: 600px) {
+  .ignis-undo-review-modal .modal-content { padding: 14px; }
+  .ignis-undo-review-item { padding: 12px; }
+  .ignis-undo-review-item .setting-item-control,
+  .ignis-undo-review-item .setting-item-control > button { width: 100%; }
+  .ignis-undo-review-item .setting-item-control > button { min-height: 44px; }
+}

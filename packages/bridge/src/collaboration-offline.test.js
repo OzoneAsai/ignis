@@ -147,6 +147,46 @@ describe("IndexedDB offline CRDT lifecycle", () => {
     // The selected new-generation journal must also be released before cleanup.
     await clearDocument(`${key}:generation:${newId}`);
   });
+  it("adopts identical server bytes under a fresh Yjs generation without resurfacing a duplicate draft", async () => {
+    const first = createOfflineDocument("offline-lab", "draft.md");
+    await first.ready;
+    first.text.insert(0, "Same text but different Yjs IDs");
+    await first.markInitialized();
+    const id = "33333333-3333-4333-8333-333333333333";
+    await first.activateGeneration(id, null);
+    await first.close();
+    const adopted = createOfflineDocument("offline-lab", "draft.md");
+    expect(await adopted.ready).toBe(false);
+    expect(adopted.activeGeneration).toBe(id);
+    expect(await adopted.recoverReplacedDraft()).toBeNull();
+    // The old origin must not be replayed into the new server CRDT.
+    expect(adopted.text.toString()).toBe("");
+    adopted.text.insert(0, "Same text but different Yjs IDs");
+    await adopted.markInitialized();
+    await adopted.setServerIdentity(id);
+    await adopted.close();
+    const afterRestart = createOfflineDocument("offline-lab", "draft.md");
+    expect(await afterRestart.ready).toBe(true);
+    expect(afterRestart.text.toString()).toBe("Same text but different Yjs IDs");
+    expect(await afterRestart.persistence.get("server-document-id")).toBe(id);
+    await afterRestart.close();
+    await clearDocument(`${key}:generation:${id}`);
+  });
+  it("never replaces the durable generation pointer from an obsolete editor session", async () => {
+    const first = createOfflineDocument("offline-lab", "draft.md");
+    await first.ready;
+    first.text.insert(0, "Protected prior contents");
+    await first.markInitialized();
+    expect(await first.activateGeneration(
+      "44444444-4444-4444-8444-444444444444", null, () => false
+    )).toBe(false);
+    await first.close();
+    const reopened = createOfflineDocument("offline-lab", "draft.md");
+    expect(await reopened.ready).toBe(true);
+    expect(reopened.activeGeneration).toBeNull();
+    expect(reopened.text.toString()).toBe("Protected prior contents");
+    await reopened.close();
+  });
 
   it("never exchanges CRDT updates between tabs with different document generations", async () => {
     const first = createOfflineDocument("offline-lab", "draft.md");

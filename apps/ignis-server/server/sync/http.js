@@ -173,17 +173,60 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
     }
     req.ignisSyncDevice = device;
     req.ignisSyncAuth = login && !match ? "tailnet" : "device";
+    // The request's body and opId remain byte-for-byte compatible with old
+    // operation receipts. A separate precondition header allows upgraded
+    // Connectors to prevent commits to a replacement journal even when the
+    // server changes between a manifest check and an outgoing POST.
+    const expectedLineage = req.get("X-Ignis-Journal-Lineage");
+    if (req.method !== "GET" && expectedLineage &&
+        expectedLineage !== store.journalLineage(req.params.vaultId)) {
+      return res.status(409).json({ code: "JOURNAL_LINEAGE_MISMATCH",
+        error: "Server Sync history changed; local operations must be reviewed" });
+    }
+    const checkpointSeq = req.get("X-Ignis-Journal-Cursor");
+    const checkpointProof = req.get("X-Ignis-Journal-Proof");
+    if (req.method !== "GET" &&
+        (checkpointSeq !== undefined || checkpointProof !== undefined)) {
+      const seq = Number(checkpointSeq);
+      if (!expectedLineage || checkpointSeq === undefined ||
+          !/^(0|[1-9][0-9]*)$/.test(checkpointSeq) ||
+          !Number.isSafeInteger(seq) ||
+          typeof checkpointProof !== "string" ||
+          !/^[a-f0-9]{64}$/.test(checkpointProof)) {
+        return res.status(400).json({code:"INVALID_CHECKPOINT",
+          error:"A complete valid Sync history checkpoint is required"});
+      }
+      // The client can remain behind unrelated editors without losing write
+      // access; the exact former operation, not the latest server HEAD, is
+      // the CAS condition. This closes a restore/catch-up race between a
+      // client's manifest verification and a delayed outgoing write.
+      if (store.journalCheckpoint(req.params.vaultId,seq).proof !== checkpointProof) {
+        return res.status(409).json({code:"JOURNAL_CHECKPOINT_MISMATCH",
+          error:"Server Sync history differs from a previously verified checkpoint"});
+      }
+    }
     next();
   });
   router.get("/vaults/:vaultId/session", (req, res) => {
     const device = req.ignisSyncDevice;
     res.json({ deviceId: device.deviceId, vaultId: device.vaultId,
       label: device.label, auth: req.ignisSyncAuth,
+      journalLineage: store.journalLineage(device.vaultId),
       contentScope: store.contentScopeFor(device.vaultId),
       mediaBypassExtensions: store.mediaBypassFor(device.vaultId) });
   });
   router.get("/vaults/:vaultId/manifest", route(async (req, res) => {
     res.json(await store.scan(req.params.vaultId));
+  }));
+  router.get("/vaults/:vaultId/checkpoint", route(async (req, res) => {
+    const seq = Number(req.query.seq);
+    if (!Number.isSafeInteger(seq) || seq < 0 || req.query.seq === undefined) {
+      return res.status(400).json({code:"INVALID_CURSOR",error:"Invalid checkpoint sequence"});
+    }
+    // A read-only indexed witness for the exact historical frontier already
+    // acknowledged by this client. Do not advance, rescan or mutate a Vault
+    // when another client is verifying continuity before replaying writes.
+    res.json(store.journalCheckpoint(req.params.vaultId, seq));
   }));
   router.get("/vaults/:vaultId/changes", route(async (req, res) => {
     const since = Number(req.query.since ?? 0);
@@ -195,12 +238,17 @@ function createSyncRouter({ store, token, tailnetAccess = new Map() }) {
     await store.scan(req.params.vaultId);
     res.json(store.changes(req.params.vaultId, since, limit));
   }));
-  router.get("/vaults/:vaultId/operations/:opId", route((req, res) => {
+  router.get("/vaults/:vaultId/operations/:opId", route(async (req, res) => {
+    await store.recover(req.params.vaultId);
     const receipt = store.operationReceipt(req.params.vaultId, req.params.opId);
     if (!receipt) return res.status(404).json({
       code: "OPERATION_NOT_FOUND", error: "Operation not recorded"
     });
+    await store.retireCommittedCreateMarker(req.params.vaultId, req.params.opId);
     res.json(receipt);
+  }));
+  router.post("/vaults/:vaultId/operations/:opId/abandon", route(async (req, res) => {
+    res.json(await store.abandonOperation(req.params.vaultId, req.params.opId));
   }));
   router.get("/vaults/:vaultId/files/:fileId", route(async (req, res) => {
     const result = await store.read(req.params.vaultId, req.params.fileId);
@@ -235,7 +283,8 @@ function registerSyncChannel(wss, store, { token, tailnetAccess = new Map() } = 
     peers.add(ws);
     ws.send(JSON.stringify({ channel: "sync", type: "ready",
       vaultId: ws.ignisVaultId, deviceId: device.deviceId,
-      vaultSeq: store.head(ws.ignisVaultId) }));
+      vaultSeq: store.head(ws.ignisVaultId),
+      journalLineage: store.journalLineage(ws.ignisVaultId) }));
   });
   channel.on("resume", (msg, ws) => {
     if (!store.deviceActive(authorized.get(ws), ws.ignisVaultId)) {

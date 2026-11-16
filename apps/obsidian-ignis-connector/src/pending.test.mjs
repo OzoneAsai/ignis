@@ -82,6 +82,23 @@ describe("offline mutation queue as path transitions of one file identity", () =
       ...receipt(value.pending[0], 11), toPath: "secret.md"
     })).toThrow(/different queued operation/);
     expect(JSON.stringify(value)).toBe(before);
+    expect(() => acknowledgePending(value, {
+      ...receipt(value.pending[0], 11), seq: Number.NaN
+    })).toThrow(/different queued operation/);
+    expect(JSON.stringify(value)).toBe(before);
+  });
+  it("acknowledges an independent later file while a conflicting earlier intention is retained", () => {
+    const value = state();
+    value.baselines["Independent.md"] = {
+      fileId: "other", generationId: "other-generation", hash: "digest-other", revision: 1
+    };
+    queueRename(value, "A.md", "B.md", "blocked-rename");
+    queueRename(value, "Independent.md", "Moved.md", "safe-rename");
+    const later = value.pending[1];
+    acknowledgePending(value, { ...receipt(later, 17), hash: "digest-other" });
+    expect(value.pending.map(x => x.opId)).toEqual(["blocked-rename"]);
+    expect(value.baselines["A.md"]).toEqual(identity);
+    expect(value.baselines["Moved.md"].fileId).toBe("other");
   });
 
   it("blocks a confirmed destination collision before removing the source", () => {

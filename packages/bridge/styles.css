@@ -427,6 +427,15 @@
   cursor: pointer;
 }
 
+/* IME is an editing state, not a disconnection or a completed user choice.
+   Keep the status visible without a toast covering the conversion candidates. */
+.ignis-collaboration-status.ignis-composition-active {
+  font-weight: 600;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--text-muted);
+}
+
 /* Ignis occupies one native Obsidian navbar slot, never a fixed overlay. */
 .ignis-navbar-action {
   position: relative;

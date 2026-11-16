@@ -130,7 +130,10 @@ vi.mock("obsidian", () => {
   return {
     Plugin: MockPlugin,
     PluginSettingTab: class {
-      constructor() { this.containerEl = document.createElement("div"); }
+      constructor(app) {
+        this.app = app;
+        this.containerEl = document.createElement("div");
+      }
     },
     Setting, Modal: MockModal, Notice: class {}, TFile: class {},
     setIcon: (element, icon) => { element.dataset.icon = icon; },
@@ -146,8 +149,9 @@ vi.mock("./live", () => ({
   }
 }));
 import IgnisConnector, {
-  ConnectorSettings, DisplayNameModal, CollaboratorsModal
+  ConnectorSettings, DisplayNameModal, CollaboratorsModal, UndoReviewModal
 } from "./main.ts";
+import { TFile } from "obsidian";
 
 const validToken = "ignis_dev_" + "a".repeat(43);
 const flush = async () => {
@@ -168,6 +172,12 @@ function setup({ ready = false } = {}) {
     openDisplayName: vi.fn(),
     getCurrentStatus: () => "Offline · local Vault retained",
     openSyncIssues: vi.fn(),
+    journalRecoveryInfo: () => null,
+    recheckJournal: vi.fn(async()=>({ok:true,
+      message:"Server history verified. Synchronization is resuming."})),
+    getUndoReviews: () => [],
+    openUndoReview: vi.fn(),
+    dismissUndoReview: vi.fn(() => true),
     currentParticipants: () => ({path: "demo.md", peers: []}),
     takeIncomingLink: () => "",
     connectionSummary: () => ({ ready, vaultId: ready ? "MarkdownLab" : "",
@@ -208,6 +218,64 @@ function setup({ ready = false } = {}) {
 }
 
 describe("native Obsidian one-button onboarding UI", () => {
+  it("schedules a newly created note immediately without waiting for another modify event", async () => {
+    const plugin = new IgnisConnector();
+    const listeners = new Map();
+    plugin.app.vault.on = (name, callback) => {
+      listeners.set(name, callback);
+      return { name };
+    };
+    await plugin.onload();
+    plugin.schedule = vi.fn();
+    const note = new TFile();
+    note.path = "Notes/from-other-site.md";
+    listeners.get("create")(note);
+    expect(plugin.schedule).toHaveBeenCalledOnce();
+    plugin.quiet.add(note.path);
+    listeners.get("create")(note);
+    expect(plugin.schedule).toHaveBeenCalledOnce();
+  });
+  it("updates live file eligibility on Vault events and detaches after settings close", async () => {
+    const { plugin } = setup();
+    plugin.getSharingDetails.mockClear();
+    const listeners = new Map();
+    const vault = {
+      on: vi.fn((event, callback) => {
+        const ref = { event, callback };
+        listeners.set(event, ref);
+        return ref;
+      }),
+      offref: vi.fn((ref) => {
+        if (listeners.get(ref.event) === ref) listeners.delete(ref.event);
+      }),
+    };
+    const tab = new ConnectorSettings({ vault }, plugin);
+    tab.display();
+    expect(listeners.size).toBe(4);
+    const summary = tab.containerEl.querySelector(".ignis-sharing-summary");
+    expect(summary.textContent).toContain("3 file(s) eligible");
+    plugin.getSharingDetails.mockReturnValue({
+      sharedFiles: 4, localOnlyFiles: 1, pendingOperations: 0,
+      localOnlyBytes: 4096, blockedQueued: 0, oversizedFiles: 1,
+    });
+    for (const event of ["create", "modify", "rename"]) {
+      listeners.get(event).callback();
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(plugin.getSharingDetails).toHaveBeenCalledTimes(2);
+    expect(summary.textContent).toContain("4 file(s) eligible");
+    expect(summary.textContent).toContain("exceed the 4 MiB");
+    tab.hide();
+    expect(vault.offref).toHaveBeenCalledTimes(4);
+    expect(listeners.size).toBe(0);
+    plugin.getSharingDetails.mockReturnValue({
+      sharedFiles: 5, localOnlyFiles: 0, pendingOperations: 0,
+      localOnlyBytes: 0, blockedQueued: 0, oversizedFiles: 0,
+    });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(summary.textContent).toContain("4 file(s) eligible");
+  });
+
   it("offers PDF/media bypass in the same mobile-compatible Connector UI", () => {
     const { containerEl } = setup();
     const region = containerEl.querySelector(".ignis-media-bypass-details");
@@ -386,6 +454,102 @@ describe("native Obsidian one-button onboarding UI", () => {
     change.click();
     expect(plugin.openDisplayName).toHaveBeenCalledOnce();
     expect(modal.closed).toBe(true);
+  });
+  it("provides a non-destructive Undo review with the exact invisible newlines", async () => {
+    const { plugin } = setup();
+    const entry = {
+      path: "FAQ/Questions.md", documentId: "a-generation", operation: "undo",
+      deleted: "\n\n", reason: "boundary-removed", context: "Q: changed?A: answer"
+    };
+    plugin.getUndoReviews = vi.fn(() => [entry]);
+    const collaborators = new CollaboratorsModal({}, plugin);
+    collaborators.open();
+    const reviewButton = [...collaborators.contentEl.querySelectorAll("button")]
+      .find(button => button.textContent === "内容を確認");
+    expect(reviewButton).toBeDefined();
+    reviewButton.click();
+    expect(plugin.openUndoReview).toHaveBeenCalledOnce();
+    const modal = new UndoReviewModal({}, plugin);
+    modal.open();
+    const original = modal.contentEl.querySelector("textarea");
+    expect(original.value).toBe("\n\n");
+    expect(original.readOnly).toBe(true);
+    expect(modal.contentEl.textContent).toContain("改行 2 個");
+    expect(modal.contentEl.textContent).toContain("FAQ/Questions.md");
+    expect(modal.contentEl.textContent).toContain("Q: changed?A: answer");
+    // Merely opening the review must not alter a native editor.
+    expect(plugin.dismissUndoReview).not.toHaveBeenCalled();
+    const dismiss = [...modal.contentEl.querySelectorAll("button")]
+      .find(button => button.textContent === "確認済みにする");
+    dismiss.click();
+    expect(plugin.dismissUndoReview).toHaveBeenCalledWith(entry);
+  });
+  it("persists review details locally, keeps them out of a different Vault, and allows explicit dismissal", async () => {
+    const entry = {
+      path:"FAQ/Collaboration.md",documentId:"first-generation",
+      operation:"undo",deleted:"\n\n",reason:"boundary-removed",
+      context:"Question?Answer"
+    };
+    const connector = new IgnisConnector();
+    connector.settings = {scope:"https://one.example|VaultA",undoReviews:[]};
+    connector.live = {
+      pendingUndoReviews:vi.fn(() => [entry]),
+      dismissUndoReview:vi.fn(() => true)
+    };
+    const write = vi.fn(async () => {});
+    connector.saveData = write;
+    connector.rememberUndoReviews();
+    await flush();
+    expect(write).toHaveBeenCalledOnce();
+    expect(write.mock.calls[0][0].undoReviews).toMatchObject([
+      { ...entry, scope:"https://one.example|VaultA" }
+    ]);
+    connector.live.pendingUndoReviews = () => [];
+    expect(connector.getUndoReviews()).toMatchObject([entry]);
+    connector.settings.scope = "https://two.example|VaultB";
+    expect(connector.getUndoReviews()).toEqual([]);
+    connector.settings.scope = "https://one.example|VaultA";
+    expect(connector.dismissUndoReview(entry)).toBe(true);
+    await flush();
+    expect(connector.getUndoReviews()).toEqual([]);
+    expect(connector.live.dismissUndoReview).toHaveBeenCalledWith(
+      entry.path,entry.documentId);
+    expect(write).toHaveBeenCalledTimes(2);
+  });
+  it("shows a held Undo review without falsely replacing the last confirmed Sync status", () => {
+    const connector = new IgnisConnector();
+    connector.settings = {scope:"v|lab",undoReviews:[{
+      path:"a.md",documentId:"G",operation:"undo",
+      deleted:"\n\n",reason:"boundary-removed",context:"A",scope:"v|lab",
+      capturedAt:Date.now()
+    }]};
+    connector.live = {pendingUndoReviews:()=>[],dismissUndoReview:()=>false};
+    connector.status = document.createElement("span");
+    connector.showStatus("Synced · server acknowledged");
+    expect(connector.getCurrentStatus()).toContain("Undo/Redo 1件を確認");
+    expect(connector.status.textContent).toContain("Synced · server acknowledged");
+    connector.persistSettings = vi.fn(async()=>{});
+    expect(connector.dismissUndoReview(connector.getUndoReviews()[0])).toBe(true);
+    expect(connector.getCurrentStatus()).toBe("Synced · server acknowledged");
+  });
+  it("shows a short native IME warning without lying about server durability",()=>{
+    const plugin=new IgnisConnector();
+    const current={composing:true,peerEditWaiting:false};
+    plugin.app.workspace.getActiveFile=()=>({path:"IME.md"});
+    plugin.settings={scope:"lab",undoReviews:[]};
+    plugin.live={compositionState:()=>current,pendingUndoReviews:()=>[]};
+    plugin.status=document.createElement("span");
+    plugin.showStatus("Synced · server acknowledged");
+    expect(plugin.status.textContent).toBe("Ignis: IME変換中 · 未確定");
+    expect(plugin.status.getAttribute("aria-label"))
+      .toMatch(/Server has received provisional text.*IME not confirmed/);
+    expect(plugin.getCurrentStatus()).not.toContain("Synced · server acknowledged");
+    current.peerEditWaiting=true;
+    plugin.renderStatus();
+    expect(plugin.status.textContent).toContain("競合保留中");
+    current.composing=false;
+    plugin.renderStatus();
+    expect(plugin.status.textContent).toBe("Ignis: Synced · server acknowledged");
   });
 
   it("persists sanitized names and broadcasts a live identity without reconnecting", async () => {

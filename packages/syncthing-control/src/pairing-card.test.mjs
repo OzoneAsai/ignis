@@ -40,7 +40,7 @@ describe("IGNIS media pairing card", () => {
 
   it("selects only plausible Tailscale IPv4 and explicit configured TCP ports", () => {
     expect(tailscaleIPv4Candidates({
-      ethernet: [{ family: "IPv4", internal: false, address: "192.168.1.7" }],
+      ethernet: [{ family: "IPv4", internal: false, address: "192.168.42.7" }],
       tailscale: [{ family: "IPv4", internal: false, address: "100.75.232.0" }],
       loopback: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
     })).toEqual(["100.75.232.0"]);

@@ -201,7 +201,8 @@ export function createWatcherClient(
         }
       } else if (
         meta.type === "file" &&
-        (existing.mtime !== meta.mtime || existing.size !== meta.size)
+        (existing.offlineRecovery || existing.mtime !== meta.mtime ||
+          existing.size !== meta.size)
       ) {
         handleModified({
           path,

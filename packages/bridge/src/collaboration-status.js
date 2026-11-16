@@ -11,7 +11,9 @@ export function collaborationStatus(current, online) {
   if (current.storageError) {
     status = "Collab: local storage failed · keep this tab open";
   } else if (current.generationMismatch) {
-    status = "Collab: note replaced · old draft protected";
+    status = current.joinConflictReason === "independent"
+      ? "Collab: separate original · draft protected"
+      : "Collab: note replaced · old draft protected";
   } else if (!current.hydrated) {
     status = "Collab: loading local draft…";
   } else if (!current.initialized) {
@@ -20,6 +22,10 @@ export function collaborationStatus(current, online) {
     status = "Collab: server save failed · local draft retained";
   } else if (current.protocolError) {
     status = "Collab: synchronization error · check this note";
+  } else if (current.causalGap) {
+    status = online
+      ? "Collab: recovering missing shared history…"
+      : "Collab: offline · shared history incomplete";
   } else if (current.localSaving || current.previewSaving || current.identitySaving) {
     status = online ? "Collab: saving to device…" : "Collab: offline · saving locally…";
   } else if (!online) {
@@ -32,9 +38,41 @@ export function collaborationStatus(current, online) {
     status = `Collab: ${current.participants} online · saved`;
   }
 
+  // A successful server receipt confirms durability of the *provisional*
+  // CRDT bytes, not that the human accepted an IME conversion candidate.
+  // These are independent dimensions and both need to be visible.
+  if (current.composing) {
+    status = status.replace(/ · saved$/, " · provisional draft acknowledged");
+    status += " · IME not confirmed";
+    if (current.compositionPublished && online) {
+      status += " · draft may be visible to peers";
+    }
+    if (current.imeProjectionBlocked) {
+      status += " · peer edit waiting for candidate end";
+    }
+  }
+
   if (typeof current.pendingConflict === "string" && !current.generationMismatch) {
     status += " · recovered draft available";
   }
 
   return status;
+}
+
+// The status bar is narrow, especially alongside Obsidian's other items.
+// Keep the full, truthful state in the dialog / accessible label; make the
+// always-visible summary readable without truncating the critical IME fact.
+export function collaborationStatusSummary(current, online) {
+  if (!current) return "";
+  if (!current.composing) return collaborationStatus(current,online);
+  if (current.storageError) return "ローカル保存失敗 · IME未確定";
+  if (current.serverSaveError) return "サーバー保存失敗 · IME未確定";
+  if (current.protocolError || current.generationMismatch) {
+    return "同期確認が必要 · IME未確定";
+  }
+  if (current.causalGap) return "履歴を修復中 · IME未確定";
+  if (!online) return "オフライン · IME未確定";
+  if (!current.joined || !current.initialized) return "再接続中 · IME未確定";
+  if (current.imeProjectionBlocked) return "競合保留中 · IME未確定";
+  return "IME変換中 · 未確定";
 }

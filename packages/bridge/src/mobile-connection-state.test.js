@@ -32,6 +32,28 @@ describe("mobile WebUI connection and durability indicator", () => {
     expect(mobileConnectionState(joined, "open", "pending").kind).toBe("syncing");
     expect(mobileConnectionState({ ...joined, dirty: true }, "open").kind).toBe("syncing");
   });
+  it("does not display a green synced badge with a missing Yjs ancestor", () => {
+    expect(mobileConnectionState({...joined,causalGap:true},"open"))
+      .toEqual({kind:"syncing",label:"共同編集履歴を修復中"});
+  });
+
+  it("shows an IME candidate as unfinished even if the provisional network save was acknowledged", () => {
+    const provisional = { ...joined, composing: true, compositionPublished: true };
+    const indicator = mobileConnectionState(provisional, "open");
+    expect(indicator.kind).toBe("syncing");
+    expect(indicator.label).toContain("変換中");
+    expect(indicator.label).not.toBe("同期済み");
+    expect(mobileConnectionState(provisional, "open", "clean", 0, "en").label)
+      .toContain("Converting");
+  });
+
+  it("still prioritizes save failures and offline over IME status", () => {
+    const provisional = { ...joined, composing: true };
+    expect(mobileConnectionState({
+      ...provisional, serverSaveError: true,
+    }, "open").kind).toBe("error");
+    expect(mobileConnectionState(provisional, "closed").kind).toBe("offline");
+  });
   it("prioritizes offline status and flags unsaved errors on a live connection", () => {
     expect(mobileConnectionState({ ...joined, dirty: true }, "closed").kind)
       .toBe("offline");
@@ -40,5 +62,16 @@ describe("mobile WebUI connection and durability indicator", () => {
     expect(mobileConnectionState(joined, "open", "clean", 2).kind).toBe("error");
     expect(mobileConnectionState({ ...joined, pendingConflict: "old" }, "open").kind)
       .toBe("error");
+  });
+  it("never hides an independently protected offline original behind a plain offline icon", () => {
+    const state=mobileConnectionState({
+      ...joined,generationMismatch:"new-id",joinConflictReason:"independent",
+      pendingConflict:"important offline original"
+    },"closed");
+    expect(state).toEqual({kind:"error",label:"オフライン・要確認"});
+    expect(mobileConnectionState({...joined,storageError:Error("disk")},
+      "closed","clean",0,"en").label).toContain("needs review");
+    expect(mobileConnectionState({...joined,dirty:true},"closed").kind)
+      .toBe("offline");
   });
 });

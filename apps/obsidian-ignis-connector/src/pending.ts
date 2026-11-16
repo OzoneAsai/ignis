@@ -85,8 +85,10 @@ export function queueDelete(
 export function acknowledgePending(
   state: PendingState, received: Receipt
 ): PendingMutation {
-  const pending = state.pending[0];
-  if (!pending || pending.fileId !== received.fileId ||
+  const index = state.pending.findIndex(item => item.opId === received.opId);
+  const pending = state.pending[index];
+  if (!pending || !Number.isSafeInteger(received.seq) || received.seq < 1 ||
+      pending.fileId !== received.fileId ||
       pending.generationId !== received.generationId ||
       pending.opId !== received.opId || pending.type !== received.type ||
       pending.path !== received.path ||
@@ -111,6 +113,6 @@ export function acknowledgePending(
       generationId: received.generationId
     };
   }
-  state.pending.shift();
+  state.pending.splice(index, 1);
   return pending;
 }

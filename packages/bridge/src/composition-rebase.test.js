@@ -1,10 +1,65 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import {
-  beginComposition, publishComposition, commitComposition
+  beginComposition, publishComposition, commitComposition,
+  independentCompositionDelta, projectIndependentCompositionUpdate
 } from "./composition-rebase.js";
 
 describe("browser IME transaction rebase", () => {
+  it("accepts an independent third participant after an earlier remote conflict was deferred", () => {
+    const initial = "Q: 変換中の更新は？\n\nA: ";
+    const live=new Y.Doc();
+    live.getText("content").insert(0,initial);
+    const snapshot=beginComposition(live);
+    publishComposition(live,snapshot,initial+"へんかん中","local-ime");
+    const guard={from:initial.length,to:initial.length+"へんかん中".length};
+    const conflicting=new Y.Doc(), independent=new Y.Doc();
+    Y.applyUpdate(conflicting,Y.encodeStateAsUpdate(live));
+    Y.applyUpdate(independent,Y.encodeStateAsUpdate(live));
+    conflicting.getText("content").insert(initial.length,"競合する答え");
+    const changed=Y.encodeStateAsUpdate(conflicting,Y.encodeStateVector(live));
+    Y.applyUpdate(live,changed,"remote");
+    const held=projectIndependentCompositionUpdate(snapshot,changed,guard,()=> {
+      throw Error("Conflicting candidate content must never be projected");
+    });
+    expect(held.projected).toBe(false);
+    expect(snapshot.text.toString()).toBe(initial+"へんかん中");
+    independent.getText("content").insert(0,"第三者の質問追記。\n");
+    const disjoint=Y.encodeStateAsUpdate(independent,Y.encodeStateVector(live));
+    Y.applyUpdate(live,disjoint,"remote");
+    let displayed="";
+    const projected=projectIndependentCompositionUpdate(snapshot,disjoint,guard,
+      (target,delta)=>{
+        displayed=target.toString();
+        expect(independentCompositionDelta(delta,guard)).toBe(true);
+        return true;
+      });
+    expect(projected.projected).toBe(true);
+    expect(displayed).toBe("第三者の質問追記。\n"+initial+"へんかん中");
+    expect(snapshot.text.toString()).toBe(displayed);
+    expect(projected.guard.from).toBe(guard.from+"第三者の質問追記。\n".length);
+    commitComposition(live,snapshot,displayed,"local-ime");
+    expect(live.getText("content").toString()).toContain("第三者の質問追記。");
+    expect(live.getText("content").toString()).toContain("競合する答え");
+    expect(live.getText("content").toString()).toContain("へんかん中");
+    conflicting.destroy();independent.destroy();live.destroy();
+  });
+
+  it("treats IME as an ordinary active editing state: remote changes outside the candidate can project", () => {
+    const guard={from:7,to:9};
+    expect(independentCompositionDelta([
+      {insert:"前置き "},{retain:12}
+    ],guard)).toBe(true);
+    expect(independentCompositionDelta([
+      {retain:10},{insert:" 追記"}
+    ],guard)).toBe(true);
+    expect(independentCompositionDelta([
+      {retain:8},{insert:"別候補"}
+    ],guard)).toBe(false);
+    expect(independentCompositionDelta([
+      {retain:7},{delete:2}
+    ],guard)).toBe(false);
+  });
   it("keeps remote text live and merges a Japanese IME draft without overwriting it", () => {
     const live = new Y.Doc();
     const text = live.getText("content");

@@ -40,6 +40,33 @@ afterEach(() => {
 });
 
 describe("one durable Vault change journal", () => {
+  it("persists an independent journal lineage across a server restart, not across a same-name replacement", async () => {
+    const { store, vault, root, collab } = testStore();
+    fs.writeFileSync(path.join(vault, "same.md"), "The original body");
+    const before = await store.scan("vault");
+    const lineage = store.journalLineage("vault");
+    expect(before.journalLineage).toBe(lineage);
+    expect(lineage).toMatch(/^[a-f0-9-]{36}$/);
+    store.close();
+    active.pop();
+    const options = { getVaultPath:id=>id==="vault"?vault:null,
+      collaboration:collab,writeCoalescer:{flushPending:async()=>{}} };
+    const restarted = new VaultSyncStore({...options,dataRoot:root});
+    active.push({store:restarted,root});
+    expect((await restarted.scan("vault")).journalLineage).toBe(lineage);
+
+    // A rebuilt SQLite store can have exactly the same Vault path, file
+    // contents and sequence. It is still not the same history.
+    const secondRoot=fs.mkdtempSync(path.join(os.tmpdir(),"ignis-new-journal-"));
+    const replacement = new VaultSyncStore({...options,dataRoot:secondRoot});
+    active.push({store:replacement,root:secondRoot});
+    const impostor=await replacement.scan("vault");
+    expect(impostor.vaultSeq).toBe(before.vaultSeq);
+    expect(impostor.files[0].path).toBe(before.files[0].path);
+    expect(impostor.files[0].hash).toBe(before.files[0].hash);
+    expect(impostor.journalLineage).not.toBe(lineage);
+    expect(impostor.files[0].generationId).not.toBe(before.files[0].generationId);
+  });
   it("shares only Markdown with Syncthing absent, preserving media on disk", async () => {
     const { store, vault } = testStore("markdown-only");
     fs.mkdirSync(path.join(vault, "Media"));
@@ -220,6 +247,66 @@ describe("one durable Vault change journal", () => {
     }]);
     expect(fs.readdirSync(vault)).toContain("casenote.md");
     expect(fs.readdirSync(vault)).not.toContain("CaseNote.md");
+  });
+  it("rejects same-inode filesystem aliases as conflicts without replacing the first writer", async () => {
+    const { store, vault } = testStore();
+    const original = {
+      type: "create", path: "CaseConflict.md",
+      content: "Mac's first note", opId: "case-original-0001"
+    };
+    const first = await store.apply("vault", original);
+    const firstPath = path.join(vault, original.path);
+    const aliasPath = path.join(vault, "caseconflict.md");
+    const aliasStat = fs.statSync(aliasPath, { throwIfNoEntry: false });
+    if (!aliasStat || aliasStat.ino !== fs.statSync(firstPath).ino) return;
+    await expect(store.apply("vault", {
+      type: "create", path: "caseconflict.md",
+      content: "SLS's different note", opId: "case-alias-0001"
+    })).rejects.toMatchObject({ status: 409, code: "CREATE_CONFLICT" });
+    expect(fs.readFileSync(firstPath, "utf8")).toBe(original.content);
+    expect(store.manifest("vault").files).toMatchObject([{
+      path: original.path, fileId: first.fileId, generationId: first.generationId
+    }]);
+  });
+  it("treats Unicode normalization aliases as one filesystem identity", async () => {
+    const { store, vault } = testStore();
+    const composed = "caf\u00e9.md";
+    const decomposed = "cafe\u0301.md";
+    const first = await store.apply("vault", {
+      type: "create", path: composed, content: "Composed Mac note",
+      opId: "unicode-original-0001"
+    });
+    const a = fs.statSync(path.join(vault, composed));
+    const b = fs.statSync(path.join(vault, decomposed), { throwIfNoEntry: false });
+    if (!b || a.dev !== b.dev || a.ino !== b.ino) return;
+    await expect(store.apply("vault", {
+      type: "create", path: decomposed, content: "Decomposed SLS note",
+      opId: "unicode-alias-0001"
+    })).rejects.toMatchObject({ code: "CREATE_CONFLICT", status: 409 });
+    expect(fs.readFileSync(path.join(vault, composed), "utf8"))
+      .toBe("Composed Mac note");
+    expect(store.manifest("vault").files[0].generationId).toBe(first.generationId);
+  });
+  it("preserves the first generation when three offline devices independently create one name", async () => {
+    const { store, vault } = testStore();
+    const name = "independent-threeway.md";
+    const versions = ["Mac independent", "SLS independent", "iPhone independent"];
+    const winner = await store.apply("vault", {
+      type: "create", path: name, content: versions[0], opId: "threeway-mac-0001"
+    });
+    for (const [index, opId] of [[1, "threeway-sls-0001"],
+                                 [2, "threeway-ios-0001"]]) {
+      await expect(store.apply("vault", {
+        type: "create", path: name, content: versions[index], opId
+      })).rejects.toMatchObject({ code: "CREATE_CONFLICT", status: 409 });
+    }
+    expect(fs.readFileSync(path.join(vault, name), "utf8")).toBe(versions[0]);
+    const [server] = store.manifest("vault").files;
+    expect(server).toMatchObject({
+      path: name, fileId: winner.fileId, generationId: winner.generationId,
+      hash: winner.hash
+    });
+    expect(store.head("vault")).toBe(winner.seq);
   });
   it("returns a durable operation receipt after a lost HTTP acknowledgement", async () => {
     const { store } = testStore();

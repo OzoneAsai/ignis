@@ -43,7 +43,8 @@ export function stageWrite(
 export function acknowledgeWrite(
   pending: StagedWrite[], receipt: WriteReceipt
 ): StagedWrite {
-  const staged = pending[0];
+  const index = pending.findIndex(item => item.opId === receipt.opId);
+  const staged = pending[index];
   if (!staged || receipt.opId !== staged.opId ||
       receipt.type !== staged.type || receipt.path !== staged.path ||
       typeof receipt.fileId !== "string" ||
@@ -52,6 +53,6 @@ export function acknowledgeWrite(
       receipt.hash !== staged.localHash) {
     throw new Error("Server acknowledged a different staged write");
   }
-  pending.shift();
+  pending.splice(index, 1);
   return staged;
 }
