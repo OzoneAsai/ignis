@@ -2119,6 +2119,14 @@ export default class IgnisConnector extends Plugin {
         }
         if (!existing) {
           if (base) { report(remote.path, "Local deletion unresolved"); continue; }
+          // The Obsidian index is not the underlying filesystem. Hidden or
+          // excluded files can exist on disk without a TFile. Never attempt
+          // to create over an unindexed original merely because getFiles()
+          // omitted it; keep the bytes untouched and reconcile other files.
+          if (await this.app.vault.adapter?.exists?.(remote.path)) {
+            report(remote.path, "Local path exists outside Obsidian index; original retained");
+            continue;
+          }
           const data = await this.remoteBytes(remote);
           await this.writeLocal(remote.path, isMarkdown(remote.path) ?
             new TextDecoder().decode(data) : data);

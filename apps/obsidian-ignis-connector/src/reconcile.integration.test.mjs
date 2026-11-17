@@ -222,6 +222,53 @@ describe("native Vault deletion requires explicit journal proof and opt-in", () 
       { path: "gone.md", reason: "Remote missing; retained locally" }
     ]);
   });
+  it("retains an unindexed on-disk note without aborting unrelated remote reconciliation", async () => {
+    const { plugin } = fixture({ optIn: false, changes: [] });
+    plugin.settings.cursor = 0;
+    plugin.settings.baselines = {};
+    plugin.app.vault.getFiles = () => [];
+    plugin.app.vault.getAbstractFileByPath = () => null;
+    plugin.app.vault.adapter = {
+      exists: vi.fn(async (path) => path === "Notes/.md")
+    };
+    const visibleText = "a legitimate remote note";
+    const hidden = { path: "Notes/.md", fileId: "hidden-file",
+      generationId: "hidden-generation", hash: createHash("sha256")
+        .update("").digest("hex"), revision: 1, size: 0 };
+    const visible = { path: "Other.md", fileId: "visible-file",
+      generationId: "visible-generation", hash: createHash("sha256")
+        .update(visibleText).digest("hex"), revision: 1,
+      size: Buffer.byteLength(visibleText) };
+    plugin.api = vi.fn(async (url) => {
+      if (url.endsWith("/manifest")) return {
+        vaultId: "lab", vaultSeq: 2, journalLineage: JOURNAL_ID,
+        files: [hidden, visible]
+      };
+      if (url.includes("/changes?")) return {
+        vaultId: "lab", vaultSeq: 2, changes: [
+          { seq: 1, type: "create", fileId: hidden.fileId,
+            generationId: hidden.generationId, path: hidden.path },
+          { seq: 2, type: "create", fileId: visible.fileId,
+            generationId: visible.generationId, path: visible.path }
+        ]
+      };
+      throw Error("unexpected API path: " + url);
+    });
+    plugin.remoteBytes = vi.fn(async () => new TextEncoder().encode(visibleText).buffer);
+    plugin.writeLocal = vi.fn(async () => {});
+    await plugin.syncNow();
+    expect(plugin.app.vault.adapter.exists).toHaveBeenCalledWith("Notes/.md");
+    expect(plugin.writeLocal).toHaveBeenCalledTimes(1);
+    expect(plugin.writeLocal).toHaveBeenCalledWith("Other.md", visibleText);
+    expect(plugin.settings.baselines["Notes/.md"]).toBeUndefined();
+    expect(plugin.settings.baselines["Other.md"].hash).toBe(visible.hash);
+    expect(plugin.settings.syncIssues).toEqual([{
+      path: "Notes/.md",
+      reason: "Local path exists outside Obsidian index; original retained"
+    }]);
+    expect(plugin.settings.cursor).toBe(2);
+    expect(plugin.status.setText).toHaveBeenCalledWith("Ignis: 1 item needs review");
+  });
   it("does not re-create an independently originated note when its remote peer disappears", async () => {
     const { plugin } = fixture({ optIn: false });
     plugin.settings.baselines = {};
