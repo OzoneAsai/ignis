@@ -69,13 +69,15 @@ export function cursorLabelTextColor(background) {
 // The same translucent participant tint is applied by the native CM6 text
 // decorations and WebUI's measured glyph fragments. Untrusted peer colors
 // never enter a style string without RGB validation.
-export function cursorHighlightTint(color) {
+export function cursorHighlightTint(color, requestedOpacity = 0.24) {
+  const opacity = Number.isFinite(requestedOpacity)
+    ? Math.max(0, Math.min(0.24, requestedOpacity)) : 0.24;
   if (!/^#[0-9a-f]{6}$/i.test(color || "")) {
-    return "rgba(89, 186, 242, 0.24)";
+    return `rgba(89, 186, 242, ${opacity})`;
   }
   const channels = [1, 3, 5].map((i) =>
     parseInt(color.slice(i, i + 2), 16));
-  return `rgba(${channels.join(", ")}, 0.24)`;
+  return `rgba(${channels.join(", ")}, ${opacity})`;
 }
 
 function candidates(item, previous) {

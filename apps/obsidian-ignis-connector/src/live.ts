@@ -7,6 +7,7 @@ import {
   CursorOverlay, encodeSelections, sanitizePeers, sanitizeCursorMessage,
   resolveSelections, type Peer, type CursorSelection
 } from "./presence";
+import type { CursorAppearance } from "./cursor-appearance";
 import { remoteSelectionExtension } from "./selection-decorations";
 import { independentCompositionDelta } from "../../../packages/bridge/src/composition-rebase.js";
 import { hasMissingYjsAncestors, causalRepairDelay,
@@ -163,6 +164,7 @@ export class NativeYjs {
     rememberId: (path: string, id: string) => Promise<void>;
     displayName?: () => string;
     mobile?: boolean;
+    cursorAppearance?: () => CursorAppearance;
     send: (message: WireMessage) => void;
     notify: (path: string, status: string) => void;
     compositionChanged?: (path: string) => void;
@@ -754,11 +756,18 @@ export class NativeYjs {
           !("nodeType" in view.dom) || view.dom.nodeType !== 1) continue;
       let overlay = this.overlays.get(view);
       if (!overlay) {
-        overlay = new CursorOverlay(view, this.opts.mobile === true);
+        overlay = new CursorOverlay(view, this.opts.mobile === true,
+          this.opts.cursorAppearance?.());
         this.overlays.set(view, overlay);
       }
       overlay.set(room.text, [...room.peers.values()]);
     }
+  }
+
+  refreshCursorAppearance() {
+    const next = this.opts.cursorAppearance?.();
+    if (!next) return;
+    for (const overlay of this.overlays.values()) overlay.setAppearance(next);
   }
 
   updateDisplayName() {

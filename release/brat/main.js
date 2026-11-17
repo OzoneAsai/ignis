@@ -1,4 +1,4 @@
-/* Ignis Connector v0.1.5-beta.4 */
+/* Ignis Connector v0.1.5-beta.5 */
 "use strict";
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -10902,6 +10902,35 @@ function resolveCursorSelections(text2, peer) {
   return selectionEntries(peer).map((entry) => resolveCursorSelection(text2, entry));
 }
 
+// src/cursor-appearance.ts
+var NORMAL_CURSOR_APPEARANCE = {
+  calm: false,
+  width: 1
+};
+function safeCalmCursorWidth(value) {
+  return value === 1 || value === 2 || value === 3 ? value : 1;
+}
+function displayCursorColor(original, calm, darkTheme) {
+  const valid = /^#[0-9a-f]{6}$/i.test(original || "");
+  const color = valid ? original : "#59baf2";
+  if (!calm)
+    return color;
+  const neutral = darkTheme ? [126, 138, 150] : [66, 77, 90];
+  const source = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
+  return "#" + source.map((channel, index) => Math.round(neutral[index] * 0.86 + channel * 0.14).toString(16).padStart(2, "0")).join("");
+}
+function cursorPaintStyle(original, appearance, darkTheme = false) {
+  const calm = appearance.calm === true;
+  return {
+    color: displayCursorColor(original, calm, darkTheme),
+    width: calm ? safeCalmCursorWidth(appearance.width) : 2,
+    highlightOpacity: calm ? 0.08 : 0.24,
+    labelFontSize: calm ? "10px" : "11px",
+    labelPadding: calm ? "1px 3px" : "2px 5px",
+    labelFontWeight: calm ? "500" : "600"
+  };
+}
+
 // ../../packages/bridge/src/cursor-label-layout.js
 var GAP = 3;
 var MAX_BADGE_DISTANCE = 96;
@@ -10952,12 +10981,13 @@ function cursorLabelTextColor(background) {
   const luminance = components[0] * 0.2126 + components[1] * 0.7152 + components[2] * 0.0722;
   return luminance >= Math.sqrt(0.0525) - 0.05 ? "#000000" : "#ffffff";
 }
-function cursorHighlightTint(color) {
+function cursorHighlightTint(color, requestedOpacity = 0.24) {
+  const opacity = Number.isFinite(requestedOpacity) ? Math.max(0, Math.min(0.24, requestedOpacity)) : 0.24;
   if (!/^#[0-9a-f]{6}$/i.test(color || "")) {
-    return "rgba(89, 186, 242, 0.24)";
+    return `rgba(89, 186, 242, ${opacity})`;
   }
   const channels = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
-  return `rgba(${channels.join(", ")}, 0.24)`;
+  return `rgba(${channels.join(", ")}, ${opacity})`;
 }
 function candidates(item, previous) {
   const { caret, width, height } = item;
@@ -11106,7 +11136,7 @@ var MAX_REMOTE_MARKS = 480;
 var replaceRemoteMarks = import_state.StateEffect.define();
 function makeMarkDecorations(marks, length2) {
   const ranges = [];
-  for (const { from: from2, to, color } of marks.slice(0, MAX_REMOTE_MARKS)) {
+  for (const { from: from2, to, color, opacity } of marks.slice(0, MAX_REMOTE_MARKS)) {
     if (!Number.isSafeInteger(from2) || !Number.isSafeInteger(to))
       continue;
     const start = Math.max(0, Math.min(length2, from2));
@@ -11115,7 +11145,7 @@ function makeMarkDecorations(marks, length2) {
       continue;
     ranges.push(import_view.Decoration.mark({
       class: "ignis-native-remote-highlight",
-      attributes: { style: `background-color: ${cursorHighlightTint(color)};` },
+      attributes: { style: `background-color: ${cursorHighlightTint(color, opacity)};` },
       inclusive: false
     }).range(start, end));
   }
@@ -11189,9 +11219,13 @@ function sanitizePeers(input, selfId) {
   return peers;
 }
 var CursorOverlay = class {
-  constructor(view, mobile = false) {
+  constructor(view, mobile = false, appearance = NORMAL_CURSOR_APPEARANCE) {
     this.view = view;
     this.mobile = mobile;
+    this.appearance = {
+      calm: appearance.calm === true,
+      width: safeCalmCursorWidth(appearance.width)
+    };
     this.root = document.createElement("div");
     this.root.className = "ignis-native-cursors";
     this.root.setAttribute("aria-hidden", "true");
@@ -11304,6 +11338,7 @@ var CursorOverlay = class {
   highlightFingerprint = "";
   highlightEpoch = 0;
   highlightsLimited = false;
+  appearance;
   positionMobileRoster() {
     if (!this.mobile)
       return;
@@ -11315,6 +11350,29 @@ var CursorOverlay = class {
       y
     )) + "px";
     this.rosterList.style.maxHeight = Math.max(88, height - 180) + "px";
+  }
+  isDarkTheme() {
+    return document.body?.classList.contains("theme-dark") === true;
+  }
+  shownColor(peer) {
+    return displayCursorColor(
+      peer.color,
+      this.appearance.calm,
+      this.isDarkTheme()
+    );
+  }
+  setAppearance(next) {
+    const safe = {
+      calm: next.calm === true,
+      width: safeCalmCursorWidth(next.width)
+    };
+    if (safe.calm === this.appearance.calm && safe.width === this.appearance.width)
+      return;
+    this.appearance = safe;
+    this.rosterFingerprint = "";
+    this.syncHighlights();
+    this.updateRoster();
+    this.schedule();
   }
   set(text2, peers) {
     this.text = text2;
@@ -11331,7 +11389,12 @@ var CursorOverlay = class {
     this.roster.hidden = this.peers.length === 0;
     this.rosterTitle.textContent = this.peers.length + " other editor" + (this.peers.length === 1 ? "" : "s") + " \xB7 show locations";
     this.rosterTitle.setAttribute("aria-label", this.rosterTitle.textContent);
-    const fingerprint = this.peers.map((peer) => [peer.id, peer.name, peer.color].join(":")).join("|");
+    const fingerprint = this.peers.map((peer) => [
+      peer.id,
+      peer.name,
+      this.shownColor(peer),
+      this.appearance.calm
+    ].join(":")).join("|");
     if (fingerprint === this.rosterFingerprint)
       return;
     this.rosterFingerprint = fingerprint;
@@ -11350,7 +11413,7 @@ var CursorOverlay = class {
         color: "var(--text-normal, #fff)",
         background: "transparent",
         border: "0",
-        borderLeft: "3px solid " + peer.color,
+        borderLeft: (this.appearance.calm ? "2px solid " : "3px solid ") + this.shownColor(peer),
         padding: this.mobile ? "12px 8px" : "4px",
         minHeight: this.mobile ? "44px" : "auto",
         cursor: "pointer"
@@ -11421,7 +11484,12 @@ var CursorOverlay = class {
           if (from2 >= to)
             continue;
           if (marks.length < MAX_REMOTE_MARKS) {
-            marks.push({ from: from2, to, color: peer.color });
+            marks.push({
+              from: from2,
+              to,
+              color: this.shownColor(peer),
+              opacity: this.appearance.calm ? 0.08 : 0.24
+            });
           } else {
             this.highlightsLimited = true;
           }
@@ -11458,6 +11526,7 @@ var CursorOverlay = class {
     const caretBlockers = [];
     for (const peer of this.peers) {
       const selections = resolveSelections(this.text, peer);
+      const paint = cursorPaintStyle(peer.color, this.appearance, this.isDarkTheme());
       const mainIndex = Number.isSafeInteger(peer.mainIndex) && peer.mainIndex >= 0 && peer.mainIndex < selections.length ? peer.mainIndex : 0;
       for (const [index, selection] of selections.entries()) {
         if (!selection)
@@ -11472,9 +11541,9 @@ var CursorOverlay = class {
           caret.dataset.ignisSelection = String(index);
           Object.assign(caret.style, {
             position: "absolute",
-            width: "2px",
+            width: paint.width + "px",
             pointerEvents: "none",
-            backgroundColor: peer.color
+            backgroundColor: paint.color
           });
           const label = document.createElement("span");
           label.className = "ignis-native-remote-label";
@@ -11482,12 +11551,12 @@ var CursorOverlay = class {
             position: "absolute",
             left: "0",
             top: "0",
-            color: cursorLabelTextColor(peer.color),
-            backgroundColor: peer.color,
-            fontSize: "11px",
-            fontWeight: "600",
+            color: cursorLabelTextColor(paint.color),
+            backgroundColor: paint.color,
+            fontSize: paint.labelFontSize,
+            fontWeight: paint.labelFontWeight,
             borderRadius: "3px",
-            padding: "2px 5px",
+            padding: paint.labelPadding,
             whiteSpace: "nowrap",
             maxWidth: "180px",
             overflow: "hidden",
@@ -11501,9 +11570,13 @@ var CursorOverlay = class {
         record.label.textContent = peer.name;
         record.label.style.display = index === mainIndex ? "" : "none";
         record.label.style.visibility = "hidden";
-        record.label.style.color = cursorLabelTextColor(peer.color);
-        record.label.style.backgroundColor = peer.color;
-        record.caret.style.backgroundColor = peer.color;
+        record.label.style.color = cursorLabelTextColor(paint.color);
+        record.label.style.backgroundColor = paint.color;
+        record.label.style.fontSize = paint.labelFontSize;
+        record.label.style.fontWeight = paint.labelFontWeight;
+        record.label.style.padding = paint.labelPadding;
+        record.caret.style.width = paint.width + "px";
+        record.caret.style.backgroundColor = paint.color;
         const at = Math.min(this.view.state.doc.length, selection.head);
         const coords = this.view.coordsAtPos(at);
         const local = coords ? space.toLocal(coords) : null;
@@ -11514,7 +11587,12 @@ var CursorOverlay = class {
           record.caret.style.left = left + "px";
           record.caret.style.top = top + "px";
           record.caret.style.height = Math.max(1, bottom - top) + "px";
-          caretBlockers.push({ left: left - 1, top, right: left + 3, bottom });
+          caretBlockers.push({
+            left: left - 1,
+            top,
+            right: left + paint.width + 1,
+            bottom
+          });
           if (index === mainIndex && peer.name) {
             const measured = record.label.getBoundingClientRect();
             badgeItems.push({
@@ -12378,11 +12456,22 @@ var NativeYjs = class {
         continue;
       let overlay = this.overlays.get(view);
       if (!overlay) {
-        overlay = new CursorOverlay(view, this.opts.mobile === true);
+        overlay = new CursorOverlay(
+          view,
+          this.opts.mobile === true,
+          this.opts.cursorAppearance?.()
+        );
         this.overlays.set(view, overlay);
       }
       overlay.set(room.text, [...room.peers.values()]);
     }
+  }
+  refreshCursorAppearance() {
+    const next = this.opts.cursorAppearance?.();
+    if (!next)
+      return;
+    for (const overlay of this.overlays.values())
+      overlay.setAppearance(next);
   }
   updateDisplayName() {
     const name = this.opts.displayName?.() || "Native Obsidian";
@@ -13653,6 +13742,8 @@ function journalHoldExplanation(reason) {
 // src/main.ts
 var DEFAULT = {
   displayName: "",
+  calmCursors: false,
+  calmCursorWidth: 1,
   serverUrl: "",
   authMode: "device",
   discoveryUrl: "",
@@ -14076,6 +14167,8 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       displayName: normalizeDisplayName(
         typeof saved?.displayName === "string" ? saved.displayName : ""
       ),
+      calmCursors: saved?.calmCursors === true,
+      calmCursorWidth: safeCalmCursorWidth(saved?.calmCursorWidth),
       baselines: saved?.baselines || {},
       journalLineage: typeof saved?.journalLineage === "string" ? saved.journalLineage : "",
       journalProof: typeof saved?.journalProof === "string" ? saved.journalProof : "",
@@ -14112,6 +14205,10 @@ var IgnisConnector = class extends import_obsidian.Plugin {
       },
       displayName: () => this.getDisplayName(),
       mobile: import_obsidian.Platform.isMobile,
+      cursorAppearance: () => ({
+        calm: this.settings.calmCursors,
+        width: this.settings.calmCursorWidth
+      }),
       send: (message) => {
         if (message.path && !this.canShare(message.path))
           return;
@@ -14281,6 +14378,30 @@ var IgnisConnector = class extends import_obsidian.Plugin {
     this.settings.displayName = next;
     await this.persistSettings();
     this.live.updateDisplayName();
+  }
+  async setCalmCursorAppearance(calm, width) {
+    const next = { calm: calm === true, width: safeCalmCursorWidth(width) };
+    if (this.settings.calmCursors === next.calm && this.settings.calmCursorWidth === next.width) {
+      return { ok: true, message: "Cursor appearance unchanged." };
+    }
+    const previous = {
+      calm: this.settings.calmCursors,
+      width: this.settings.calmCursorWidth
+    };
+    this.settings.calmCursors = next.calm;
+    this.settings.calmCursorWidth = next.width;
+    try {
+      await this.persistSettings();
+    } catch {
+      this.settings.calmCursors = previous.calm;
+      this.settings.calmCursorWidth = previous.width;
+      return {
+        ok: false,
+        message: "Could not save the cursor preference; previous appearance retained."
+      };
+    }
+    this.live?.refreshCursorAppearance();
+    return { ok: true, message: next.calm ? "Calm cursor enabled for this device (" + next.width + " px)." : "Standard collaborator cursors restored for this device." };
   }
   openDisplayName() {
     new DisplayNameModal(this.app, this).open();
@@ -16243,6 +16364,64 @@ var ConnectorSettings = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Your display name").setDesc(this.plugin.getDisplayName() + " \xB7 Visible beside your cursor on other devices").addButton((b) => b.setButtonText("Change name").onClick(() => this.plugin.openDisplayName()));
+    containerEl.createEl("h3", { text: "Collaborator cursor appearance" });
+    const cursorSettings = containerEl.createDiv({
+      cls: "ignis-cursor-appearance-settings"
+    });
+    cursorSettings.createEl("p", {
+      text: "A visual preference for this device only. Other editors still see your own cursor in their chosen style.",
+      cls: "setting-item-description"
+    });
+    const cursorPreview = cursorSettings.createDiv({
+      cls: "ignis-cursor-appearance-preview"
+    });
+    cursorPreview.setAttribute("role", "img");
+    const previewCaret = cursorPreview.createDiv({
+      cls: "ignis-cursor-appearance-preview-caret"
+    });
+    const previewName = cursorPreview.createEl("span", {
+      text: "Example collaborator",
+      cls: "ignis-cursor-appearance-preview-name"
+    });
+    const cursorFeedback = cursorSettings.createDiv();
+    cursorFeedback.setAttribute("role", "status");
+    cursorFeedback.setAttribute("aria-live", "polite");
+    const refreshCursorPreview = () => {
+      const calm = this.plugin.settings.calmCursors;
+      const paint = cursorPaintStyle("#59baf2", {
+        calm,
+        width: this.plugin.settings.calmCursorWidth
+      }, document.body?.classList.contains("theme-dark") === true);
+      cursorPreview.setAttribute("aria-label", calm ? "Calm collaborator cursor preview, width " + paint.width + " pixels" : "Standard collaborator cursor preview, width 2 pixels");
+      previewCaret.style.width = paint.width + "px";
+      previewCaret.style.backgroundColor = paint.color;
+      previewName.style.backgroundColor = paint.color;
+      previewName.style.color = cursorLabelTextColor(paint.color);
+      previewName.style.fontSize = paint.labelFontSize;
+      previewName.style.fontWeight = paint.labelFontWeight;
+      previewName.style.padding = paint.labelPadding;
+    };
+    refreshCursorPreview();
+    new import_obsidian.Setting(cursorSettings).setName("Calm cursor").setDesc("Use desaturated slate/dark-toned collaborator cursors, quieter selection highlights and smaller name tags.").addToggle((toggle) => toggle.setValue(this.plugin.settings.calmCursors).onChange(async (enabled) => {
+      const result = await this.plugin.setCalmCursorAppearance(
+        enabled,
+        this.plugin.settings.calmCursorWidth
+      );
+      if (!result.ok)
+        toggle.setValue(!enabled);
+      cursorFeedback.setText(result.message);
+      refreshCursorPreview();
+    }));
+    new import_obsidian.Setting(cursorSettings).setName("Calm cursor thickness").setDesc("Caret width when Calm cursor is enabled: 1 (thin), 2 or 3 pixels. The standard cursor remains 2 pixels.").addSlider((slider) => slider.setLimits(1, 3, 1).setValue(this.plugin.settings.calmCursorWidth).setDynamicTooltip().onChange(async (value) => {
+      const result = await this.plugin.setCalmCursorAppearance(
+        this.plugin.settings.calmCursors,
+        value
+      );
+      if (!result.ok)
+        slider.setValue(this.plugin.settings.calmCursorWidth);
+      cursorFeedback.setText(result.message);
+      refreshCursorPreview();
+    }));
     containerEl.createEl("h3", { text: "Connect to Ignis" });
     containerEl.createEl("p", {
       text: "Paste one connection link. If Tailscale is connected, no token or Vault ID entry is needed."

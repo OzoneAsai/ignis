@@ -78,6 +78,43 @@ function fixture({ optIn = true, localText = text, changes = journal } = {}) {
 afterEach(() => vi.restoreAllMocks());
 
 describe("native Vault deletion requires explicit journal proof and opt-in", () => {
+  it("persists Calm cursor visual options without changing the journal or sending a frame", async () => {
+    const { plugin } = fixture();
+    plugin.settings.calmCursors = false;
+    plugin.settings.calmCursorWidth = 1;
+    plugin.live.refreshCursorAppearance = vi.fn();
+    const initial = {
+      cursor:plugin.settings.cursor, pending:plugin.settings.pending,
+      baselines:plugin.settings.baselines
+    };
+    const result = await plugin.setCalmCursorAppearance(true, 3);
+    expect(result.ok).toBe(true);
+    expect(plugin.settings.calmCursors).toBe(true);
+    expect(plugin.settings.calmCursorWidth).toBe(3);
+    expect(plugin.live.refreshCursorAppearance).toHaveBeenCalledOnce();
+    expect(plugin.saveData).toHaveBeenCalledWith(expect.objectContaining({
+      calmCursors:true, calmCursorWidth:3
+    }));
+    expect(plugin.settings.cursor).toBe(initial.cursor);
+    expect(plugin.settings.pending).toBe(initial.pending);
+    expect(plugin.settings.baselines).toBe(initial.baselines);
+    expect(plugin.api).not.toHaveBeenCalled();
+    plugin.saveData.mockClear();
+    await plugin.setCalmCursorAppearance(true, 3);
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+  it("rolls back cursor display options if saving the local preferences fails", async () => {
+    const { plugin } = fixture();
+    plugin.settings.calmCursors = false;
+    plugin.settings.calmCursorWidth = 1;
+    plugin.live.refreshCursorAppearance = vi.fn();
+    plugin.saveData = vi.fn(async () => { throw new Error("storage unavailable"); });
+    const result = await plugin.setCalmCursorAppearance(true, 2);
+    expect(result.ok).toBe(false);
+    expect(plugin.settings.calmCursors).toBe(false);
+    expect(plugin.settings.calmCursorWidth).toBe(1);
+    expect(plugin.live.refreshCursorAppearance).not.toHaveBeenCalled();
+  });
   it("never claims a two-site Vault is synced while an outbound operation remains", async () => {
     const { plugin } = fixture();
     plugin.settings.pendingWrites = [{ opId: "blocked-create-123", type: "create",

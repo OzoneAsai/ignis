@@ -338,3 +338,33 @@
   .ignis-undo-review-item .setting-item-control > button { width: 100%; }
   .ignis-undo-review-item .setting-item-control > button { min-height: 44px; }
 }
+
+
+/* Personal, non-animated preview; never injects color into network identity. */
+.ignis-cursor-appearance-preview {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
+  gap: 0;
+  padding: 10px 14px;
+  margin: 8px 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.ignis-cursor-appearance-preview-caret {
+  display: block;
+  flex: none;
+  height: 25px;
+  width: 2px;
+  border-radius: 1px;
+}
+.ignis-cursor-appearance-preview-name {
+  display: inline-block;
+  flex: none;
+  max-width: min(70%, 180px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 3px;
+}

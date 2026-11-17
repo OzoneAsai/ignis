@@ -67,6 +67,20 @@ afterEach(async () => {
 });
 
 describe("Native Obsidian offline Yjs bridge", () => {
+  it("refreshes live collaborator appearance without sending another network frame", () => {
+    const { manager, view, sent } = harness();
+    const spy = vi.fn();
+    manager.opts.cursorAppearance = () => ({ calm: true, width: 1 });
+    manager.overlays.set(view.view, {
+      setAppearance: spy, destroy: () => {}
+    });
+    const before = [...sent];
+    manager.refreshCursorAppearance();
+    expect(spy).toHaveBeenCalledOnce();
+    expect(spy).toHaveBeenCalledWith({ calm: true, width: 1 });
+    expect(sent).toEqual(before);
+    expect(manager.rooms.has("test.md")).toBe(true);
+  });
   it("never joins or applies inbound CRDT state for an explicitly excluded path", async () => {
     const sent = [];
     let allowed = false;

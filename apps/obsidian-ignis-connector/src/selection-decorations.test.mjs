@@ -34,6 +34,17 @@ describe("native CM6 glyph-accurate remote selection marks", () => {
     ]);
     expect(ranges.every(r => r.style?.startsWith("background-color: rgba("))).toBe(true);
   });
+  it("supports an understated personal selection opacity without changing glyph ranges", () => {
+    const marksWithAlpha = makeMarkDecorations([
+      {from: 2,to:7,color:"#445566",opacity:0.08}
+    ], 10);
+    expect(marks(marksWithAlpha)).toEqual([
+      {from:2,to:7,style:"background-color: rgba(68, 85, 102, 0.08);"}
+    ]);
+    expect(marks(makeMarkDecorations([
+      {from:2,to:7,color:"#445566",opacity:100}
+    ], 10))[0].style).toContain("0.24)");
+  });
   it("renders actual CodeMirror marked glyph spans, not rectangular overlay nodes", () => {
     const parent = document.createElement("div");
     document.body.append(parent);

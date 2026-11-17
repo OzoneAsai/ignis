@@ -52,6 +52,23 @@ vi.mock("obsidian", () => {
     setDisabled(value) { this.el.disabled = value; return this; }
     onClick(fn) { this.el.addEventListener("click", fn); return this; }
   }
+  class Slider {
+    constructor(parent) {
+      this.el = parent.ownerDocument.createElement("input");
+      this.el.type = "range";
+      parent.append(this.el);
+    }
+    setLimits(min, max, step) {
+      this.el.min = String(min); this.el.max = String(max);
+      this.el.step = String(step); return this;
+    }
+    setValue(value) { this.el.value = String(value); return this; }
+    setDynamicTooltip() { return this; }
+    onChange(fn) {
+      this.el.addEventListener("input", () => fn(Number(this.el.value)));
+      return this;
+    }
+  }
   class Toggle {
     constructor(parent) {
       this.el = parent.ownerDocument.createElement("button");
@@ -91,6 +108,7 @@ vi.mock("obsidian", () => {
     addText(fn) { fn(new TextInput(this.el)); return this; }
     addButton(fn) { fn(new Button(this.el)); return this; }
     addToggle(fn) { fn(new Toggle(this.el)); return this; }
+    addSlider(fn) { fn(new Slider(this.el)); return this; }
   }
   class MockModal {
     constructor() { this.contentEl = document.createElement("div"); }
@@ -167,9 +185,15 @@ function setup({ ready = false } = {}) {
       deviceId: "", contentScope: "all",
       deviceContentScope: "follow-server",
       serverMediaBypassExtensions: [], deviceMediaBypassExtensions: [],
+      calmCursors: false, calmCursorWidth: 1
     },
     getDisplayName: () => "Obsidian Native",
     openDisplayName: vi.fn(),
+    setCalmCursorAppearance: vi.fn(async (calm, width) => {
+      plugin.settings.calmCursors = calm;
+      plugin.settings.calmCursorWidth = width;
+      return { ok: true, message: calm ? "Calm cursor active" : "Standard cursor restored" };
+    }),
     getCurrentStatus: () => "Offline · local Vault retained",
     openSyncIssues: vi.fn(),
     journalRecoveryInfo: () => null,
@@ -213,7 +237,8 @@ function setup({ ready = false } = {}) {
   const ui = new ConnectorSettings({}, plugin);
   ui.display();
   const inputs = [...ui.containerEl.querySelectorAll("input")]
-    .filter(input => !input.closest(".ignis-local-only-paths"));
+    .filter(input => !input.closest(".ignis-local-only-paths") &&
+      input.type !== "range");
   const buttons = [...ui.containerEl.querySelectorAll("button")];
   const connect = buttons.find(b => b.textContent === "Connect and verify");
   const sync = buttons.find(b => b.textContent === "Sync");
@@ -326,6 +351,46 @@ describe("native Obsidian one-button onboarding UI", () => {
       Platform.isMobile = before;
     }
   });
+  it("loads persisted Calm settings and normalizes unsafe legacy width values", async () => {
+    const plugin = new IgnisConnector();
+    plugin.loadData = vi.fn(async () => ({ calmCursors: true, calmCursorWidth: 2 }));
+    await plugin.onload();
+    expect(plugin.settings.calmCursors).toBe(true);
+    expect(plugin.settings.calmCursorWidth).toBe(2);
+    const other = new IgnisConnector();
+    other.loadData = vi.fn(async () => ({ calmCursors: true, calmCursorWidth: 99 }));
+    await other.onload();
+    expect(other.settings.calmCursors).toBe(true);
+    expect(other.settings.calmCursorWidth).toBe(1);
+  });
+  it("offers a personal Calm cursor toggle, width slider and live preview", async () => {
+    const { containerEl, plugin } = setup();
+    const group = containerEl.querySelector(".ignis-cursor-appearance-settings");
+    expect(group).not.toBeNull();
+    expect(group.textContent).toContain("Calm cursor");
+    const sample = group.querySelector(".ignis-cursor-appearance-preview");
+    const caret = group.querySelector(".ignis-cursor-appearance-preview-caret");
+    const toggle = group.querySelector('[role="switch"]');
+    const slider = group.querySelector('input[type="range"]');
+    expect(sample.getAttribute("aria-label")).toContain("Standard");
+    expect(caret.style.width).toBe("2px");
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    toggle.click();
+    await flush();
+    expect(plugin.setCalmCursorAppearance).toHaveBeenCalledWith(true, 1);
+    expect(sample.getAttribute("aria-label")).toContain("Calm");
+    expect(caret.style.width).toBe("1px");
+    expect(caret.style.backgroundColor).not.toBe("rgb(89, 186, 242)");
+    slider.value = "3";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    expect(plugin.setCalmCursorAppearance).toHaveBeenLastCalledWith(true, 3);
+    expect(caret.style.width).toBe("3px");
+    toggle.click();
+    await flush();
+    expect(plugin.setCalmCursorAppearance).toHaveBeenLastCalledWith(false, 3);
+    expect(caret.style.width).toBe("2px");
+  });
   it("offers PDF/media bypass in the same mobile-compatible Connector UI", () => {
     const { containerEl } = setup();
     const region = containerEl.querySelector(".ignis-media-bypass-details");
@@ -356,7 +421,8 @@ describe("native Obsidian one-button onboarding UI", () => {
     expect(containerEl.querySelector(".ignis-sharing-summary").textContent)
       .toContain("5.0 KiB");
     expect(containerEl.textContent).toContain("Keep attachments on this device");
-    const switchEl = containerEl.querySelector('[role="switch"]');
+    const switchEl = [...containerEl.querySelectorAll('[role="switch"]')]
+      .find(el => el.parentElement.textContent.includes("Keep attachments"));
     expect(switchEl.getAttribute("aria-checked")).toBe("false");
     switchEl.click();
     await flush();
@@ -376,7 +442,8 @@ describe("native Obsidian one-button onboarding UI", () => {
     plugin.setDeviceContentScope.mockResolvedValueOnce({
       ok: false, message: "2 unsent media operations require review",
     });
-    const switchEl = containerEl.querySelector('[role="switch"]');
+    const switchEl = [...containerEl.querySelectorAll('[role="switch"]')]
+      .find(el => el.parentElement.textContent.includes("Keep attachments"));
     switchEl.click();
     await flush();
     expect(switchEl.getAttribute("aria-checked")).toBe("false");

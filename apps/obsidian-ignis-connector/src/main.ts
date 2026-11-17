@@ -3,6 +3,9 @@ import {
   editorInfoField, requestUrl, setIcon, type EventRef
 } from "obsidian";
 import { NativeYjs, type UndoReview } from "./live";
+import { cursorPaintStyle, safeCalmCursorWidth } from "./cursor-appearance";
+import { cursorLabelTextColor } from
+  "../../../packages/bridge/src/cursor-label-layout.js";
 import {
   effectiveDisplayName, normalizeDisplayName, DISPLAY_NAME_LIMIT
 } from "./display-name";
@@ -61,6 +64,9 @@ type SyncIssue = { path: string; reason: string };
 type StoredUndoReview = UndoReview & { scope: string; capturedAt: number };
 type Settings = {
   displayName: string;
+  // Viewing preferences stay on THIS device; no change to peer wire identity.
+  calmCursors: boolean;
+  calmCursorWidth: 1 | 2 | 3;
   serverUrl: string;
   authMode: "device" | "tailnet";
   discoveryUrl: string;
@@ -116,6 +122,7 @@ type OperationResult = {
 
 const DEFAULT: Settings = {
   displayName: "",
+  calmCursors: false, calmCursorWidth: 1,
   serverUrl: "", authMode: "device", discoveryUrl: "", serverDeviceId: "", vaultId: "", deviceId: "",
   contentScope: "all",
   deviceContentScope: "follow-server",
@@ -565,6 +572,8 @@ export default class IgnisConnector extends Plugin {
       displayName: normalizeDisplayName(
         typeof saved?.displayName === "string" ? saved.displayName : ""
       ),
+      calmCursors: saved?.calmCursors === true,
+      calmCursorWidth: safeCalmCursorWidth(saved?.calmCursorWidth),
       baselines: saved?.baselines || {},
       journalLineage: typeof saved?.journalLineage === "string" ? saved.journalLineage : "",
       journalProof: typeof saved?.journalProof === "string" ? saved.journalProof : "",
@@ -609,6 +618,10 @@ export default class IgnisConnector extends Plugin {
       },
       displayName: () => this.getDisplayName(),
       mobile: Platform.isMobile,
+      cursorAppearance: () => ({
+        calm: this.settings.calmCursors,
+        width: this.settings.calmCursorWidth
+      }),
       send: (message) => {
         if (message.path && !this.canShare(message.path)) return;
         if (!this.historyHold && this.socket?.readyState === WebSocket.OPEN) {
@@ -790,6 +803,34 @@ export default class IgnisConnector extends Plugin {
     // Existing live peers should see this change immediately, without
     // disconnecting the socket or destroying unsaved editor CRDT state.
     this.live.updateDisplayName();
+  }
+
+  async setCalmCursorAppearance(calm: boolean, width: number): Promise<{
+    ok: boolean; message: string
+  }> {
+    const next = { calm: calm === true, width: safeCalmCursorWidth(width) };
+    if (this.settings.calmCursors === next.calm &&
+        this.settings.calmCursorWidth === next.width) {
+      return { ok: true, message: "Cursor appearance unchanged." };
+    }
+    const previous = {
+      calm: this.settings.calmCursors, width: this.settings.calmCursorWidth
+    };
+    this.settings.calmCursors = next.calm;
+    this.settings.calmCursorWidth = next.width;
+    try { await this.persistSettings(); }
+    catch {
+      this.settings.calmCursors = previous.calm;
+      this.settings.calmCursorWidth = previous.width;
+      return { ok: false,
+        message: "Could not save the cursor preference; previous appearance retained." };
+    }
+    // Style-only refresh. No socket close, Yjs replacement, cursor relocation,
+    // room rejoin, presence identity update, or sync journal mutation.
+    this.live?.refreshCursorAppearance();
+    return { ok: true, message: next.calm
+      ? "Calm cursor enabled for this device (" + next.width + " px)." :
+        "Standard collaborator cursors restored for this device." };
   }
 
   openDisplayName() {
@@ -2939,6 +2980,70 @@ export class ConnectorSettings extends PluginSettingTab {
         " · Visible beside your cursor on other devices")
       .addButton((b) => b.setButtonText("Change name")
         .onClick(() => this.plugin.openDisplayName()));
+
+    containerEl.createEl("h3", { text: "Collaborator cursor appearance" });
+    const cursorSettings = containerEl.createDiv({
+      cls: "ignis-cursor-appearance-settings"
+    });
+    cursorSettings.createEl("p", {
+      text: "A visual preference for this device only. Other editors still see your own cursor in their chosen style.",
+      cls: "setting-item-description"
+    });
+    const cursorPreview = cursorSettings.createDiv({
+      cls: "ignis-cursor-appearance-preview"
+    });
+    cursorPreview.setAttribute("role", "img");
+    const previewCaret = cursorPreview.createDiv({
+      cls: "ignis-cursor-appearance-preview-caret"
+    });
+    const previewName = cursorPreview.createEl("span", {
+      text: "Example collaborator",
+      cls: "ignis-cursor-appearance-preview-name"
+    });
+    const cursorFeedback = cursorSettings.createDiv();
+    cursorFeedback.setAttribute("role", "status");
+    cursorFeedback.setAttribute("aria-live", "polite");
+    const refreshCursorPreview = () => {
+      const calm = this.plugin.settings.calmCursors;
+      const paint = cursorPaintStyle("#59baf2", {
+        calm, width: this.plugin.settings.calmCursorWidth
+      }, document.body?.classList.contains("theme-dark") === true);
+      cursorPreview.setAttribute("aria-label", calm
+        ? "Calm collaborator cursor preview, width " + paint.width + " pixels"
+        : "Standard collaborator cursor preview, width 2 pixels");
+      previewCaret.style.width = paint.width + "px";
+      previewCaret.style.backgroundColor = paint.color;
+      previewName.style.backgroundColor = paint.color;
+      previewName.style.color = cursorLabelTextColor(paint.color);
+      previewName.style.fontSize = paint.labelFontSize;
+      previewName.style.fontWeight = paint.labelFontWeight;
+      previewName.style.padding = paint.labelPadding;
+    };
+    refreshCursorPreview();
+    new Setting(cursorSettings).setName("Calm cursor")
+      .setDesc("Use desaturated slate/dark-toned collaborator cursors, quieter selection highlights and smaller name tags.")
+      .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.calmCursors)
+        .onChange(async enabled => {
+          const result = await this.plugin.setCalmCursorAppearance(
+            enabled, this.plugin.settings.calmCursorWidth);
+          if (!result.ok) toggle.setValue(!enabled);
+          cursorFeedback.setText(result.message);
+          refreshCursorPreview();
+        }));
+    new Setting(cursorSettings).setName("Calm cursor thickness")
+      .setDesc("Caret width when Calm cursor is enabled: 1 (thin), 2 or 3 pixels. The standard cursor remains 2 pixels.")
+      .addSlider(slider => slider
+        .setLimits(1, 3, 1)
+        .setValue(this.plugin.settings.calmCursorWidth)
+        .setDynamicTooltip()
+        .onChange(async value => {
+          const result = await this.plugin.setCalmCursorAppearance(
+            this.plugin.settings.calmCursors, value);
+          if (!result.ok) slider.setValue(this.plugin.settings.calmCursorWidth);
+          cursorFeedback.setText(result.message);
+          refreshCursorPreview();
+        }));
     containerEl.createEl("h3", { text: "Connect to Ignis" });
     containerEl.createEl("p", {
       text: "Paste one connection link. If Tailscale is connected, no token or Vault ID entry is needed."

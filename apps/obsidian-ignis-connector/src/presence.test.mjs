@@ -117,6 +117,63 @@ describe("Ignis native presence uses the existing server relative cursor protoco
       vi.restoreAllMocks();
     }
   });
+  it("switches existing peer carets, labels, roster and selection tints without changing positions", async () => {
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    text.insert(0, "hello world");
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const scroller = document.createElement("div");
+    parent.append(scroller);
+    vi.spyOn(parent, "getBoundingClientRect").mockReturnValue({
+      left:0, top:0, right:400, bottom:240, width:400, height:240
+    });
+    const view = {
+      dom:parent, scrollDOM:scroller,
+      coordsAtPos:()=>({left:42,right:44,top:20,bottom:38}),
+      state:{doc:{length:11}},
+      viewport:{from:0,to:11}
+    };
+    const oldRaf = globalThis.requestAnimationFrame;
+    const oldCancel = globalThis.cancelAnimationFrame;
+    globalThis.requestAnimationFrame = cb => setTimeout(() => cb(0), 1);
+    globalThis.cancelAnimationFrame = clearTimeout;
+    try {
+      const overlay = new CursorOverlay(view);
+      const shared = encodeSelection(text, 1, 5);
+      overlay.set(text, [{id:"peer-a", name:"Alice", color:"#ff0055", ...shared}]);
+      await new Promise(resolve=>setTimeout(resolve, 20));
+      const caret = parent.querySelector(".ignis-native-remote-caret");
+      const label = parent.querySelector(".ignis-native-remote-label");
+      const originalX = caret.style.left;
+      const standardColor = caret.style.backgroundColor;
+      expect(caret.style.width).toBe("2px");
+      expect(label.style.fontSize).toBe("11px");
+      overlay.setAppearance({calm:true,width:1});
+      await new Promise(resolve=>setTimeout(resolve, 20));
+      expect(caret.style.width).toBe("1px");
+      expect(caret.style.left).toBe(originalX);
+      expect(caret.style.backgroundColor).not.toBe(standardColor);
+      expect(label.style.fontSize).toBe("10px");
+      expect(label.style.padding).toBe("1px 3px");
+      expect(parent.querySelector(".ignis-native-people-jump")
+        .style.borderLeftWidth).toBe("2px");
+      overlay.setAppearance({calm:true,width:3});
+      await new Promise(resolve=>setTimeout(resolve, 20));
+      expect(caret.style.width).toBe("3px");
+      overlay.setAppearance({calm:false,width:3});
+      await new Promise(resolve=>setTimeout(resolve, 20));
+      expect(caret.style.width).toBe("2px");
+      expect(caret.style.backgroundColor).toBe(standardColor);
+      overlay.destroy();
+    } finally {
+      globalThis.requestAnimationFrame = oldRaf;
+      globalThis.cancelAnimationFrame = oldCancel;
+      parent.remove();
+      doc.destroy();
+      vi.restoreAllMocks();
+    }
+  });
   it("renders three caret nodes for one peer and keeps all 50 peers navigable", async () => {
     const d = new Y.Doc();
     const t = d.getText("content");

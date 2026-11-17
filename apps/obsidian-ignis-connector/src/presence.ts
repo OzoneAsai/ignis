@@ -12,6 +12,10 @@ export const resolveSelection = resolveCursorSelection;
 export const resolveSelections = resolveCursorSelections;
 import type { EditorView } from "@codemirror/view";
 import {
+  cursorPaintStyle, displayCursorColor, safeCalmCursorWidth,
+  NORMAL_CURSOR_APPEARANCE, type CursorAppearance
+} from "./cursor-appearance";
+import {
   createOverlaySpace, cursorLabelTextColor, layoutCursorLabels,
   visibleContentObstacles
 } from
@@ -118,8 +122,14 @@ export class CursorOverlay {
   private highlightFingerprint = "";
   private highlightEpoch = 0;
   private highlightsLimited = false;
+  private appearance: CursorAppearance;
 
-  constructor(private readonly view: EditorView, private readonly mobile = false) {
+  constructor(private readonly view: EditorView, private readonly mobile = false,
+    appearance: CursorAppearance = NORMAL_CURSOR_APPEARANCE) {
+    this.appearance = {
+      calm: appearance.calm === true,
+      width: safeCalmCursorWidth(appearance.width)
+    };
     this.root = document.createElement("div");
     this.root.className = "ignis-native-cursors";
     this.root.setAttribute("aria-hidden", "true");
@@ -203,6 +213,29 @@ export class CursorOverlay {
     this.rosterList.style.maxHeight = Math.max(88, height - 180) + "px";
   }
 
+  private isDarkTheme() {
+    return document.body?.classList.contains("theme-dark") === true;
+  }
+
+  private shownColor(peer: Peer): string {
+    return displayCursorColor(peer.color, this.appearance.calm,
+      this.isDarkTheme());
+  }
+
+  setAppearance(next: CursorAppearance) {
+    const safe = {
+      calm: next.calm === true,
+      width: safeCalmCursorWidth(next.width)
+    };
+    if (safe.calm === this.appearance.calm &&
+        safe.width === this.appearance.width) return;
+    this.appearance = safe;
+    this.rosterFingerprint = "";
+    this.syncHighlights();
+    this.updateRoster();
+    this.schedule();
+  }
+
   set(text: Y.Text | null, peers: Peer[]) {
     this.text = text;
     this.peers = peers;
@@ -221,7 +254,8 @@ export class CursorOverlay {
       (this.peers.length === 1 ? "" : "s") + " · show locations";
     this.rosterTitle.setAttribute("aria-label", this.rosterTitle.textContent);
     const fingerprint = this.peers.map(peer =>
-      [peer.id, peer.name, peer.color].join(":")).join("|");
+      [peer.id, peer.name, this.shownColor(peer),
+        this.appearance.calm].join(":")).join("|");
     if (fingerprint === this.rosterFingerprint) return;
     this.rosterFingerprint = fingerprint;
     this.rosterList.replaceChildren();
@@ -236,7 +270,8 @@ export class CursorOverlay {
         display: "block", width: "100%", textAlign: "left",
         color: "var(--text-normal, #fff)",
         background: "transparent", border: "0",
-        borderLeft: "3px solid " + peer.color,
+        borderLeft: (this.appearance.calm ? "2px solid " : "3px solid ") +
+          this.shownColor(peer),
         padding: this.mobile ? "12px 8px" : "4px",
         minHeight: this.mobile ? "44px" : "auto", cursor: "pointer"
       });
@@ -301,7 +336,8 @@ export class CursorOverlay {
           const to = Math.min(length, Math.max(selection.anchor, selection.head));
           if (from >= to) continue;
           if (marks.length < MAX_REMOTE_MARKS) {
-            marks.push({ from, to, color: peer.color });
+            marks.push({ from, to, color: this.shownColor(peer),
+              opacity: this.appearance.calm ? 0.08 : 0.24 });
           } else {
             this.highlightsLimited = true;
           }
@@ -338,6 +374,7 @@ export class CursorOverlay {
     const caretBlockers: LabelRect[] = [];
     for (const peer of this.peers) {
       const selections = resolveSelections(this.text, peer);
+      const paint = cursorPaintStyle(peer.color, this.appearance, this.isDarkTheme());
       const mainIndex = Number.isSafeInteger(peer.mainIndex) &&
         (peer.mainIndex as number) >= 0 &&
         (peer.mainIndex as number) < selections.length ? peer.mainIndex! : 0;
@@ -352,16 +389,17 @@ export class CursorOverlay {
         caret.dataset.ignisPeer = peer.id;
         caret.dataset.ignisSelection = String(index);
         Object.assign(caret.style, {
-          position: "absolute", width: "2px", pointerEvents: "none",
-          backgroundColor: peer.color
+          position: "absolute", width: paint.width + "px", pointerEvents: "none",
+          backgroundColor: paint.color
         });
         const label = document.createElement("span");
         label.className = "ignis-native-remote-label";
         Object.assign(label.style, {
           position: "absolute", left: "0", top: "0",
-          color: cursorLabelTextColor(peer.color), backgroundColor: peer.color,
-          fontSize: "11px", fontWeight: "600", borderRadius: "3px",
-          padding: "2px 5px", whiteSpace: "nowrap", maxWidth: "180px",
+          color: cursorLabelTextColor(paint.color), backgroundColor: paint.color,
+          fontSize: paint.labelFontSize, fontWeight: paint.labelFontWeight,
+          borderRadius: "3px", padding: paint.labelPadding,
+          whiteSpace: "nowrap", maxWidth: "180px",
           overflow: "hidden", textOverflow: "ellipsis"
         });
         caret.appendChild(label);
@@ -372,9 +410,13 @@ export class CursorOverlay {
       record.label.textContent = peer.name;
       record.label.style.display = index === mainIndex ? "" : "none";
       record.label.style.visibility = "hidden";
-      record.label.style.color = cursorLabelTextColor(peer.color);
-      record.label.style.backgroundColor = peer.color;
-      record.caret.style.backgroundColor = peer.color;
+      record.label.style.color = cursorLabelTextColor(paint.color);
+      record.label.style.backgroundColor = paint.color;
+      record.label.style.fontSize = paint.labelFontSize;
+      record.label.style.fontWeight = paint.labelFontWeight;
+      record.label.style.padding = paint.labelPadding;
+      record.caret.style.width = paint.width + "px";
+      record.caret.style.backgroundColor = paint.color;
       const at = Math.min(this.view.state.doc.length, selection.head);
       const coords = this.view.coordsAtPos(at);
       const local = coords ? space.toLocal(coords) : null;
@@ -387,7 +429,8 @@ export class CursorOverlay {
         record.caret.style.left = left + "px";
         record.caret.style.top = top + "px";
         record.caret.style.height = Math.max(1, bottom - top) + "px";
-        caretBlockers.push({ left: left - 1, top, right: left + 3, bottom });
+        caretBlockers.push({ left: left - 1, top,
+          right: left + paint.width + 1, bottom });
         if (index === mainIndex && peer.name) {
           const measured = record.label.getBoundingClientRect();
           badgeItems.push({ key, caret: { left, top, bottom },

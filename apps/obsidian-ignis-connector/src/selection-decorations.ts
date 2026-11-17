@@ -10,6 +10,7 @@ export type RemoteMark = {
   from: number;
   to: number;
   color: string;
+  opacity?: number;
 };
 
 export const MAX_REMOTE_MARKS = 480;
@@ -20,14 +21,14 @@ export function makeMarkDecorations(
   marks: readonly RemoteMark[], length: number
 ): DecorationSet {
   const ranges = [];
-  for (const { from, to, color } of marks.slice(0, MAX_REMOTE_MARKS)) {
+  for (const { from, to, color, opacity } of marks.slice(0, MAX_REMOTE_MARKS)) {
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) continue;
     const start = Math.max(0, Math.min(length, from));
     const end = Math.max(0, Math.min(length, to));
     if (start >= end) continue;
     ranges.push(Decoration.mark({
       class: "ignis-native-remote-highlight",
-      attributes: { style: `background-color: ${cursorHighlightTint(color)};` },
+      attributes: { style: `background-color: ${cursorHighlightTint(color, opacity)};` },
       inclusive: false
     }).range(start, end));
   }
