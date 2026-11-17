@@ -71,6 +71,8 @@ type Settings = {
   deviceContentScope: DeviceContentScope;
   serverMediaBypassExtensions: string[];
   deviceMediaBypassExtensions: string[];
+  // Device-private exact paths; never uploaded as sync operations.
+  localOnlyPaths: string[];
   cursor: number;
   journalLineage: string;
   journalProof: string;
@@ -118,6 +120,7 @@ const DEFAULT: Settings = {
   contentScope: "all",
   deviceContentScope: "follow-server",
   serverMediaBypassExtensions: [], deviceMediaBypassExtensions: [],
+  localOnlyPaths: [],
   cursor: 0, journalLineage: "", journalProof: "", tombstoneProofs: {}, baselines: {}, pending: [], pendingWrites: [],
   applyRemoteDeletes: false, syncIssues: [], undoReviews: [], migrations: {}, yjsIds: {},
   scope: "", archivedScopes: []
@@ -144,6 +147,12 @@ function isSyncablePath(path: string): boolean {
 }
 function isMarkdown(path: string): boolean {
   return path.toLowerCase().endsWith(".md") && isSyncablePath(path);
+}
+function normalizeLocalOnlyPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((path): path is string =>
+    typeof path === "string" && path.length <= 2048 &&
+    isSyncablePath(path)))].sort();
 }
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -224,7 +233,61 @@ export default class IgnisConnector extends Plugin {
     );
   }
   private canShare(path: string): boolean {
-    return this.fileScope.allowsPath(path);
+    return this.fileScope.allowsPath(path) && !this.isLocalOnly(path);
+  }
+  isLocalOnly(path: string): boolean {
+    return (this.settings?.localOnlyPaths || []).includes(path);
+  }
+  getLocalOnlyPaths(): readonly string[] {
+    return [...(this.settings.localOnlyPaths || [])];
+  }
+  async setLocalOnlyPath(path: string, ignored: boolean): Promise<{
+    ok: boolean; message: string;
+  }> {
+    if (typeof path !== "string" || path.length > 2048 || !isSyncablePath(path)) {
+      return { ok: false, message: "Use a valid relative Vault file path." };
+    }
+    const previous = this.getLocalOnlyPaths();
+    if (previous.includes(path) === ignored) {
+      return { ok: true, message: ignored ? "Already kept only on this device." :
+        "Path is already eligible for the normal sharing rules." };
+    }
+    if (this.syncing) return { ok: false,
+      message: "A sync is in progress. Retry when it finishes." };
+    if (ignored) {
+      if ([...(this.settings.pending || []), ...(this.settings.pendingWrites || [])]
+        .some(op => op.path === path || ("toPath" in op && op.toPath === path))) {
+        return { ok: false, message:
+          "Unsent work for this path must be reviewed before excluding it. Nothing was dropped." };
+      }
+      if (this.live?.isManaged(path) || this.live?.hasUnsettled?.(path)) return { ok: false,
+        message: "Close this note's live editor and finish pending collaboration before excluding it. Unsent edits are preserved." };
+    }
+    const priorIssues = [...(this.settings.syncIssues || [])];
+    this.settings.localOnlyPaths = normalizeLocalOnlyPaths(
+      ignored ? [...previous, path] : previous.filter(item => item !== path));
+    if (ignored) {
+      this.settings.syncIssues = priorIssues.filter(issue => issue.path !== path);
+    }
+    try {
+      // One durable snapshot for both the exclusion and the visible review
+      // projection. A failed write restores both, never half-applies them.
+      await this.persistSettings();
+    } catch {
+      this.settings.localOnlyPaths = [...previous];
+      this.settings.syncIssues = priorIssues;
+      return { ok: false, message: "Could not save the local-only policy; nothing changed." };
+    }
+    // Recompute the status promptly; the next snapshot also reconciles
+    // history when the user deliberately re-enables a path.
+    this.showStatus((this.settings.syncIssues || []).length
+      ? (this.settings.syncIssues.length + (this.settings.syncIssues.length === 1
+        ? " item needs review" : " items need review"))
+      : "Syncing · checking device-only paths");
+    this.schedule();
+    return { ok: true, message: ignored
+      ? "Kept on this device. This path will not be uploaded, downloaded or joined for live editing. Existing remote copies are not deleted."
+      : "Path returned to normal sync rules; any independent versions will be reviewed." };
   }
   private rebuildFileScope(): void {
     this.fileScope = this.devicePolicy();
@@ -238,7 +301,9 @@ export default class IgnisConnector extends Plugin {
       this.settings.pending || [], this.settings.pendingWrites || [],
       this.settings.serverMediaBypassExtensions || [],
       this.settings.deviceMediaBypassExtensions || [],
-    ), emptyFolders: this.emptyLocalFolders().length };
+      this.settings.localOnlyPaths || [],
+    ), emptyFolders: this.emptyLocalFolders().length,
+    explicitLocalOnlyRules: (this.settings.localOnlyPaths || []).length };
   }
   private emptyLocalFolders(): string[] {
     // Sync v1 has file operations, not directory identities. The user must
@@ -496,6 +561,7 @@ export default class IgnisConnector extends Plugin {
         ? "markdown-only" : "follow-server",
       serverMediaBypassExtensions: safeBypassList(saved?.serverMediaBypassExtensions),
       deviceMediaBypassExtensions: safeBypassList(saved?.deviceMediaBypassExtensions),
+      localOnlyPaths: normalizeLocalOnlyPaths(saved?.localOnlyPaths),
       displayName: normalizeDisplayName(
         typeof saved?.displayName === "string" ? saved.displayName : ""
       ),
@@ -530,7 +596,11 @@ export default class IgnisConnector extends Plugin {
     this.live = new NativeYjs({
       vaultId: () => this.settings.vaultId,
       origin: () => this.settings.serverUrl,
-      pathForView: (view) => view.state.field(editorInfoField, false)?.file?.path || null,
+      pathForView: (view) => {
+        const path = view.state.field(editorInfoField, false)?.file?.path || null;
+        return path && this.canShare(path) ? path : null;
+      },
+      allowedPath: (path) => this.canShare(path),
       knownId: (path) => this.settings.yjsIds[path] || null,
       fileBaseline: (path) => this.settings.baselines[path] || null,
       rememberId: async (path, id) => {
@@ -540,6 +610,7 @@ export default class IgnisConnector extends Plugin {
       displayName: () => this.getDisplayName(),
       mobile: Platform.isMobile,
       send: (message) => {
+        if (message.path && !this.canShare(message.path)) return;
         if (!this.historyHold && this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify(message));
         }
@@ -569,7 +640,20 @@ export default class IgnisConnector extends Plugin {
     });
     this.registerEditorExtension(this.live.extension());
     // Obsidian mobile does not support the desktop status bar API.
-    if (!Platform.isMobile) this.status = this.addStatusBarItem();
+    if (!Platform.isMobile) {
+      this.status = this.addStatusBarItem();
+      this.status.setAttribute("role", "button");
+      this.status.setAttribute("tabindex", "0");
+      this.status.setAttribute("aria-haspopup", "dialog");
+      this.status.style.cursor = "pointer";
+      this.registerDomEvent(this.status, "click", () => this.openSyncIssues());
+      this.registerDomEvent(this.status, "keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          this.openSyncIssues();
+        }
+      });
+    }
     this.showStatus("Not connected");
     this.addSettingTab(new ConnectorSettings(this.app, this));
     // Mobile ribbon entries appear in Obsidian's bottom navigation menu.
@@ -905,7 +989,8 @@ export default class IgnisConnector extends Plugin {
             : "; staged bytes are retained for safe retry."),
       })),
     ];
-    const issues = [...(this.settings.syncIssues || []), ...queued];
+    const issues = [...(this.settings.syncIssues || []), ...queued]
+      .filter(issue => !this.isLocalOnly(issue.path));
     if (this.migrationModal) {
       // Reuse the one active dialog. A close/open pair on iOS can leave the
       // previous backdrop in the DOM while its dismissal animation runs.
@@ -928,7 +1013,8 @@ export default class IgnisConnector extends Plugin {
         issues.push({ path, reason: "Live editor blocked; local draft retained" });
       }
     }
-    return issues.filter(issue => migrationNeedsPreservation(issue.reason));
+    return issues.filter(issue =>
+      !this.isLocalOnly(issue.path) && migrationNeedsPreservation(issue.reason));
   }
 
   getPreservedMigration(path: string): PreservedMigration | undefined {
@@ -1467,8 +1553,8 @@ export default class IgnisConnector extends Plugin {
       // Obsidian supplies a DOM element; minimal host adapters may expose
       // only setText. Accessibility metadata is an optional capability of
       // that presentation sink, not a prerequisite for sync state changes.
-      this.status.setAttribute?.("aria-label", "Ignis: " + shown);
-      this.status.setAttribute?.("title", "Ignis: " + shown);
+      this.status.setAttribute?.("aria-label", "Ignis: " + shown + " · review sync status");
+      this.status.setAttribute?.("title", "Ignis: " + shown + " · click to review");
     }
     // Obsidian's custom status bar doesn't exist on mobile. This reflects
     // the *actual* sync message, never treats a connected socket as a save ACK.
@@ -2568,6 +2654,7 @@ class MigrationModal extends Modal {
   private allIssues(): SyncIssue[] {
     const issues = new Map<string, SyncIssue>();
     for (const issue of [...this.issues, ...this.plugin.getMigrationIssues()]) {
+      if (this.plugin.isLocalOnly(issue.path)) continue;
       if (!issues.has(issue.path)) issues.set(issue.path, issue);
     }
     return [...issues.values()];
@@ -2742,6 +2829,20 @@ class MigrationModal extends Modal {
     }
 
     const controls = main.createDiv({ cls: "ignis-migration-actions" });
+    if (!history) {
+      this.button(controls, language === "ja"
+        ? "この端末だけに残す（今後同期しない）"
+        : "Ignore and keep it client side (never sync)", () =>
+          void this.perform(async () => {
+            const result = await this.plugin.setLocalOnlyPath(issue.path, true);
+            if (!result.ok) throw new Error(result.message);
+            this.issues = this.issues.filter(item => item.path !== issue.path);
+            this.itemFeedback.set(issue.path, result.message);
+          }, language === "ja" ? "端末内だけに保持する設定を保存中…" :
+            "Saving local-only rule…", language === "ja"
+            ? "この端末だけに残します。サーバー上の既存コピーは削除しません。"
+            : "Local-only: no future transfer; any existing server copy remains."));
+    }
     if (!history && migrationNeedsPreservation(issue.reason)) {
       this.button(controls, t.saveSelected, () =>
         void this.perform(async () => {
@@ -2909,6 +3010,8 @@ export class ConnectorSettings extends PluginSettingTab {
         summary.localOnlyFiles + " file(s) kept on this device (" +
         formatLocalBytes(summary.localOnlyBytes) + ") · " +
         summary.pendingOperations + " unsent operation(s)." +
+        (summary.explicitLocalOnlyRules ? " " + summary.explicitLocalOnlyRules +
+          " exact path(s) excluded from this device's Sync." : "") +
         (summary.blockedQueued ? " " + summary.blockedQueued +
           " queued operation(s) need review before syncing." : "") +
         (summary.oversizedFiles ? " " + summary.oversizedFiles +
@@ -3000,6 +3103,47 @@ export class ConnectorSettings extends PluginSettingTab {
           }
         });
       });
+    const localOnlyDetails = containerEl.createEl("details", {
+      cls: "ignis-local-only-paths",
+    });
+    localOnlyDetails.createEl("summary", { text: "Local-only paths (never sync)" });
+    localOnlyDetails.createEl("p", {
+      text: "Exact Vault-relative paths excluded from uploads, downloads and live collaboration on this device. Local files are never deleted. Existing server copies remain until separately reviewed.",
+      cls: "setting-item-description",
+    });
+    const localOnlyFeedback = localOnlyDetails.createDiv();
+    localOnlyFeedback.setAttr("role", "status");
+    localOnlyFeedback.setAttr("aria-live", "polite");
+    const rules = localOnlyDetails.createDiv();
+    const renderRules = () => {
+      rules.empty();
+      const paths = this.plugin.getLocalOnlyPaths();
+      if (!paths.length) rules.createEl("p", { text: "No excluded paths." });
+      for (const path of paths) {
+        new Setting(rules).setName(path)
+          .addButton(button => button.setButtonText("Allow sync again")
+            .onClick(async () => {
+              button.setDisabled(true);
+              const result = await this.plugin.setLocalOnlyPath(path, false);
+              localOnlyFeedback.setText(result.message);
+              renderRules();
+              renderSharing();
+            }));
+      }
+    };
+    renderRules();
+    let exclusionInput = "";
+    new Setting(localOnlyDetails).setName("Exclude another path")
+      .setDesc("Enter the exact relative path, for example univ/Kenpou/.md")
+      .addText(text => text
+        .setPlaceholder("folder/note.md")
+        .onChange(value => { exclusionInput = value; }))
+      .addButton(button => button.setButtonText("Keep local only")
+        .onClick(async () => {
+          const result = await this.plugin.setLocalOnlyPath(exclusionInput.trim(), true);
+          localOnlyFeedback.setText(result.message);
+          if (result.ok) { exclusionInput = ""; renderRules(); renderSharing(); }
+        }));
     new Setting(containerEl).setName("Review unsent changes")
       .setDesc("Inspect pending paths and sync conflicts. Nothing is discarded or uploaded by opening this view.")
       .addButton((button) => button.setButtonText("Review")

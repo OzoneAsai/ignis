@@ -43,6 +43,19 @@ describe("local-only media preference", () => {
       sharedFiles: 2, localOnlyFiles: 1, blockedQueued: 0,
     });
   });
+  it("counts explicitly ignored Markdown as local-only and blocks queued work for its path", () => {
+    const files = [
+      { path: "Notes/normal.md", stat: { size: 10 } },
+      { path: "Notes/ignored.md", stat: { size: 50 } },
+      { path: "Other/attachment.pdf", stat: { size: 300 } }
+    ];
+    expect(sharingSummary(files, "markdown-only", "follow-server",
+      [{ path: "Notes/ignored.md" }], [], [], [],
+      ["Notes/ignored.md"])).toMatchObject({
+      sharedFiles: 1, localOnlyFiles: 2, localOnlyBytes: 350,
+      blockedQueued: 1, pendingOperations: 1
+    });
+  });
   it("formats local-only storage estimates without rounding small files to zero", () => {
     expect(formatLocalBytes(0)).toBe("0 B");
     expect(formatLocalBytes(71)).toBe("71 B");

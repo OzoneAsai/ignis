@@ -269,6 +269,95 @@ describe("native Vault deletion requires explicit journal proof and opt-in", () 
     expect(plugin.settings.cursor).toBe(2);
     expect(plugin.status.setText).toHaveBeenCalledWith("Ignis: 1 item needs review");
   });
+  it("never uploads or downloads a device-only path while allowing unrelated synchronization", async () => {
+    const { plugin } = fixture({ optIn: false, changes: [] });
+    plugin.settings.localOnlyPaths = ["gone.md"];
+    plugin.settings.baselines = {};
+    const visibleText = "second note from the server";
+    const ownRemote = { path: "gone.md", size: Buffer.byteLength(text), ...baseline };
+    const visible = { path: "Other.md", fileId: "another-file",
+      generationId: "another-generation", revision: 1,
+      hash: createHash("sha256").update(visibleText).digest("hex"),
+      size: Buffer.byteLength(visibleText) };
+    plugin.api = vi.fn(async url => {
+      if (url.endsWith("/manifest")) return {
+        vaultId: "lab", vaultSeq: 2, journalLineage: JOURNAL_ID,
+        files: [ownRemote, visible]
+      };
+      if (url.includes("/changes?")) return {
+        vaultId: "lab", vaultSeq: 2,
+        changes: [
+          { seq: 1, type: "create", path: "gone.md",
+            fileId: baseline.fileId, generationId: baseline.generationId },
+          { seq: 2, type: "create", path: "Other.md",
+            fileId: visible.fileId, generationId: visible.generationId }
+        ]
+      };
+      throw Error("Unexpected URL: " + url);
+    });
+    plugin.remoteBytes = vi.fn(async () =>
+      new TextEncoder().encode(visibleText).buffer);
+    plugin.writeLocal = vi.fn(async () => {});
+    plugin.stageAndSend = vi.fn(async () => {});
+    await plugin.syncNow();
+    expect(plugin.canShare("gone.md")).toBe(false);
+    expect(plugin.stageAndSend).not.toHaveBeenCalled();
+    expect(plugin.remoteBytes).toHaveBeenCalledTimes(1);
+    expect(plugin.writeLocal).toHaveBeenCalledWith("Other.md", visibleText);
+    expect(plugin.settings.baselines["gone.md"]).toBeUndefined();
+    expect(plugin.settings.baselines["Other.md"].hash).toBe(visible.hash);
+    expect(plugin.settings.cursor).toBe(2);
+    expect(plugin.settings.syncIssues).toEqual([]);
+  });
+  it("persists a path exclusion, leaves file bytes untouched and removes its review", async () => {
+    const { plugin, file } = fixture({ optIn: false });
+    plugin.settings.syncIssues = [{ path: "gone.md", reason: "Local original retained" }];
+    plugin.settings.localOnlyPaths = [];
+    plugin.schedule = vi.fn();
+    const result = await plugin.setLocalOnlyPath("gone.md", true);
+    expect(result.ok).toBe(true);
+    expect(plugin.settings.localOnlyPaths).toEqual(["gone.md"]);
+    expect(plugin.settings.syncIssues).toEqual([]);
+    expect(plugin.canShare("gone.md")).toBe(false);
+    expect(plugin.app.vault.trash).not.toHaveBeenCalled();
+    expect(plugin.saveData).toHaveBeenCalledWith(expect.objectContaining({
+      localOnlyPaths: ["gone.md"]
+    }));
+    expect(plugin.schedule).toHaveBeenCalled();
+    const undo = await plugin.setLocalOnlyPath("gone.md", false);
+    expect(undo.ok).toBe(true);
+    expect(plugin.settings.localOnlyPaths).toEqual([]);
+    expect(plugin.canShare("gone.md")).toBe(true);
+    expect(file.path).toBe("gone.md");
+  });
+  it("refuses to exclude pending operations, active collaboration or invalid paths", async () => {
+    const { plugin } = fixture();
+    plugin.settings.localOnlyPaths = [];
+    plugin.schedule = vi.fn();
+    plugin.settings.pendingWrites = [{ path: "gone.md",
+      opId: "saved-original-123", type: "create", content: text }];
+    expect((await plugin.setLocalOnlyPath("gone.md", true)).ok).toBe(false);
+    expect(plugin.settings.localOnlyPaths).toEqual([]);
+    plugin.settings.pendingWrites = [];
+    plugin.live.isManaged = () => true;
+    expect((await plugin.setLocalOnlyPath("gone.md", true)).ok).toBe(false);
+    plugin.live.isManaged = () => false;
+    for (const path of ["", "../other.md", ".obsidian/data.json", "/absolute.md", "a\\b.md"]) {
+      expect((await plugin.setLocalOnlyPath(path, true)).ok).toBe(false);
+    }
+    expect(plugin.schedule).not.toHaveBeenCalled();
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+  it("rolls back local-only state when durable settings persistence fails", async () => {
+    const { plugin } = fixture();
+    plugin.settings.localOnlyPaths = [];
+    plugin.schedule = vi.fn();
+    plugin.saveData = vi.fn(async () => { throw Error("disk unavailable"); });
+    const response = await plugin.setLocalOnlyPath("gone.md", true);
+    expect(response.ok).toBe(false);
+    expect(plugin.settings.localOnlyPaths).toEqual([]);
+    expect(plugin.schedule).not.toHaveBeenCalled();
+  });
   it("does not re-create an independently originated note when its remote peer disappears", async () => {
     const { plugin } = fixture({ optIn: false });
     plugin.settings.baselines = {};

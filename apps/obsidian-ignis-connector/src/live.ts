@@ -156,6 +156,8 @@ export class NativeYjs {
     vaultId: () => string;
     origin: () => string;
     pathForView: (view: EditorView) => string | null;
+    // Same exclusion authority for editors, inbound CRDT and rejoin.
+    allowedPath?: (path: string) => boolean;
     knownId: (path: string) => string | null;
     fileBaseline?: (path: string) => { hash: string; generationId: string } | null;
     rememberId: (path: string, id: string) => Promise<void>;
@@ -636,7 +638,8 @@ export class NativeYjs {
   }
 
   private join(room: Room) {
-    if (!this.online || room.blocked || !room.views.size) return;
+    if (!this.online || room.blocked || !room.views.size ||
+        this.opts.allowedPath?.(room.path) === false) return;
     this.opts.send({ channel: "collab", type: "join", path: room.path,
       name: this.opts.displayName?.() || "Native Obsidian" });
   }
@@ -908,7 +911,8 @@ export class NativeYjs {
   }
 
   async handle(message: WireMessage) {
-    if (this.disposed || message.channel !== "collab" || !message.path) return;
+    if (this.disposed || message.channel !== "collab" || !message.path ||
+        this.opts.allowedPath?.(message.path) === false) return;
     const room = this.rooms.get(message.path);
     if (!room) return;
     if ((message.type === "cursor" || message.type === "presence") &&
@@ -1144,6 +1148,11 @@ export class NativeYjs {
   isManaged(path: string): boolean {
     const room = this.rooms.get(path);
     return !!room?.views.size;
+  }
+  hasUnsettled(path: string): boolean {
+    const room = this.rooms.get(path);
+    return !!room && (room.sentSeq > room.savedSeq ||
+      room.pendingHandshake || room.waiting.length > 0);
   }
 
   async retireDocument(path: string): Promise<void> {

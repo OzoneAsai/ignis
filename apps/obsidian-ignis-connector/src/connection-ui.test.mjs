@@ -125,7 +125,7 @@ vi.mock("obsidian", () => {
       return document.createElement("span");
     }
     registerInterval(id) { clearInterval(id); }
-    registerDomEvent() {}
+    registerDomEvent(node, event, handler) { node.addEventListener(event, handler); }
   }
   return {
     Plugin: MockPlugin,
@@ -151,7 +151,7 @@ vi.mock("./live", () => ({
 import IgnisConnector, {
   ConnectorSettings, DisplayNameModal, CollaboratorsModal, UndoReviewModal
 } from "./main.ts";
-import { TFile } from "obsidian";
+import { TFile, Platform } from "obsidian";
 
 const validToken = "ignis_dev_" + "a".repeat(43);
 const flush = async () => {
@@ -189,6 +189,13 @@ function setup({ ready = false } = {}) {
       sharedFiles: 3, localOnlyFiles: 2, pendingOperations: 0,
       localOnlyBytes: 5120, blockedQueued: 0, oversizedFiles: 0,
     })),
+    getLocalOnlyPaths: () => plugin.settings.localOnlyPaths || [],
+    setLocalOnlyPath: vi.fn(async (path, ignored) => {
+      const old = plugin.settings.localOnlyPaths || [];
+      plugin.settings.localOnlyPaths = ignored ? [...old, path] :
+        old.filter(item => item !== path);
+      return { ok: true, message: ignored ? "Kept local only" : "Allowed again" };
+    }),
     getServerMediaBypassExtensions: () => plugin.settings.serverMediaBypassExtensions,
     getDeviceMediaBypassExtensions: () => plugin.settings.deviceMediaBypassExtensions,
     setDeviceMediaBypassExtensions: vi.fn(async (value) => {
@@ -205,7 +212,8 @@ function setup({ ready = false } = {}) {
   };
   const ui = new ConnectorSettings({}, plugin);
   ui.display();
-  const inputs = [...ui.containerEl.querySelectorAll("input")];
+  const inputs = [...ui.containerEl.querySelectorAll("input")]
+    .filter(input => !input.closest(".ignis-local-only-paths"));
   const buttons = [...ui.containerEl.querySelectorAll("button")];
   const connect = buttons.find(b => b.textContent === "Connect and verify");
   const sync = buttons.find(b => b.textContent === "Sync");
@@ -276,6 +284,48 @@ describe("native Obsidian one-button onboarding UI", () => {
     expect(summary.textContent).toContain("4 file(s) eligible");
   });
 
+  it("manages exact local-only paths in Connector settings without deleting files", async () => {
+    const { containerEl, plugin } = setup();
+    const details = containerEl.querySelector(".ignis-local-only-paths");
+    expect(details.querySelector("summary").textContent)
+      .toContain("Local-only paths");
+    const input = details.querySelector("input");
+    input.value = "univ/Kenpou/.md";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const keep = [...details.querySelectorAll("button")]
+      .find(button => button.textContent === "Keep local only");
+    keep.click();
+    await flush();
+    expect(plugin.setLocalOnlyPath)
+      .toHaveBeenCalledWith("univ/Kenpou/.md", true);
+    expect(details.textContent).toContain("univ/Kenpou/.md");
+    const undo = [...details.querySelectorAll("button")]
+      .find(button => button.textContent === "Allow sync again");
+    undo.click();
+    await flush();
+    expect(plugin.setLocalOnlyPath)
+      .toHaveBeenCalledWith("univ/Kenpou/.md", false);
+    expect(details.textContent).toContain("No excluded paths.");
+  });
+  it("opens the review action when the desktop status bar is clicked or pressed", async () => {
+    const before = Platform.isMobile;
+    Platform.isMobile = false;
+    try {
+      const plugin = new IgnisConnector();
+      await plugin.onload();
+      plugin.openSyncIssues = vi.fn();
+      const el = plugin.status;
+      expect(el).toBeTruthy();
+      expect(el.getAttribute("role")).toBe("button");
+      expect(el.getAttribute("tabindex")).toBe("0");
+      el.click();
+      el.dispatchEvent(new KeyboardEvent("keydown",
+        { key: "Enter", bubbles: true, cancelable: true }));
+      expect(plugin.openSyncIssues).toHaveBeenCalledTimes(2);
+    } finally {
+      Platform.isMobile = before;
+    }
+  });
   it("offers PDF/media bypass in the same mobile-compatible Connector UI", () => {
     const { containerEl } = setup();
     const region = containerEl.querySelector(".ignis-media-bypass-details");

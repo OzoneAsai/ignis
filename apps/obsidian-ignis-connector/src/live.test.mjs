@@ -67,6 +67,34 @@ afterEach(async () => {
 });
 
 describe("Native Obsidian offline Yjs bridge", () => {
+  it("never joins or applies inbound CRDT state for an explicitly excluded path", async () => {
+    const sent = [];
+    let allowed = false;
+    const manager = new NativeYjs({
+      vaultId: () => "lab",
+      origin: () => "https://example.test/" + crypto.randomUUID(),
+      pathForView: (view) => view.state.field().file?.path || null,
+      allowedPath: (path) => allowed && path === "test.md",
+      knownId: () => null,
+      rememberId: async () => {},
+      send: frame => sent.push(frame),
+      notify: () => {}
+    });
+    const view = makeView("test.md", "local");
+    manager.observe(view.view);
+    testInstances.push(manager);
+    manager.connected();
+    expect(sent.filter(frame => frame.type === "join")).toEqual([]);
+    await manager.handle(serverInit("test.md", ID, "from remote"));
+    const room = manager.rooms.get("test.md");
+    expect(room.joined).toBe(false);
+    expect(room.doc).toBeNull();
+    expect(manager.hasUnsettled("test.md")).toBe(false);
+    allowed = true;
+    manager.rejoinPath("test.md");
+    expect(sent.some(frame => frame.type === "join" && frame.path === "test.md"))
+      .toBe(true);
+  });
   it("distinguishes local editor attachment, server ACK, reconnection and block state", async () => {
     const s = harness();
     expect(s.manager.saveState()).toMatchObject({

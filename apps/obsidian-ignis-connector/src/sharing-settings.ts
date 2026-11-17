@@ -56,7 +56,9 @@ export function sharingSummary(
   pendingWrites: readonly QueuedPath[] = [],
   serverBypassExtensions: readonly string[] = [],
   deviceBypassExtensions: readonly string[] = [],
+  explicitLocalOnlyPaths: readonly string[] = [],
 ) {
+  const deviceOnly = new Set(explicitLocalOnlyPaths);
   const effective = effectiveContentScope(serverScope, deviceScope);
   const effectiveBypass = effectiveMediaBypassExtensions(serverScope, deviceScope,
     serverBypassExtensions, deviceBypassExtensions);
@@ -67,7 +69,8 @@ export function sharingSummary(
   let localOnlyBytes = 0;
   for (const file of files) {
     const bytes = Math.max(0, Number(file.stat?.size) || 0);
-    if (policy.allowsPath(file.path) && bytes <= 4 * 1024 * 1024) {
+    if (!deviceOnly.has(file.path) &&
+        policy.allowsPath(file.path) && bytes <= 4 * 1024 * 1024) {
       sharedFiles += 1;
     } else if (createContentScope("all").allowsPath(file.path)) {
       localOnlyFiles += 1;
@@ -76,8 +79,9 @@ export function sharingSummary(
     }
   }
   const blockedQueued = [...pending, ...pendingWrites].filter((item) =>
-    !policy.allowsPath(item.path) ||
-    (item.toPath !== undefined && !policy.allowsPath(item.toPath))
+    deviceOnly.has(item.path) || !policy.allowsPath(item.path) ||
+    (item.toPath !== undefined &&
+      (deviceOnly.has(item.toPath) || !policy.allowsPath(item.toPath)))
   ).length;
   return {
     serverScope, deviceScope, effective, effectiveBypass,
